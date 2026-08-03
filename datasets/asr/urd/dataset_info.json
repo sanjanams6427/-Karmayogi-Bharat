@@ -1,0 +1,28 @@
+{
+  "lang_code": "urd",
+  "lang_name": "Urdu",
+  "script": "Arab",
+  "sampling_rate": 16000,
+  "source": "fleurs",
+  "hf_repo": "google/fleurs (ur_pk)",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\urdu\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\urdu\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\urdu\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

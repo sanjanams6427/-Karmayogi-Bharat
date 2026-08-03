@@ -1,0 +1,28 @@
+{
+  "lang_code": "mai",
+  "lang_name": "Maithili",
+  "script": "Deva",
+  "sampling_rate": 16000,
+  "source": "indicsuper_audio",
+  "hf_repo": "alekya/IndicSUPERB",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\mai\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\mai",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\mai"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

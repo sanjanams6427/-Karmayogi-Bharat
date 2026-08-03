@@ -1,0 +1,46 @@
+# ── Models (large binary weights — download separately) ──────
+models/
+checkpoints/indictrans/
+checkpoints/seamless/
+
+# ── Output / temp / cache ─────────────────────────────────────
+output/
+temp/
+logs/
+translation_memory/
+__pycache__/
+*.pyc
+*.pyo
+.cache/
+*.egg-info/
+dist/
+build/
+
+# ── Secrets ───────────────────────────────────────────────────
+.env
+.output_dir
+
+# ── Dataset raw audio (large HF arrow files) ─────────────────
+datasets/audio/
+datasets/text/
+
+# ── Job checkpoints (runtime state) ──────────────────────────
+checkpoints/jobs/
+
+# ── Virtual environment ─────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── OS / IDE ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# ── Keep these dataset index files (small JSON) ──────────────
+!datasets/asr/
+!datasets/asr/**
+!datasets/parallel/
+!datasets/parallel/**

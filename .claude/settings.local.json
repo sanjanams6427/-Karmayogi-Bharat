@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk 'NR<=45{print NR\": \"length\\($0\\)\" bytes, ends with:\"; }' run_finetune.bat)",
+      "Bash(python3 -)",
+      "Bash(awk '{ if \\(substr\\($0, length\\($0\\), 1\\) != \"\\\\r\"\\) print NR\": no-CR -> \"$0 }' run_finetune.bat)",
+      "Bash(cp run_finetune.bat run_finetune.bat.bak)",
+      "Bash(unix2dos run_finetune.bat)",
+      "Bash(awk '{ if \\(substr\\($0, length\\($0\\), 1\\) != \"\\\\r\"\\) print NR\": still missing CR\" }' run_finetune.bat)",
+      "Bash(xxd run_finetune.bat)",
+      "Bash(\"/c/Users/M1021/AppData/Local/Programs/Python/Python312/python.exe\" -m py_compile finetune/finetune_indictrans.py finetune/finetune_seamless.py)",
+      "Bash(nvidia-smi --help-query-gpu)"
+    ]
+  }
+}

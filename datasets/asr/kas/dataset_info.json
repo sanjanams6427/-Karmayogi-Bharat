@@ -1,0 +1,28 @@
+{
+  "lang_code": "kas",
+  "lang_name": "Kashmiri",
+  "script": "Arab",
+  "sampling_rate": 16000,
+  "source": "indicsuper_audio",
+  "hf_repo": "alekya/IndicSUPERB",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\kas\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\kas",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\indicsuper_per_lang\\kas"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

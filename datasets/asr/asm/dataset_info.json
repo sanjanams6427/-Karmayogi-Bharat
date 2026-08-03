@@ -1,0 +1,28 @@
+{
+  "lang_code": "asm",
+  "lang_name": "Assamese",
+  "script": "Beng",
+  "sampling_rate": 16000,
+  "source": "fleurs",
+  "hf_repo": "google/fleurs (as_in)",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\assamese\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\assamese\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\assamese\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

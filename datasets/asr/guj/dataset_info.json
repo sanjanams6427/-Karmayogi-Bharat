@@ -1,0 +1,28 @@
+{
+  "lang_code": "guj",
+  "lang_name": "Gujarati",
+  "script": "Gujr",
+  "sampling_rate": 16000,
+  "source": "fleurs",
+  "hf_repo": "google/fleurs (gu_in)",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\gujarati\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\gujarati\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\gujarati\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

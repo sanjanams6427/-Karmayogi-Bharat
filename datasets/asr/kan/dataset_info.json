@@ -1,0 +1,28 @@
+{
+  "lang_code": "kan",
+  "lang_name": "Kannada",
+  "script": "Knda",
+  "sampling_rate": 16000,
+  "source": "fleurs",
+  "hf_repo": "google/fleurs (kn_in)",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\kannada\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\kannada\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\kannada\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

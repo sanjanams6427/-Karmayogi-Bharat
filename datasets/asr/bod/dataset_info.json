@@ -1,0 +1,28 @@
+{
+  "lang_code": "bod",
+  "lang_name": "Bodo",
+  "script": "Deva",
+  "sampling_rate": 16000,
+  "source": "bodo_asr",
+  "hf_repo": "XKaab/ASR-Bodo_5hrs",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\bodo_asr\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\bodo_asr\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\bodo_asr\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}

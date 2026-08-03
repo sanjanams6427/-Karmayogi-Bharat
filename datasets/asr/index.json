@@ -1,0 +1,30 @@
+{
+  "total_languages": 22,
+  "finetune_ready": 22,
+  "languages": {
+    "asm": "fleurs",
+    "ben": "fleurs",
+    "guj": "fleurs",
+    "hin": "fleurs",
+    "kan": "fleurs",
+    "mal": "fleurs",
+    "mar": "fleurs",
+    "ory": "fleurs",
+    "pan": "fleurs",
+    "tam": "fleurs",
+    "tel": "fleurs",
+    "bod": "bodo_asr",
+    "doi": "indicsuper",
+    "kas": "indicsuper",
+    "kok": "indicsuper",
+    "mni": "indicsuper",
+    "mai": "indicsuper",
+    "nep": "fleurs",
+    "san": "indicsuper",
+    "sat": "indicsuper",
+    "snd": "indicsuper",
+    "urd": "fleurs"
+  },
+  "structure": "datasets/asr/<lang_code>/dataset_info.json",
+  "usage": "from datasets import load_from_disk\nds = load_from_disk('datasets/asr/hin/splits/train')"
+}

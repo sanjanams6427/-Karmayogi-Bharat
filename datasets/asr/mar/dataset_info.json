@@ -1,0 +1,28 @@
+{
+  "lang_code": "mar",
+  "lang_name": "Marathi",
+  "script": "Deva",
+  "sampling_rate": 16000,
+  "source": "fleurs",
+  "hf_repo": "google/fleurs (mr_in)",
+  "splits": {
+    "train": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\marathi\\train",
+    "validation": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\marathi\\validation",
+    "test": "e:\\Manick_AI_ML\\project\\datasets\\audio\\fleurs\\marathi\\test"
+  },
+  "finetune_ready": true,
+  "features": {
+    "audio": {
+      "sampling_rate": 16000,
+      "_type": "Audio"
+    },
+    "transcription": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "lang_code": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  }
+}
