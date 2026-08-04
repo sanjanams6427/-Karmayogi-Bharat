@@ -23,6 +23,13 @@ build/
 # ── Dataset raw audio (large HF arrow files) ─────────────────
 datasets/audio/
 datasets/text/
+datasets/parallel/
+input/
+.claude/
+*.bak
+ui/requirements.txt
+scripts/git_push.bat
+scripts/test_seamless_mal.py
 
 # ── Job checkpoints (runtime state) ──────────────────────────
 checkpoints/jobs/
