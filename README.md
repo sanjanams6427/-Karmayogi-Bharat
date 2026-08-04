@@ -192,6 +192,25 @@ All others use ASR → Translate → TTS pipeline.
 python scripts/download_models.py
 ```
 
+## Datasets (not in git — too large)
+
+Parallel training data (~1.5GB total) is excluded from git. To rebuild:
+
+```bash
+# Download all 22-language parallel datasets
+python scripts/download_datasets.py
+
+# Verify 22-lang coverage
+python scripts/check_gaps.py
+```
+
+Or copy from shared storage into:
+```
+datasets/parallel/<lang_code>/train.jsonl   # 50-77MB per language
+datasets/parallel/<lang_code>/dev.jsonl
+datasets/parallel/<lang_code>/test.jsonl
+```
+
 | Model | Path | Size |
 |-------|------|------|
 | faster-whisper large-v3 | models/indic_asr/ | ~3GB |
