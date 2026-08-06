@@ -231,6 +231,7 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
         return None, "❌ Please upload a file."
     if not tgt_langs:
         return None, "❌ Select at least one target language."
+    _t0 = time.time()
 
     pipeline  = get_pipeline()
     course_id = Path(file.name).stem
@@ -247,7 +248,9 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
     if suffix in (".docx", ".doc", ".txt"):
         output_files, log_lines = _translate_plain_doc(
             file.name, src_lang, tgt_langs, out_dir, course_id, progress, pipeline)
-        return _save_outputs(output_files) or None, "\n".join(log_lines)
+        _elapsed = round((time.time() - _t0) / 60, 1)
+    log_lines.insert(0, f"⏱ Completed in {_elapsed} min")
+    return _save_outputs(output_files) or None, "\n".join(log_lines)
 
     # ── JSON paths (existing behaviour) ──
     output_files, log_lines = [], []
@@ -279,6 +282,8 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
         except Exception as e:
             log_lines.append(f"❌ {e}")
 
+    _elapsed = round((time.time() - _t0) / 60, 1)
+    log_lines.insert(0, f"⏱ Completed in {_elapsed} min")
     return _save_outputs(output_files) or None, "\n".join(log_lines)
 
 
@@ -316,6 +321,7 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
 
     progress(0.1, desc="Starting pipeline...")
     _append_log(f"Full course batch: {cid} → {tgt_langs} | GPUs={_num_gpus}")
+    _t0 = time.time()
     summary = pipeline.process_course_full(
         video_file.name, src_lang, tgt_langs, out_dir, cid,
         metadata=metadata, quiz=quiz,
@@ -340,6 +346,9 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
     if summary.get("metadata_xlsx", {}).get("all"):
         all_files.append(summary["metadata_xlsx"]["all"])
 
+    _elapsed = round((time.time() - _t0) / 60, 1)
+    summary["elapsed_min"] = _elapsed
+    _append_log(f"✅ Dubbing done in {_elapsed} min")
     return _save_outputs(all_files) or None, json.dumps(summary, indent=2, default=str)
 
 
