@@ -46,6 +46,8 @@ def main():
                         help="Force re-run even if output already exists")
     parser.add_argument("--gpu", type=int, default=0,
                         help="GPU index to use (default: 0). Use --batch-videos for multi-GPU.")
+    parser.add_argument("--num-gpus", type=int, default=None,
+                        help="Number of GPUs for parallel dubbing (default: auto-detect all available)")
 
     # Voice cloning
     parser.add_argument("--voice-clone", action="store_true",
@@ -113,6 +115,17 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
         print(f"  GPU: {args.gpu}")
 
+    # Auto-detect GPU count for parallel mode
+    try:
+        import torch
+        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    except Exception:
+        available_gpus = 1
+    num_gpus = args.num_gpus if args.num_gpus is not None else available_gpus
+    num_gpus = max(1, min(num_gpus, available_gpus))
+    if num_gpus > 1:
+        print(f"  Parallel mode: {num_gpus} GPUs")
+
     print(f"\n{'='*60}")
     print(f"  KB Dubbing Pipeline")
     print(f"  Source: {src_name}")
@@ -121,10 +134,12 @@ def main():
         print(f"  Mode: Voice Cloning")
     print(f"{'='*60}\n")
 
-    pipeline = DubbingPipeline(use_glossary=not args.no_glossary)
+    pipeline = DubbingPipeline(use_glossary=not args.no_glossary) if num_gpus == 1 else None
 
     # ── Full course processing ─────────────────────────────────
     if args.full and args.video:
+        if pipeline is None:
+            pipeline = DubbingPipeline(use_glossary=not args.no_glossary)
         metadata = None
         quiz = None
         if args.metadata and Path(args.metadata).exists():
@@ -195,6 +210,11 @@ def main():
             print(f"ERROR: File not found: {args.video}")
             sys.exit(1)
 
+        if pipeline is None:
+            # parallel mode: use DubbingPipeline as coordinator (workers do the real work)
+            from pipeline.dubbing_pipeline import DubbingPipeline as _DP
+            pipeline = _DP(use_glossary=not args.no_glossary)
+
         results = pipeline.dub_course(
             video_path=args.video,
             src_lang=args.src,
@@ -204,6 +224,7 @@ def main():
             voice_clone=args.voice_clone,
             reference_audio=args.reference_audio,
             force=args.force,
+            num_gpus=num_gpus,
         )
 
         # Optional: QA reports
@@ -229,6 +250,8 @@ def main():
 
     # ── Metadata translation ───────────────────────────────────
     if args.metadata:
+        if pipeline is None:
+            pipeline = DubbingPipeline(use_glossary=not args.no_glossary)
         meta_path = Path(args.metadata)
         if not meta_path.exists():
             print(f"ERROR: Metadata file not found: {args.metadata}")
@@ -252,6 +275,8 @@ def main():
 
     # ── Quiz translation ───────────────────────────────────────
     if args.quiz:
+        if pipeline is None:
+            pipeline = DubbingPipeline(use_glossary=not args.no_glossary)
         quiz_path = Path(args.quiz)
         if not quiz_path.exists():
             print(f"ERROR: Quiz file not found: {args.quiz}")

@@ -39,7 +39,7 @@ class VideoProcessor:
             import shutil
             ffprobe = shutil.which("ffprobe") or _FFMPEG.replace("ffmpeg", "ffprobe")
             args[0] = ffprobe
-        result = subprocess.run(args, capture_output=True)
+        result = subprocess.run(args, capture_output=True, timeout=600)
         return result.returncode
 
     def _probe(self, path: str) -> dict:
@@ -53,20 +53,29 @@ class VideoProcessor:
             result = subprocess.run(
                 [ffprobe, "-v", "error", "-show_entries", "format=duration",
                  "-of", "json", path],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=60,
             )
             if result.returncode == 0:
                 return json.loads(result.stdout)
-        # Fallback: use soundfile/librosa
-        import soundfile as sf
-        info = sf.info(path)
-        return {"format": {"duration": str(info.duration)}}
+        # Fallback: parse Duration from ffmpeg stderr (works for MP4/MKV/WAV/MP3)
+        result = subprocess.run(
+            [_FFMPEG, "-i", path],
+            stderr=subprocess.STDOUT, stdout=subprocess.PIPE, timeout=60,
+        )
+        out = result.stdout.decode("utf-8", errors="replace")
+        import re as _re
+        m = _re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", out)
+        if m:
+            h, mn, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+            dur = h * 3600 + mn * 60 + s
+            return {"format": {"duration": str(dur)}}
+        raise RuntimeError(f"Cannot determine duration for: {path}")
 
     def _has_audio_stream(self, video_path: str) -> bool:
         """Return True if the file has at least one audio stream."""
         result = subprocess.run(
             [_FFMPEG, "-i", str(video_path)],
-            stderr=subprocess.STDOUT, stdout=subprocess.PIPE
+            stderr=subprocess.STDOUT, stdout=subprocess.PIPE, timeout=60,
         )
         return b"Audio:" in result.stdout
 
@@ -82,15 +91,14 @@ class VideoProcessor:
              "-c:a", "aac", "-b:a", "128k",
              "-movflags", "+faststart", str(tmp_path),
              "-loglevel", "error"],
-            capture_output=True
+            capture_output=True, timeout=600,
         )
         if ret.returncode != 0:
-            # video-only re-encode (no audio in source)
             subprocess.run(
                 [_FFMPEG, "-y", "-i", str(video_path),
                  "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
                  "-an", str(tmp_path), "-loglevel", "error"],
-                capture_output=True
+                capture_output=True, timeout=600,
             )
         return tmp_path
 
@@ -107,7 +115,7 @@ class VideoProcessor:
                 [_FFMPEG, "-y", "-f", "lavfi",
                  "-i", f"anullsrc=r={sample_rate}:cl=mono",
                  "-t", str(duration), output_wav, "-loglevel", "error"],
-                capture_output=True
+                capture_output=True, timeout=60,
             ).returncode
             if ret != 0:
                 # fallback: write numpy silence
@@ -121,11 +129,10 @@ class VideoProcessor:
             [_FFMPEG, "-y", "-i", video_path,
              "-ar", str(sample_rate), "-ac", "1", "-vn", output_wav,
              "-loglevel", "error"],
-            capture_output=True
+            capture_output=True, timeout=600,
         ).returncode
 
         if ret != 0:
-            # Re-encode input then retry (handles corrupt/unusual containers)
             print(f"[VP] Extraction failed, re-encoding input: {Path(video_path).name}")
             tmp = str(Path(output_wav).parent / "_reenc_input.mp4")
             self._reencode_input(video_path, tmp)
@@ -133,7 +140,7 @@ class VideoProcessor:
                 [_FFMPEG, "-y", "-i", tmp,
                  "-ar", str(sample_rate), "-ac", "1", "-vn", output_wav,
                  "-loglevel", "error"],
-                capture_output=True
+                capture_output=True, timeout=600,
             ).returncode
             if ret2 != 0:
                 raise RuntimeError(f"Audio extraction failed for {Path(video_path).name}")
@@ -146,7 +153,7 @@ class VideoProcessor:
             [_FFMPEG, "-y", "-i", str(input_path),
              "-ar", str(sample_rate), "-ac", "1", str(output_path),
              "-loglevel", "error"],
-            capture_output=True
+            capture_output=True, timeout=600,
         ).returncode
         if ret != 0:
             raise RuntimeError(f"ffmpeg audio conversion failed: {input_path}")
@@ -167,7 +174,7 @@ class VideoProcessor:
         # Use ffprobe with video stream duration as fallback
         result = subprocess.run(
             [_FFMPEG, "-i", str(video_path)],
-            stderr=subprocess.STDOUT, stdout=subprocess.PIPE
+            stderr=subprocess.STDOUT, stdout=subprocess.PIPE, timeout=60,
         )
         out = result.stdout.decode("utf-8", errors="replace")
         import re
@@ -241,9 +248,52 @@ class VideoProcessor:
         subprocess.run(
             [_FFMPEG, "-y", "-i", str(audio_path),
              "-filter:a", atempo, str(output_path), "-loglevel", "error"],
-            capture_output=True
+            capture_output=True, timeout=300,
         )
         return output_path
+
+    def _atempo_stretch_file(self, audio: np.ndarray, sr: int, ratio: float) -> np.ndarray:
+        """
+        Time-stretch using ffmpeg atempo (time-domain, no phase smearing).
+        ratio > 1 = speed up. Chains filters for ratios outside 0.5-2.0.
+        Falls back to original on error.
+        """
+        if abs(ratio - 1.0) < 0.02:
+            return audio
+        # Clamp to sane range — beyond 3x is unintelligible anyway
+        ratio = max(0.5, min(3.0, ratio))
+        # Build chained atempo filter — each stage must be in [0.5, 2.0]
+        if ratio > 2.0:
+            # e.g. ratio=2.5 → atempo=2.0,atempo=1.25
+            atempo = f"atempo=2.0,atempo={ratio/2.0:.4f}"
+        elif ratio < 0.5:
+            atempo = f"atempo=0.5,atempo={ratio/0.5:.4f}"
+        else:
+            atempo = f"atempo={ratio:.4f}"
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix="_in.wav", delete=False) as fi, \
+             tempfile.NamedTemporaryFile(suffix="_out.wav", delete=False) as fo:
+            in_path, out_path = fi.name, fo.name
+        try:
+            sf.write(in_path, audio, sr)
+            subprocess.run(
+                [_FFMPEG, "-y", "-i", in_path,
+                 "-filter:a", atempo,
+                 out_path, "-loglevel", "error"],
+                capture_output=True, check=True, timeout=300,
+            )
+            stretched, _ = sf.read(out_path, dtype="float32")
+            return stretched
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"atempo stretch failed (ratio={ratio:.3f}): {e} — using original")
+            return audio
+        finally:
+            for p in (in_path, out_path):
+                try:
+                    Path(p).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def assemble_dubbed_audio(
         self,
@@ -253,79 +303,63 @@ class VideoProcessor:
         sample_rate: int = 44100,
     ) -> str:
         """
-        Assemble TTS segments into a single dubbed audio track.
-        Strategy: place each segment at its original timestamp.
-        If TTS is longer than the slot, speed it up to fit (max 2x).
-        If TTS is shorter, pad with silence — never cut speech.
-        Final output is always exactly original_duration long.
+        Place each TTS segment at its original timestamp in the output buffer.
+        Speed-up (max 1.35x) applied if segment overruns its slot.
         """
-        import librosa
-        FADE_MS = int(0.025 * sample_rate)  # 25ms crossfade
+        FADE_SAMP = int(0.010 * sample_rate)
+        MAX_SPEED = 1.35
 
-        total_samples = int(original_duration * sample_rate)
-        output_audio  = np.zeros(total_samples, dtype=np.float32)
+        total_samp   = max(int(original_duration * sample_rate), 1)
+        output_audio = np.zeros(total_samp, dtype=np.float32)
 
         for i, seg in enumerate(segments):
             if "audio_path" not in seg or not Path(seg["audio_path"]).exists():
                 continue
             try:
-                seg_audio, _ = librosa.load(seg["audio_path"], sr=sample_rate, mono=True)
+                seg_audio, tts_sr = sf.read(seg["audio_path"], dtype="float32", always_2d=False)
+                if seg_audio.ndim > 1:
+                    seg_audio = seg_audio.mean(axis=1)
+                if tts_sr != sample_rate:
+                    import librosa
+                    seg_audio = librosa.resample(seg_audio, orig_sr=tts_sr, target_sr=sample_rate)
             except Exception:
                 continue
             if len(seg_audio) == 0:
                 continue
 
-            start_s = seg["start"]
-            # slot = time until next segment starts (or end of video)
+            start_s    = seg["start"]
+            seg_end    = seg.get("end", start_s + 1.0)
             next_start = segments[i + 1]["start"] if i + 1 < len(segments) else original_duration
-            slot_s     = max(next_start - start_s, 0.5)
-            slot_samp  = int(slot_s * sample_rate)
-            tts_samp   = len(seg_audio)
+            slot_samp  = max(
+                int((next_start - start_s) * sample_rate),
+                int((seg_end   - start_s) * sample_rate),
+                int(0.1 * sample_rate),
+            )
 
-            # Speed up TTS to fit slot if it overruns (cap at 1.4x — beyond that sounds robotic)
-            if tts_samp > slot_samp:
-                ratio = min(tts_samp / slot_samp, 1.4)
-                try:
-                    seg_audio = librosa.effects.time_stretch(seg_audio, rate=ratio).astype(np.float32)
-                except Exception:
-                    pass
-                seg_audio = seg_audio[:slot_samp]  # hard trim as safety net
+            # Speed up if overruns slot (max 1.35x)
+            if len(seg_audio) > slot_samp:
+                ratio     = min(len(seg_audio) / slot_samp, MAX_SPEED)
+                seg_audio = self._atempo_stretch_file(seg_audio, sample_rate, ratio)
+                if len(seg_audio) > slot_samp:
+                    seg_audio = seg_audio[:slot_samp]
 
-            # 10ms fade-in only — eliminates click at segment start without dipping speech
-            fade = min(FADE_MS, len(seg_audio) // 8)
+            # 10ms fade-in to eliminate click
+            fade = min(FADE_SAMP, len(seg_audio) // 8)
             if fade > 0:
                 seg_audio[:fade] *= np.linspace(0.0, 1.0, fade)
 
+            # Place at original timestamp
             start_samp = int(start_s * sample_rate)
-            end_samp   = min(start_samp + len(seg_audio), total_samples)
-            copy_len   = end_samp - start_samp
-            if copy_len > 0:
-                output_audio[start_samp:end_samp] = seg_audio[:copy_len]
+            end_samp   = min(start_samp + len(seg_audio), total_samp)
+            output_audio[start_samp:end_samp] = seg_audio[:end_samp - start_samp]
 
-        # Normalize to -3dBFS
         peak = np.max(np.abs(output_audio))
         if peak > 0.01:
-            output_audio *= (0.707 / peak)
+            output_audio *= (0.891 / peak)
 
         Path(output_wav).parent.mkdir(parents=True, exist_ok=True)
         sf.write(output_wav, output_audio, sample_rate)
         return output_wav
-
-    def _atempo_stretch_array(
-        self, audio: np.ndarray, sr: int, ratio: float
-    ) -> np.ndarray:
-        """
-        Time-stretch in memory using librosa (no ffmpeg subprocess per segment).
-        ratio > 1 = speed up, ratio < 1 = slow down.
-        """
-        ratio = max(0.5, min(2.0, ratio))
-        if abs(ratio - 1.0) < 0.02:
-            return audio
-        try:
-            import librosa
-            return librosa.effects.time_stretch(audio, rate=ratio).astype(np.float32)
-        except Exception:
-            return audio
 
     # ----------------------------------------------------------
     # Replace audio in video
@@ -335,40 +369,48 @@ class VideoProcessor:
         video_path: str,
         new_audio_path: str,
         output_video_path: str,
+        srt_path: str = None,
+        lang: str = None,
     ) -> str:
         """
         Replace the audio track in a video with new dubbed audio.
-        Always stretches dubbed audio to exactly match original video duration
-        so output video never runs longer than the source.
+        Optionally embeds SRT as a soft subtitle track (mov_text) inside the MP4.
         """
         Path(output_video_path).parent.mkdir(parents=True, exist_ok=True)
 
-        # Stretch dubbed audio to exactly match original video duration
         video_duration = self.get_video_duration(video_path)
-        stretched_path = str(Path(new_audio_path).parent / "_dubbed_synced.wav")
-        self.stretch_audio_to_duration(new_audio_path, video_duration, stretched_path)
-        audio_to_use = stretched_path
+        # Pad with silence to match video duration — do NOT stretch (stretching slows all speech)
+        padded_path = str(Path(new_audio_path).parent / "_dubbed_synced.wav")
+        audio_data, audio_sr = sf.read(new_audio_path, dtype="float32", always_2d=False)
+        target_samples = int(video_duration * audio_sr)
+        if len(audio_data) < target_samples:
+            audio_data = np.concatenate([audio_data, np.zeros(target_samples - len(audio_data), dtype=np.float32)])
+        else:
+            audio_data = audio_data[:target_samples]
+        sf.write(padded_path, audio_data, audio_sr)
+        audio_to_use = padded_path
 
-        # Mux: -shortest ensures output stops at video end
-        ret = subprocess.run(
-            [_FFMPEG, "-y",
-             "-i", str(video_path), "-i", audio_to_use,
-             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
-             "-map", "0:v:0", "-map", "1:a:0",
-             "-shortest", str(output_video_path), "-loglevel", "error"],
-            capture_output=True
-        ).returncode
-        if ret != 0:
-            ret2 = subprocess.run(
-                [_FFMPEG, "-y",
-                 "-i", str(video_path), "-i", audio_to_use,
-                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                 "-c:a", "aac", "-b:a", "192k",
-                 "-map", "0:v:0", "-map", "1:a:0",
-                 "-shortest", str(output_video_path), "-loglevel", "error"],
-                capture_output=True
-            ).returncode
-            if ret2 != 0:
+        has_srt = srt_path and Path(srt_path).exists()
+
+        def _mux(reencode_video: bool) -> int:
+            cmd = [_FFMPEG, "-y", "-i", str(video_path), "-i", audio_to_use]
+            if has_srt:
+                cmd += ["-i", str(srt_path)]
+            if reencode_video:
+                cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+            else:
+                cmd += ["-c:v", "copy"]
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+            cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+            if has_srt:
+                cmd += ["-map", "2:0", "-c:s", "mov_text"]
+                if lang:
+                    cmd += ["-metadata:s:s:0", f"language={lang}"]
+            cmd += ["-shortest", str(output_video_path), "-loglevel", "error"]
+            return subprocess.run(cmd, capture_output=True, timeout=600).returncode
+
+        if _mux(reencode_video=False) != 0:
+            if _mux(reencode_video=True) != 0:
                 raise RuntimeError(f"Audio replacement failed for {Path(video_path).name}")
         return output_video_path
 

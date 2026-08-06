@@ -10,6 +10,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import gradio as gr
 from pipeline.lang_config import LANG_NAMES, ALL_22
+from ui.reviewer import (
+    load_metadata, load_review, save_review,
+    export_certificate, review_stats, segments_to_display,
+)
 
 SRC_LANGS = [("English", "eng"), ("Hindi", "hin")] + [
     (LANG_NAMES[c], c) for c in ALL_22 if c not in ("hin",)
@@ -130,78 +134,64 @@ def _save_outputs(files: list[str]) -> list[str]:
     return saved
 
 
-# ── Tab 1: Dub Video ─────────────────────────────────────────
-def dub_file(file, src_lang, tgt_langs, voice_clone, ref_audio,
-             progress=gr.Progress()):
-    if file is None:
-        return None, None, "❌ Please upload a file.", ""
-    if not tgt_langs:
-        return None, None, "❌ Select at least one target language.", ""
-
-    pipeline  = get_pipeline()
-    course_id = Path(file.name).stem
-    # Always save to persistent output dir — never inside Gradio's temp folder
-    out_dir   = os.path.join(_get_output_dir(), course_id)
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    ref_path  = ref_audio.name if ref_audio else None
-
-    _append_log(f"Starting dub: {Path(file.name).name} → {tgt_langs}")
-    results = {}
-    total = len(tgt_langs)
-    for i, tgt in enumerate(tgt_langs):
-        progress((i / total) + (0.9 / total), desc=f"Dubbing → {LANG_NAMES[tgt]}")
-        _append_log(f"Processing {LANG_NAMES[tgt]}...")
-        r = pipeline.dub_video(file.name, src_lang, tgt, out_dir, course_id,
-                               voice_clone=voice_clone, reference_audio=ref_path)
-        results[tgt] = r
-        status = "✅" if r.success else "❌"
-        _append_log(f"{status} {LANG_NAMES[tgt]} done in {r.elapsed_s}s")
-
-    progress(0.95, desc="Saving outputs...")
-    output_files, log_lines, quality_lines = [], [], []
-    for tgt, r in results.items():
-        lang = LANG_NAMES[tgt]
-        if r.success:
-            out = r.output_video_path or r.output_audio_path
-            output_files.append(out)
-            # Include SRT/VTT subtitles (KB Financial Schedule)
-            sub_dir = Path(out_dir) / tgt
-            for sub in list(sub_dir.glob("*.srt")) + list(sub_dir.glob("*.vtt")):
-                output_files.append(str(sub))
-            qs = r.quality_summary
-            log_lines.append(f"✅ {lang} → {Path(out).name}  ({r.elapsed_s}s)")
-            quality_lines.append(
-                f"{lang}: score={qs.get('avg_score','?')} | chrf={qs.get('avg_chrf','?')} | "
-                f"pass={qs.get('pass_rate','?')} | "
-                f"review_needed={qs.get('needs_review','?')}/{qs.get('total','?')} segs")
-        else:
-            log_lines.append(f"❌ {lang} → {r.error}")
-    saved = _save_outputs(output_files)
-    progress(1.0, desc="✅ Done")
-    return (saved[0] if saved else None,
-            saved or None,
-            "\n".join(log_lines),
-            "\n".join(quality_lines) or "No quality data")
-
-
 # ── Tab 2: Translate Document ─────────────────────────────────
 def _chunk_text(text: str, max_chars: int = 400) -> list[str]:
-    """Split long text into chunks that fit within model token limits."""
-    words, chunk, chunks = text.split(), [], []
-    for word in words:
-        chunk.append(word)
-        if len(" ".join(chunk)) >= max_chars:
-            chunks.append(" ".join(chunk))
-            chunk = []
-    if chunk:
-        chunks.append(" ".join(chunk))
+    """Split on sentence boundaries; only hard-split if a sentence itself is too long."""
+    import re
+    sentences = re.split(r'(?<=[.!?।॥])\s+', text.strip())
+    chunks, current = [], ""
+    for sent in sentences:
+        if not sent:
+            continue
+        if len(sent) > max_chars:
+            # Hard-split oversized sentence at word boundaries
+            words, part = sent.split(), ""
+            for w in words:
+                if len(part) + len(w) + 1 > max_chars and part:
+                    chunks.append(part)
+                    part = w
+                else:
+                    part = (part + " " + w).strip()
+            if part:
+                chunks.append(part)
+            current = ""
+        elif len(current) + len(sent) + 1 > max_chars and current:
+            chunks.append(current)
+            current = sent
+        else:
+            current = (current + " " + sent).strip()
+    if current:
+        chunks.append(current)
     return chunks or [text]
 
 
 def _translate_plain_doc(file_path: str, src_lang: str, tgt_langs: list,
                          out_dir: str, course_id: str,
                          progress, pipeline) -> tuple[list, list]:
-    """Extract text from PDF/DOCX/TXT, translate, save per-language .docx."""
+    """Translate PDF/DOCX/TXT. DOCX preserves all formatting; PDF/TXT → plain .docx."""
+    suffix = Path(file_path).suffix.lower()
+    output_files, log_lines = [], []
+
+    # ── DOCX: format-preserving path ─────────────────────────────────────
+    if suffix in (".docx", ".doc"):
+        from pipeline.doc_extractor import translate_docx
+
+        def _batch_translate(texts: list[str], src: str, tgt: str) -> list[str]:
+            """Document translation — raw engine, no protection layers."""
+            return pipeline.translator.translate_document_batch(texts, src, tgt)
+
+        for i, tgt in enumerate(tgt_langs):
+            progress((i + 1) / len(tgt_langs), desc=f"Translating → {LANG_NAMES[tgt]}")
+            out_path = os.path.join(out_dir, f"{course_id}_{tgt}.docx")
+            try:
+                translate_docx(file_path, out_path, _batch_translate, src_lang, tgt)
+                output_files.append(out_path)
+                log_lines.append(f"✅ {LANG_NAMES[tgt]} → {Path(out_path).name}")
+            except Exception as e:
+                log_lines.append(f"❌ {LANG_NAMES[tgt]}: {e}")
+        return output_files, log_lines
+
+    # ── PDF / TXT: plain-text path → translated .docx ────────────────────
     from pipeline.doc_extractor import extract_text
     from docx import Document as DocxDocument
 
@@ -210,18 +200,14 @@ def _translate_plain_doc(file_path: str, src_lang: str, tgt_langs: list,
     except Exception as e:
         return [], [f"❌ Could not extract text: {e}"]
 
-    # Split into paragraphs, then chunk any that are too long
     raw_paras = [p.strip() for p in text.splitlines() if p.strip()]
     paragraphs = []
     for p in raw_paras:
         paragraphs.extend(_chunk_text(p) if len(p) > 400 else [p])
 
-    output_files, log_lines = [], []
-
     for i, tgt in enumerate(tgt_langs):
         progress((i + 1) / len(tgt_langs), desc=f"Translating → {LANG_NAMES[tgt]}")
         try:
-            # translate_batch returns list of dicts: {"text": ..., "engine": ..., "score": ...}
             results = pipeline.translator.translate_batch(paragraphs, src_lang, tgt)
             translated_paras = [r.get("text", paragraphs[j]) for j, r in enumerate(results)]
         except Exception as e:
@@ -253,8 +239,12 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
 
     suffix = Path(file.name).suffix.lower()
 
-    # ── Plain document (PDF / DOCX / TXT) ──
-    if suffix in (".pdf", ".docx", ".doc", ".txt"):
+    # ── PDF blocked per tender §3.1 ──
+    if suffix == ".pdf":
+        return None, "❌ PDF documents are NOT translated per tender §3.1. Upload the PDF as-is to CBP portal in the original language."
+
+    # ── Plain document (DOCX / TXT) ──
+    if suffix in (".docx", ".doc", ".txt"):
         output_files, log_lines = _translate_plain_doc(
             file.name, src_lang, tgt_langs, out_dir, course_id, progress, pipeline)
         return _save_outputs(output_files) or None, "\n".join(log_lines)
@@ -262,7 +252,7 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
     # ── JSON paths (existing behaviour) ──
     output_files, log_lines = [], []
 
-    if doc_type == "Quiz (Word .docx)":
+    if doc_type == "Quiz / Assessment (Word .docx)":
         try:
             quiz = json.loads(Path(file.name).read_text(encoding="utf-8"))
         except Exception as e:
@@ -318,22 +308,31 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
         except Exception:
             pass
 
+    try:
+        import torch
+        _num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    except Exception:
+        _num_gpus = 1
+
     progress(0.1, desc="Starting pipeline...")
-    _append_log(f"Full course batch: {cid} → {tgt_langs}")
+    _append_log(f"Full course batch: {cid} → {tgt_langs} | GPUs={_num_gpus}")
     summary = pipeline.process_course_full(
         video_file.name, src_lang, tgt_langs, out_dir, cid,
         metadata=metadata, quiz=quiz,
         voice_clone=voice_clone, upload_to_cbp=upload_cbp,
+        num_gpus=_num_gpus,
     )
 
     all_files = []
     for tgt, info in summary["dubbing"].items():
         if info.get("output"):
             all_files.append(info["output"])
-        # Include SRT/VTT subtitles (KB Financial Schedule)
+        # Only include SRT/VTT matching this job's course_id + lang
         sub_dir = Path(out_dir) / tgt
-        for sub in list(sub_dir.glob("*.srt")) + list(sub_dir.glob("*.vtt")):
-            all_files.append(str(sub))
+        for ext in (".srt", ".vtt"):
+            p = sub_dir / f"{cid}_{tgt}{ext}"
+            if p.exists():
+                all_files.append(str(p))
     for p in summary.get("quiz_docx", {}).values():
         all_files.append(p)
     for p in summary.get("qa_reports", {}).values():
@@ -381,108 +380,259 @@ def build_ui():
 
         gr.Markdown(
             "# 🇮🇳 KB Translation & Dubbing System\n"
-            "**iGOT Karmayogi — 22 Indian Languages** | "
-            "IndicTrans2 · faster-whisper · MMS-TTS"
+            "**iGOT Karmayogi | RFB IN-KBL-543730-NC-RFB** · "
+            "22 Scheduled Indian Languages · "
+            "IndicTrans2 · faster-whisper · Parler-TTS · MMS-TTS"
         )
         status_bar = gr.Textbox(value=_pipeline_status, every=3,
                                 label="Pipeline Status", interactive=False, lines=1)
 
-        # ── Tab 1: Dub ────────────────────────────────────────
+        # ── Tab 1: Dub Video / Audio ──────────────────────────
         with gr.Tab("🎬 Dub Video / Audio"):
+            gr.Markdown(
+                "**iGOT Karmayogi — KB Tender RFB IN-KBL-543730-NC-RFB**  \n"
+                "Mandatory: 11 languages (KB-11) · Optional: remaining 11 scheduled languages · "
+                "Output: MP4 + SRT/VTT per language · Upload to CBP portal after acceptance"
+            )
             with gr.Row():
                 with gr.Column(scale=2):
-                    t1_file  = gr.File(label="Upload MP4 / MP3 / WAV",
-                                       file_types=[".mp4",".mp3",".wav",".flac"])
-                    t1_src   = gr.Dropdown(src_choices, value="eng", label="Source Language")
-                    t1_tgt   = gr.CheckboxGroup(tgt_choices, value=["hin","pan"],
-                                                label="Target Languages")
+                    t1_file = gr.File(
+                        label="Course Video / Audio (MP4 / MP3 / WAV)",
+                        file_types=[".mp4", ".mp3", ".wav", ".flac"]
+                    )
                     with gr.Row():
-                        gr.Button("KB 11", size="sm").click(
+                        t1_meta = gr.File(
+                            label="Course Metadata (Word / Excel / JSON)",
+                            file_types=[".docx", ".xlsx", ".json"]
+                        )
+                        t1_quiz = gr.File(
+                            label="Quiz / Assessment (Word / Excel / JSON)",
+                            file_types=[".docx", ".xlsx", ".json"]
+                        )
+                    t1_id  = gr.Textbox(label="Course ID", value="KB_COURSE_001",
+                                        placeholder="e.g. KB_COURSE_001")
+                    t1_src = gr.Dropdown(src_choices, value="eng", label="Source Language")
+                    t1_tgt = gr.CheckboxGroup(
+                        tgt_choices, value=KB_11,
+                        label="Target Languages  (KB-11 mandatory · tick more for optional)"
+                    )
+                    with gr.Row():
+                        gr.Button("✅ KB 11 (Mandatory)", size="sm").click(
                             lambda: KB_11, outputs=[t1_tgt])
                         gr.Button("All 22", size="sm").click(
-                            lambda: [c for _,c in tgt_choices], outputs=[t1_tgt])
+                            lambda: [c for _, c in tgt_choices], outputs=[t1_tgt])
                         gr.Button("Clear", size="sm").click(
                             lambda: [], outputs=[t1_tgt])
-                    t1_clone = gr.Checkbox(label="🎙️ Voice Cloning (Tier 2)", value=False)
-                    t1_ref   = gr.File(label="Reference Speaker Audio",
-                                       file_types=[".wav",".mp3"], visible=False)
+                    with gr.Row():
+                        t1_clone = gr.Checkbox(label="🎙️ Voice Cloning (Tier 2)", value=False)
+                        t1_cbp   = gr.Checkbox(label="📤 Upload to CBP Portal", value=False)
+                    t1_ref = gr.File(label="Reference Speaker Audio (.wav / .mp3)",
+                                     file_types=[".wav", ".mp3"], visible=False)
                     t1_clone.change(lambda v: gr.update(visible=v), t1_clone, t1_ref)
-                    t1_btn   = gr.Button("🚀 Start Dubbing", variant="primary")
+                    t1_btn = gr.Button("🚀 Start Dubbing", variant="primary", size="lg")
 
                 with gr.Column(scale=2):
-                    t1_preview = gr.Video(label="Preview (first language)")
-                    t1_dl      = gr.Files(label="Download All Outputs")
-                    t1_log     = gr.Textbox(label="Status", lines=6)
-                    t1_quality = gr.Textbox(label="Quality Scores", lines=5)
+                    t1_dl      = gr.Files(label="⬇️ Download All Outputs (MP4 · SRT · VTT · DOCX)")
+                    t1_quality = gr.Textbox(
+                        label="Job Summary & Quality Scores",
+                        lines=14, interactive=False,
+                        placeholder="Results appear here after job completes…"
+                    )
 
-            t1_btn.click(dub_file,
-                         inputs=[t1_file, t1_src, t1_tgt, t1_clone, t1_ref],
-                         outputs=[t1_preview, t1_dl, t1_log, t1_quality])
+            t1_btn.click(
+                process_course,
+                inputs=[t1_file, t1_meta, t1_quiz, t1_src, t1_tgt,
+                        t1_id, t1_clone, t1_cbp],
+                outputs=[t1_dl, t1_quality],
+            )
 
-        # ── Tab 2: Document ───────────────────────────────────
+        # ── Tab 2: Translate Document ─────────────────────────
         with gr.Tab("📄 Translate Document"):
+            gr.Markdown(
+                "Translate course materials per tender scope: **Quiz / Assessment** (Word/Excel) · "
+                "**Course Metadata** (title, description, learning outcomes, keywords) · "
+                "**PDF / TXT** documents"
+            )
             with gr.Row():
                 with gr.Column(scale=2):
-                    t2_file  = gr.File(label="Upload Document (PDF / DOCX / TXT / JSON)",
-                                       file_types=[".json", ".pdf", ".docx", ".doc", ".txt"])
-                    t2_type  = gr.Radio(["Quiz (Word .docx)", "Metadata (Excel .xlsx)"],
-                                        value="Quiz (Word .docx)", label="Document Type")
+                    gr.Markdown(
+                        "> ⚠️ **Tender Exclusions (§3.1):** PDF documents are uploaded as-is — not translated. "
+                        "Government speeches, ceremonial addresses and classified content must NOT be submitted for translation."
+                    )
+                    t2_file  = gr.File(
+                        label="Upload Document (DOCX / TXT / JSON — PDF not accepted)",
+                        file_types=[".docx", ".doc", ".xlsx", ".txt", ".json"]
+                    )
+                    t2_type  = gr.Radio(
+                        ["Quiz / Assessment (Word .docx)",
+                         "Course Metadata (Excel .xlsx)",
+                         "General Document (TXT / DOCX)"],
+                        value="Quiz / Assessment (Word .docx)",
+                        label="Document Type"
+                    )
                     t2_src   = gr.Dropdown(src_choices, value="eng", label="Source Language")
-                    t2_tgt   = gr.CheckboxGroup(tgt_choices, value=["hin","pan"],
+                    t2_tgt   = gr.CheckboxGroup(tgt_choices, value=KB_11,
                                                 label="Target Languages")
-                    t2_title = gr.Textbox(label="Course Title (optional)")
-                    t2_btn   = gr.Button("🚀 Translate", variant="primary")
+                    with gr.Row():
+                        gr.Button("KB 11", size="sm").click(lambda: KB_11, outputs=[t2_tgt])
+                        gr.Button("All 22", size="sm").click(
+                            lambda: [c for _, c in tgt_choices], outputs=[t2_tgt])
+                        gr.Button("Clear", size="sm").click(lambda: [], outputs=[t2_tgt])
+                    t2_title = gr.Textbox(label="Course Title (for metadata header)")
+                    t2_btn   = gr.Button("🚀 Translate Document", variant="primary")
                 with gr.Column(scale=2):
-                    t2_dl  = gr.Files(label="Download Outputs")
-                    t2_log = gr.Textbox(label="Log", lines=8)
+                    t2_dl  = gr.Files(label="⬇️ Download Translated Documents")
+                    t2_log = gr.Textbox(label="Translation Log", lines=10, interactive=False)
             t2_btn.click(translate_doc,
                          inputs=[t2_file, t2_src, t2_tgt, t2_type, t2_title],
                          outputs=[t2_dl, t2_log])
 
-        # ── Tab 3: Full Course ────────────────────────────────
-        with gr.Tab("📦 Full Course Batch"):
+        # ── Tab 3: QA Certificate ─────────────────────────────
+        with gr.Tab("📋 QA Certificate"):
+            gr.Markdown(
+                "Generate the **Language Quality Assurance Certification** required per tender SLA.  \n"
+                "Certifies: linguistic accuracy ≥ 98% · terminology consistency · "
+                "compliance with KB content guidelines · review by qualified language expert."
+            )
             with gr.Row():
                 with gr.Column(scale=2):
-                    t3_video = gr.File(label="Video / Audio",
-                                       file_types=[".mp4",".mp3",".wav"])
-                    t3_meta  = gr.File(label="Metadata JSON (optional)",
-                                       file_types=[".json"])
-                    t3_quiz  = gr.File(label="Quiz JSON (optional)",
-                                       file_types=[".json"])
-                    t3_id    = gr.Textbox(label="Course ID", placeholder="KB_COURSE_001")
-                    t3_src   = gr.Dropdown(src_choices, value="eng", label="Source Language")
-                    t3_tgt   = gr.CheckboxGroup(tgt_choices, value=KB_11,
-                                                label="Target Languages")
-                    with gr.Row():
-                        t3_clone = gr.Checkbox(label="Voice Cloning", value=False)
-                        t3_cbp   = gr.Checkbox(label="Upload to CBP Portal", value=False)
-                    t3_btn   = gr.Button("🚀 Process Full Course", variant="primary")
-                with gr.Column(scale=2):
-                    t3_dl  = gr.Files(label="Download All Outputs")
-                    t3_log = gr.Textbox(label="Summary JSON", lines=20)
-            t3_btn.click(process_course,
-                         inputs=[t3_video, t3_meta, t3_quiz, t3_src, t3_tgt,
-                                 t3_id, t3_clone, t3_cbp],
-                         outputs=[t3_dl, t3_log])
-
-        # ── Tab 4: QA Report ──────────────────────────────────
-        with gr.Tab("📋 QA Report"):
-            with gr.Row():
-                with gr.Column(scale=2):
-                    t4_id       = gr.Textbox(label="Course ID")
+                    t4_id       = gr.Textbox(label="Course ID", placeholder="KB_COURSE_001")
                     t4_src      = gr.Dropdown(src_choices, value="eng", label="Source Language")
                     t4_tgt      = gr.Dropdown(tgt_choices, value="hin", label="Target Language")
-                    t4_input    = gr.File(label="Original Input File")
-                    t4_output   = gr.File(label="Dubbed Output File (optional)")
-                    t4_reviewer = gr.Textbox(label="Reviewer Name",
-                                             value="Translation Agency QA Lead")
-                    t4_btn      = gr.Button("📋 Generate QA Certificate", variant="primary")
+                    t4_input    = gr.File(label="Original Source File (MP4 / MP3 / DOCX)")
+                    t4_output   = gr.File(label="Dubbed / Translated Output File")
+                    t4_reviewer = gr.Textbox(
+                        label="Language Expert / Reviewer Name",
+                        placeholder="e.g. Dr. Priya Nair (Tamil Expert)",
+                        value="Translation Agency QA Lead"
+                    )
+                    t4_btn = gr.Button("📋 Generate QA Certificate (.docx)", variant="primary")
                 with gr.Column(scale=2):
-                    t4_dl  = gr.File(label="Download QA Report (.docx)")
-                    t4_log = gr.Textbox(label="Status", lines=4)
+                    t4_dl  = gr.File(label="⬇️ Download QA Certificate (.docx)")
+                    t4_log = gr.Textbox(label="Status", lines=4, interactive=False)
+                    gr.Markdown(
+                        "**SLA Thresholds (KB Tender)**  \n"
+                        "- Score ≥ 0.55 → ✅ Pass (98%+ accuracy)  \n"
+                        "- Score 0.30–0.55 → ⚠️ Needs correction (resubmit within 5 days)  \n"
+                        "- Score < 0.30 → ❌ Failed — mandatory re-translation  \n\n"
+                        "**Delivery SLA**  \n"
+                        "- < 5% shortfall → No penalty  \n"
+                        "- 5–10% shortfall → 2% deduction  \n"
+                        "- > 10% shortfall → 4% deduction  \n"
+                        "- > 20% shortfall → 5% deduction"
+                    )
             t4_btn.click(gen_qa,
                          inputs=[t4_id, t4_tgt, t4_src, t4_input, t4_output, t4_reviewer],
                          outputs=[t4_dl, t4_log])
+
+        # ── Tab 4: Human Review ───────────────────────────────
+        with gr.Tab("👤 Human Review"):
+            _rev_state = gr.State([])   # list[dict] segments
+            _rev_path  = gr.State("")   # path to loaded metadata JSON
+
+            with gr.Row():
+                with gr.Column(scale=1):
+                    rv_file     = gr.File(label="Load *_metadata.json",
+                                         file_types=[".json"])
+                    rv_reviewer = gr.Textbox(
+                        label="Reviewer Name",
+                        placeholder="e.g. Dr. Priya Nair (Tamil Expert)")
+                    rv_load_btn = gr.Button("📂 Load Segments", variant="primary")
+                    rv_stats    = gr.Textbox(
+                        label="Review Progress  (SLA: corrections resubmitted within 5 days)",
+                        lines=2, interactive=False
+                    )
+                with gr.Column(scale=3):
+                    rv_table = gr.Dataframe(
+                        headers=["ID", "Time", "Source", "AI Translation",
+                                 "Corrected Text", "Score", "Flags", "🚩", "Decision"],
+                        datatype=["str","str","str","str","str",
+                                  "str","str","str","str"],
+                        interactive=True,
+                        wrap=True,
+                        label="Edit 'Corrected Text' and 'Decision' "
+                              "(approved / corrected / rejected)",
+                    )
+
+            with gr.Row():
+                rv_approve_all = gr.Button("✅ Approve All Unflagged")
+                rv_save_btn    = gr.Button("💾 Save Progress")
+                rv_cert_btn    = gr.Button("📜 Export Review Certificate (.docx)",
+                                           variant="primary")
+            with gr.Row():
+                rv_cert_dl = gr.File(label="Download Certificate")
+                rv_log     = gr.Textbox(label="Status", lines=3, interactive=False)
+
+            def _rv_load(file, reviewer):
+                if file is None:
+                    return [], "", [], "", "❌ Upload a metadata JSON first."
+                try:
+                    segs, _ = load_metadata(file.name)
+                    segs    = load_review(file.name, segs)
+                    rows    = segments_to_display(segs)
+                    stats   = review_stats(segs)
+                    return segs, file.name, rows, stats, f"✅ Loaded {len(segs)} segments."
+                except Exception as e:
+                    return [], "", [], "", f"❌ {e}"
+
+            def _rv_save(table_data, path, reviewer, segs):
+                if not path or not segs:
+                    return segs, "❌ Load a file first.", ""
+                for i, row in enumerate(table_data):
+                    if i < len(segs):
+                        segs[i]["corrected_text"] = row[4] or segs[i]["translated_text"]
+                        segs[i]["decision"]        = (row[8] or "").strip().lower()
+                try:
+                    sp = save_review(path, segs, reviewer or "Reviewer")
+                    return segs, f"✅ Saved → {sp}", review_stats(segs)
+                except Exception as e:
+                    return segs, f"❌ {e}", ""
+
+            def _rv_cert(table_data, path, reviewer, segs):
+                if not path or not segs:
+                    return None, "❌ Load and save a review first."
+                for i, row in enumerate(table_data):
+                    if i < len(segs):
+                        segs[i]["corrected_text"] = row[4] or segs[i]["translated_text"]
+                        segs[i]["decision"]        = (row[8] or "").strip().lower()
+                cert_path = str(
+                    Path(path).parent /
+                    (Path(path).stem.replace("_metadata", "") + "_review_cert.docx")
+                )
+                try:
+                    export_certificate(path, segs, reviewer or "Reviewer", cert_path)
+                    return cert_path, f"✅ Certificate → {Path(cert_path).name}"
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            def _rv_approve_all(table_data, segs):
+                rows = [list(r) for r in table_data]
+                for i, row in enumerate(rows):
+                    if i < len(segs) and not segs[i]["flags"] and not (row[8] or "").strip():
+                        rows[i][8] = "approved"
+                        segs[i]["decision"] = "approved"
+                return rows, segs, review_stats(segs)
+
+            rv_load_btn.click(
+                _rv_load,
+                inputs=[rv_file, rv_reviewer],
+                outputs=[_rev_state, _rev_path, rv_table, rv_stats, rv_log],
+            )
+            rv_save_btn.click(
+                _rv_save,
+                inputs=[rv_table, _rev_path, rv_reviewer, _rev_state],
+                outputs=[_rev_state, rv_log, rv_stats],
+            )
+            rv_cert_btn.click(
+                _rv_cert,
+                inputs=[rv_table, _rev_path, rv_reviewer, _rev_state],
+                outputs=[rv_cert_dl, rv_log],
+            )
+            rv_approve_all.click(
+                _rv_approve_all,
+                inputs=[rv_table, _rev_state],
+                outputs=[rv_table, _rev_state, rv_stats],
+            )
 
         # ── Tab 5: Settings ───────────────────────────────────
         with gr.Tab("⚙️ Settings"):
@@ -519,14 +669,235 @@ def build_ui():
             dir_save_btn.click(_set_output_dir, inputs=[out_dir_box], outputs=[dir_status])
             open_btn.click(lambda: (os.startfile(_get_output_dir()), "✅ Folder opened")[1], outputs=[dir_status])
 
-        # ── Tab 6: Live Logs ──────────────────────────────────
+                # ── Tab 6: Monthly Delivery Tracker ──────────────────
+        with gr.Tab("📅 Monthly Delivery"):
+            gr.Markdown(
+                "**Monthly Delivery Tracker — KB Tender §4.4**  \n"
+                "Track course hours delivered per month. SLA: 50–125 hrs/month. "
+                "Generate Month-wise Submission Report for CBP portal upload."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    md_month    = gr.Textbox(label="Month (e.g. 2025-07)", placeholder="YYYY-MM")
+                    md_course   = gr.Textbox(label="Course ID", placeholder="KB_COURSE_001")
+                    md_langs    = gr.CheckboxGroup(tgt_choices, value=KB_11, label="Languages Delivered")
+                    md_hours    = gr.Number(label="Content Hours Delivered (this course)", value=0, precision=2)
+                    md_add_btn  = gr.Button("➕ Add Entry", variant="primary")
+                    md_state    = gr.State([])  # list of row dicts
+                with gr.Column(scale=3):
+                    md_table = gr.Dataframe(
+                        headers=["Month", "Course ID", "Languages", "Hours", "Status"],
+                        datatype=["str", "str", "str", "number", "str"],
+                        interactive=False,
+                        label="Monthly Submissions"
+                    )
+                    md_summary = gr.Textbox(label="Monthly Summary", lines=5, interactive=False)
+            with gr.Row():
+                md_report_btn = gr.Button("📄 Export Month-wise Submission Report (.xlsx)", variant="primary")
+                md_complete_btn = gr.Button("📦 Export Consolidated Completion Report (.xlsx)")
+            with gr.Row():
+                md_dl  = gr.File(label="⬇️ Download Report")
+                md_log = gr.Textbox(label="Status", lines=3, interactive=False)
+
+            def _md_add(month, course, langs, hours, rows):
+                if not month or not course:
+                    return rows, rows, "❌ Month and Course ID are required."
+                total_this_month = sum(r["hours"] for r in rows if r["month"] == month) + hours
+                status = "✅ On track" if total_this_month <= 125 else "⚠️ Exceeds 125hr SLA cap"
+                if total_this_month < 50:
+                    status = "⚠️ Below 50hr minimum"
+                rows = rows + [{"month": month, "course": course,
+                                "langs": ", ".join(langs), "hours": hours, "status": status}]
+                table = [[r["month"], r["course"], r["langs"], r["hours"], r["status"]] for r in rows]
+                months = sorted(set(r["month"] for r in rows))
+                summary_lines = []
+                for m in months:
+                    mrows = [r for r in rows if r["month"] == m]
+                    total = sum(r["hours"] for r in mrows)
+                    courses = len(mrows)
+                    flag = "✅" if 50 <= total <= 125 else "⚠️"
+                    summary_lines.append(f"{flag} {m}: {total:.1f} hrs across {courses} course(s)")
+                return rows, table, "\n".join(summary_lines)
+
+            def _md_export_monthly(rows):
+                if not rows:
+                    return None, "❌ No entries to export."
+                try:
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Monthly Submission"
+                    ws.append(["Month", "Course ID", "Languages Delivered", "Hours", "Status"])
+                    for r in rows:
+                        ws.append([r["month"], r["course"], r["langs"], r["hours"], r["status"]])
+                    out = os.path.join(_get_output_dir(), "KB_Monthly_Submission_Report.xlsx")
+                    wb.save(out)
+                    return out, f"✅ Saved → {Path(out).name}"
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            def _md_export_completion(rows):
+                if not rows:
+                    return None, "❌ No entries to export."
+                try:
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Completion Report"
+                    ws.append(["Month", "Course ID", "Languages Delivered", "Hours", "Status"])
+                    for r in rows:
+                        ws.append([r["month"], r["course"], r["langs"], r["hours"], r["status"]])
+                    # Summary sheet
+                    ws2 = wb.create_sheet("Summary")
+                    ws2.append(["Month", "Total Hours", "Total Courses", "SLA Status"])
+                    months = sorted(set(r["month"] for r in rows))
+                    for m in months:
+                        mrows = [r for r in rows if r["month"] == m]
+                        total = sum(r["hours"] for r in mrows)
+                        flag = "On track" if 50 <= total <= 125 else "SLA breach"
+                        ws2.append([m, round(total, 2), len(mrows), flag])
+                    out = os.path.join(_get_output_dir(), "KB_Consolidated_Completion_Report.xlsx")
+                    wb.save(out)
+                    return out, f"✅ Saved → {Path(out).name}"
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            md_add_btn.click(
+                _md_add,
+                inputs=[md_month, md_course, md_langs, md_hours, md_state],
+                outputs=[md_state, md_table, md_summary],
+            )
+            md_report_btn.click(_md_export_monthly, inputs=[md_state], outputs=[md_dl, md_log])
+            md_complete_btn.click(_md_export_completion, inputs=[md_state], outputs=[md_dl, md_log])
+
+        # ── Tab 7: Glossary ───────────────────────────────────
+        with gr.Tab("📖 Glossary"):
+            gr.Markdown(
+                "**Standardised Terminology Glossary — KB Tender Final Deliverable**  \n"
+                "Add English terms with their approved translations per language. "
+                "Export as Excel (.xlsx) for CBP portal submission."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gl_term    = gr.Textbox(label="English Term", placeholder="e.g. Competency Framework")
+                    gl_domain  = gr.Textbox(label="Domain / Category", placeholder="e.g. HR, Governance, IT")
+                    gl_langs   = gr.CheckboxGroup(tgt_choices, value=KB_11, label="Languages to Add Translation For")
+                    gl_trans   = gr.Textbox(
+                        label="Translations (one per line: lang_code: translation)",
+                        placeholder="hin: दक्षता ढांचा\ntan: திறன் கட்டமைப்பு",
+                        lines=6
+                    )
+                    gl_add_btn = gr.Button("➕ Add Term", variant="primary")
+                    gl_state   = gr.State([])  # list of term dicts
+                with gr.Column(scale=3):
+                    gl_table = gr.Dataframe(
+                        headers=["English Term", "Domain", "Languages", "Translations"],
+                        datatype=["str", "str", "str", "str"],
+                        interactive=False,
+                        label="Glossary Entries"
+                    )
+            with gr.Row():
+                gl_export_btn  = gr.Button("📥 Export Glossary (.xlsx)", variant="primary")
+                gl_import_file = gr.File(label="Import Glossary (.xlsx)", file_types=[".xlsx"])
+                gl_import_btn  = gr.Button("📤 Import")
+            with gr.Row():
+                gl_dl  = gr.File(label="⬇️ Download Glossary")
+                gl_log = gr.Textbox(label="Status", lines=2, interactive=False)
+
+            def _gl_add(term, domain, langs, trans_text, rows):
+                if not term.strip():
+                    return rows, [[r["term"], r["domain"], r["langs"], r["trans"]] for r in rows], "❌ Term is required."
+                trans_map = {}
+                for line in trans_text.strip().splitlines():
+                    if ":" in line:
+                        k, _, v = line.partition(":")
+                        trans_map[k.strip()] = v.strip()
+                entry = {
+                    "term": term.strip(),
+                    "domain": domain.strip(),
+                    "langs": ", ".join(langs),
+                    "trans": " | ".join(f"{k}: {v}" for k, v in trans_map.items()),
+                    "trans_map": trans_map,
+                }
+                rows = rows + [entry]
+                table = [[r["term"], r["domain"], r["langs"], r["trans"]] for r in rows]
+                return rows, table, f"✅ Added '{term.strip()}' ({len(rows)} terms total)"
+
+            def _gl_export(rows):
+                if not rows:
+                    return None, "❌ No glossary entries to export."
+                try:
+                    import openpyxl
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Glossary"
+                    # Header: English + one column per language
+                    all_langs = sorted({k for r in rows for k in r.get("trans_map", {})})
+                    ws.append(["English Term", "Domain"] + [LANG_NAMES.get(l, l) for l in all_langs])
+                    for r in rows:
+                        row = [r["term"], r["domain"]] + [r.get("trans_map", {}).get(l, "") for l in all_langs]
+                        ws.append(row)
+                    out = os.path.join(_get_output_dir(), "KB_Standardised_Glossary.xlsx")
+                    wb.save(out)
+                    return out, f"✅ Saved → {Path(out).name} ({len(rows)} terms, {len(all_langs)} languages)"
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            def _gl_import(file, rows):
+                if file is None:
+                    return rows, [[r["term"], r["domain"], r["langs"], r["trans"]] for r in rows], "❌ Upload an .xlsx file."
+                try:
+                    import openpyxl
+                    wb = openpyxl.load_workbook(file.name)
+                    ws = wb.active
+                    headers = [str(c.value or "").strip() for c in next(ws.iter_rows(min_row=1, max_row=1))]
+                    lang_cols = headers[2:]  # after English Term, Domain
+                    # reverse map: lang name → code
+                    name_to_code = {v: k for k, v in LANG_NAMES.items()}
+                    imported = 0
+                    for row in ws.iter_rows(min_row=2, values_only=True):
+                        if not row[0]:
+                            continue
+                        trans_map = {}
+                        for i, lname in enumerate(lang_cols):
+                            val = row[2 + i] if 2 + i < len(row) else None
+                            if val:
+                                code = name_to_code.get(lname, lname)
+                                trans_map[code] = str(val)
+                        entry = {
+                            "term": str(row[0]),
+                            "domain": str(row[1] or ""),
+                            "langs": ", ".join(trans_map.keys()),
+                            "trans": " | ".join(f"{k}: {v}" for k, v in trans_map.items()),
+                            "trans_map": trans_map,
+                        }
+                        rows = rows + [entry]
+                        imported += 1
+                    table = [[r["term"], r["domain"], r["langs"], r["trans"]] for r in rows]
+                    return rows, table, f"✅ Imported {imported} terms."
+                except Exception as e:
+                    return rows, [], f"❌ {e}"
+
+            gl_add_btn.click(
+                _gl_add,
+                inputs=[gl_term, gl_domain, gl_langs, gl_trans, gl_state],
+                outputs=[gl_state, gl_table, gl_log],
+            )
+            gl_export_btn.click(_gl_export, inputs=[gl_state], outputs=[gl_dl, gl_log])
+            gl_import_btn.click(_gl_import, inputs=[gl_import_file, gl_state], outputs=[gl_state, gl_table, gl_log])
+
+        # ── Tab 8: Live Logs ──────────────────────────────────
         with gr.Tab("📊 Live Logs"):
-            gr.Markdown("Real-time pipeline logs. Refresh to update.")
-            log_box     = gr.Textbox(label="Pipeline Log", lines=30, interactive=False)
-            refresh_btn = gr.Button("🔄 Refresh Logs")
-            refresh_btn.click(_get_log, outputs=[log_box])
+            gr.Markdown("Real-time pipeline logs. Auto-refreshes every 3 s.")
+            log_box = gr.Textbox(value=_get_log, every=3,
+                                 label="Pipeline Log", lines=30, interactive=False)
 
     return app
+
+
+def create_app():
+    """Entry point for `gradio ui/app.py` hot-reload."""
+    return build_ui()
 
 
 if __name__ == "__main__":

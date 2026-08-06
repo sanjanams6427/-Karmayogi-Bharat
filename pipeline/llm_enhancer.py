@@ -1,5 +1,8 @@
 # ============================================================
 # LLM Translation Enhancer
+# Post-edit machine translations to meet KB tender 98% SLA.
+# Optional — activates only when an API key is set in .env.
+# Supports: Groq (free), Gemini, OpenRouter
 # ============================================================
 import os, json
 from pathlib import Path
@@ -8,7 +11,6 @@ from .retry import retry
 
 log = get_logger("llm")
 
-# Load .env into os.environ at import (keys read lazily per-call)
 _env = Path(__file__).parent.parent / ".env"
 if _env.exists():
     for line in _env.read_text(encoding="utf-8").splitlines():
@@ -17,14 +19,9 @@ if _env.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 
-def _groq_key():
-    return os.environ.get("GROQ_API_KEY", "")
-
-def _gemini_key():
-    return os.environ.get("GEMINI_API_KEY", "")
-
-def _openrouter_key():
-    return os.environ.get("OPENROUTER_API_KEY", "")
+def _groq_key():       return os.environ.get("GROQ_API_KEY", "")
+def _gemini_key():     return os.environ.get("GEMINI_API_KEY", "")
+def _openrouter_key(): return os.environ.get("OPENROUTER_API_KEY", "")
 
 _ENHANCE_PROMPT = """\
 You are a professional translator and language quality editor for Indian languages.
@@ -57,7 +54,8 @@ class LLMEnhancer:
         if self._provider:
             log.info(f"LLM enhancer active: {self._provider}")
         else:
-            log.info("No LLM API key found — enhancement disabled (set GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in .env)")
+            log.info("No LLM API key found — enhancement disabled "
+                     "(set GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in .env)")
 
     def _detect_provider(self) -> str | None:
         if _groq_key():       return "groq"
@@ -69,23 +67,18 @@ class LLMEnhancer:
     def available(self) -> bool:
         return self._detect_provider() is not None
 
-    # ----------------------------------------------------------
-    # Provider implementations
-    # ----------------------------------------------------------
     @retry(max_attempts=3, delay=1.0)
     def _call_groq(self, prompt: str) -> str:
         import urllib.request
-        key = _groq_key()
         payload = json.dumps({
             "model": "llama-3.3-70b-versatile",
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.1,
-            "max_tokens": 1024,
+            "temperature": 0.1, "max_tokens": 1024,
         }).encode()
         req = urllib.request.Request(
             "https://api.groq.com/openai/v1/chat/completions",
             data=payload,
-            headers={"Authorization": f"Bearer {key}",
+            headers={"Authorization": f"Bearer {_groq_key()}",
                      "Content-Type": "application/json"},
         )
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -94,23 +87,21 @@ class LLMEnhancer:
     @retry(max_attempts=3, delay=1.0)
     def _call_gemini(self, prompt: str) -> str:
         import urllib.request
-        # Key passed as header, NOT in URL, to prevent logging exposure
-        url = ("https://generativelanguage.googleapis.com/v1beta/models/"
-               "gemini-1.5-flash:generateContent")
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1024},
         }).encode()
-        req = urllib.request.Request(url, data=payload,
-                                     headers={"Content-Type": "application/json",
-                                              "x-goog-api-key": _gemini_key()})
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+            data=payload,
+            headers={"Content-Type": "application/json", "x-goog-api-key": _gemini_key()},
+        )
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())["candidates"][0]["content"]["parts"][0]["text"].strip()
 
     @retry(max_attempts=3, delay=1.0)
     def _call_openrouter(self, prompt: str) -> str:
         import urllib.request
-        key = _openrouter_key()
         payload = json.dumps({
             "model": "meta-llama/llama-3.3-70b-instruct:free",
             "messages": [{"role": "user", "content": prompt}],
@@ -119,7 +110,7 @@ class LLMEnhancer:
         req = urllib.request.Request(
             "https://openrouter.ai/api/v1/chat/completions",
             data=payload,
-            headers={"Authorization": f"Bearer {key}",
+            headers={"Authorization": f"Bearer {_openrouter_key()}",
                      "Content-Type": "application/json",
                      "HTTP-Referer": "https://kb-translation.local"},
         )
@@ -128,25 +119,20 @@ class LLMEnhancer:
 
     def _call(self, prompt: str) -> str:
         provider = self._detect_provider()
-        if provider == "groq":        return self._call_groq(prompt)
-        if provider == "gemini":      return self._call_gemini(prompt)
-        if provider == "openrouter":  return self._call_openrouter(prompt)
+        if provider == "groq":       return self._call_groq(prompt)
+        if provider == "gemini":     return self._call_gemini(prompt)
+        if provider == "openrouter": return self._call_openrouter(prompt)
         raise RuntimeError("No LLM provider available")
 
-    # ----------------------------------------------------------
-    # Public API
-    # ----------------------------------------------------------
-    def enhance(self, source: str, translation: str,
-                src_lang: str, tgt_lang: str) -> str:
+    def enhance(self, source: str, translation: str, src_lang: str, tgt_lang: str) -> str:
         """Enhance a single translation. Returns original if LLM unavailable."""
         if not self.available or not translation.strip():
             return translation
         try:
-            prompt = _ENHANCE_PROMPT.format(
+            result = self._call(_ENHANCE_PROMPT.format(
                 src_lang=src_lang, tgt_lang=tgt_lang,
                 source=source, translation=translation,
-            )
-            result = self._call(prompt)
+            ))
             log.debug(f"LLM enhanced [{tgt_lang}]: {translation[:60]} → {result[:60]}")
             return result
         except Exception as e:
@@ -159,14 +145,11 @@ class LLMEnhancer:
         if not self.available or not translations:
             return translations
         try:
-            prompt = _BATCH_PROMPT.format(
+            raw = self._call(_BATCH_PROMPT.format(
                 src_lang=src_lang, tgt_lang=tgt_lang,
                 translations_json=json.dumps(translations, ensure_ascii=False),
-            )
-            raw = self._call(prompt)
-            # Parse JSON array from response
-            start = raw.find("[")
-            end   = raw.rfind("]") + 1
+            ))
+            start, end = raw.find("["), raw.rfind("]") + 1
             if start >= 0 and end > start:
                 enhanced = json.loads(raw[start:end])
                 if isinstance(enhanced, list) and len(enhanced) == len(translations):

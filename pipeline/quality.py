@@ -165,10 +165,19 @@ def score_segment(source: str, translation: str,
             score -= 0.35
             break
 
-    # 4. Untranslated
+    # 4. Untranslated — exact copy OR source script dominates when target script expected
     if tgt_lang != "eng" and translation.strip() == source.strip():
         flags.append("untranslated")
         score -= 0.40
+    elif tgt_lang != "eng" and src_lang == "eng":
+        # If target expects a non-Latin script but output is >80% Latin, it's untranslated
+        latin_chars  = len(re.findall(r"[a-zA-Z]", translation))
+        total_alpha  = len(re.findall(r"[\w]", translation))
+        if total_alpha > 4 and latin_chars / total_alpha > 0.80:
+            script_range = _SCRIPT_RANGES.get(tgt_lang)
+            if script_range:  # only flag for non-Latin target scripts
+                flags.append("untranslated_latin_output")
+                score -= 0.35
 
     # 5. Too short
     if src_words >= 5 and tgt_words < 2:
@@ -180,7 +189,15 @@ def score_segment(source: str, translation: str,
         flags.append("transliteration_detected")
         score -= 0.35
 
-    # 7. ChrF — only meaningful when comparing translation to a reference.
+    # 7. Factual token preservation — numbers, dates, measurements must survive
+    src_tokens = set(re.findall(r"[\d]+(?:[.,][\d]+)*", source))
+    tgt_tokens = set(re.findall(r"[\d]+(?:[.,][\d]+)*", translation))
+    missing_nums = src_tokens - tgt_tokens
+    if missing_nums:
+        flags.append(f"missing_numbers:{','.join(sorted(missing_nums)[:5])}")
+        score -= 0.20
+
+    # 8. ChrF — only meaningful when comparing translation to a reference.
     #    source ≠ reference (different scripts), so skip cross-script pairs.
     same_script = (src_lang == "eng" and tgt_lang == "eng") or (src_lang == tgt_lang)
     chrf = chrf_score(source, translation) if same_script else 0.0

@@ -9,8 +9,12 @@ from pathlib import Path
 from .lang_config import LANG_NAMES
 from .lang_detect import tag_segments, fw_lang_to_internal
 
-# UI inference pinned to cuda:0 — fine-tuning runs on cuda:1/2/3 via FSDP
-DEVICE     = "cuda:0" if torch.cuda.is_available() else "cpu"
+import os
+try:
+    _gpu = int(os.environ.get("PIPELINE_GPU", "0"))
+except ValueError:
+    _gpu = 0
+DEVICE     = f"cuda:{_gpu}" if torch.cuda.is_available() else "cpu"
 ASR_DEVICE = DEVICE
 MODELS_DIR = Path(__file__).parent.parent / "models"
 
@@ -58,7 +62,8 @@ def _extract_wav(path: str) -> str:
     tmp.close()
     subprocess.run(
         [_FFMPEG, "-y", "-i", path, "-ac", "1", "-ar", "16000", "-vn", tmp.name],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        check=True, timeout=300,
     )
     return tmp.name
 
@@ -83,13 +88,15 @@ class ASREngine:
                 src = "large-v3"
             compute = "float16" if torch.cuda.is_available() else "int8"
             print(f"[ASR] Loading faster-whisper from {src} on {ASR_DEVICE}")
+            import os as _os
+            cpu_count = _os.cpu_count() or 4
             self._fw_model = WhisperModel(
                 src,
                 device="cuda" if torch.cuda.is_available() else "cpu",
                 device_index=int(ASR_DEVICE.split(":")[1]) if ":" in ASR_DEVICE else 0,
                 compute_type=compute,
                 num_workers=1,  # >1 deadlocks on Windows (no fork)
-                cpu_threads=4,
+                cpu_threads=min(cpu_count, 8),
                 download_root=str(MODELS_DIR / "indic_asr"),
             )
         return self._fw_model
@@ -113,8 +120,10 @@ class ASREngine:
             return internal, prob
         finally:
             if wav != str(audio_path):
-                try: os.unlink(wav)
-                except: pass
+                try:
+                    os.unlink(wav)
+                except Exception:
+                    pass
 
     def transcribe_segments(self, audio_path: str, lang: str) -> list[dict]:
         """
@@ -126,17 +135,9 @@ class ASREngine:
         try:
             model = self._load_fw()
 
-            # Auto-detect language if not specified
-            if lang == "auto" or not lang:
-                _probe_segs, info = model.transcribe(wav, beam_size=1, language=None,
-                                                     vad_filter=True, max_new_tokens=1)
-                list(_probe_segs)  # consume generator
-                lang = fw_lang_to_internal(info.language, fallback="eng")
-                print(f"[ASR] Auto-detected language: {info.language} → {lang} "
-                      f"(prob={info.language_probability:.2f})")
-
-            fw_lang = FW_LANG_CODES.get(lang)
-            raw_segs, _ = model.transcribe(
+            # Auto-detect language if not specified — single pass, no redundant probe
+            fw_lang = None if (lang == "auto" or not lang) else FW_LANG_CODES.get(lang)
+            raw_segs, info = model.transcribe(
                 wav,
                 language=fw_lang,
                 beam_size=5,
@@ -150,10 +151,17 @@ class ASREngine:
                 compression_ratio_threshold=2.4,
             )
             raw_segs = list(raw_segs)
+            # Resolve auto-detected language after consuming generator
+            if fw_lang is None:
+                lang = fw_lang_to_internal(info.language, fallback="eng")
+                print(f"[ASR] Auto-detected language: {info.language} → {lang} "
+                      f"(prob={info.language_probability:.2f})")
         finally:
             if wav != str(audio_path):
-                try: os.unlink(wav)
-                except: pass
+                try:
+                    os.unlink(wav)
+                except Exception:
+                    pass
 
         if not raw_segs:
             return []
@@ -163,12 +171,37 @@ class ASREngine:
         if lang in ("urd", "kas", "snd"):
             for seg in segments:
                 seg["text"] = _normalize_nastaliq(seg["text"])
+        # Strip ASR hallucination artifacts (garbage words at segment boundaries)
+        for seg in segments:
+            seg["text"] = _strip_hallucinations(seg["text"])
+        segments = [s for s in segments if s["text"].strip()]
         return segments
 
     def transcribe_file(self, audio_path: str, lang: str) -> str:
         """Return full transcript as plain text (for quick tests)."""
         segs = self.transcribe_segments(audio_path, lang)
         return " ".join(s["text"] for s in segs)
+
+
+def _strip_hallucinations(text: str) -> str:
+    """
+    Remove known Whisper hallucination patterns that appear at segment boundaries.
+    These are real English words that Whisper hallucinates when audio is unclear
+    at the start/end of a segment — they corrupt translation output.
+    """
+    import re
+    # Sentence-initial hallucination words Whisper commonly produces
+    _HALLUC_PREFIX = re.compile(
+        r'^(?:Wanner|Whener|Viengore|Venue|Guinevere|Gindis|Wener|Whener|'
+        r'Venger|Vien|Whan|Whan|Wener|Winer|Wanna|Gonna|Ginda|Gindas|'
+        r'Wanna|Gonna|Vanna|Venna|Vinna|Vanna|Wenna|Winna)\s+',
+        re.IGNORECASE
+    )
+    text = _HALLUC_PREFIX.sub('', text).strip()
+    # Capitalise first letter after stripping
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
 
 
 def _merge_segments(raw_segs, min_words: int = 6, min_dur: float = 1.5,

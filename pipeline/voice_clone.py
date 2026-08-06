@@ -1,8 +1,7 @@
 # ============================================================
-# Voice Cloning Module
+# Voice Cloning — KB Tender Tier 2 pricing
 # Uses Coqui XTTS-v2 to clone a speaker's voice from a
 # reference audio sample and synthesize dubbed speech.
-# Meets KB tender "with voice cloning" pricing tier.
 # All processing is local — no cloud API.
 # ============================================================
 
@@ -112,7 +111,6 @@ class VoiceCloner:
 
         try:
             if speaker_embedding:
-                # Use pre-computed embedding (faster for batch processing)
                 out = model.inference(
                     text=text,
                     language=xtts_lang,
@@ -121,7 +119,6 @@ class VoiceCloner:
                 )
                 sf.write(output_path, np.array(out["wav"]), 24000)
             else:
-                # Extract embedding on the fly
                 model.tts_to_file(
                     text=text,
                     language=xtts_lang,
@@ -143,7 +140,6 @@ class VoiceCloner:
         Synthesize all segments using cloned voice.
         Pre-computes speaker embedding once for efficiency.
         """
-        # Pre-compute embedding once for all segments
         embedding = self.extract_speaker_embedding(reference_audio)
         out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)

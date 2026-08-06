@@ -1,8 +1,7 @@
 # ============================================================
-# CBP Portal Uploader
+# CBP Portal Uploader — KB Tender Section 4.2
 # Uploads translated course assets to the iGOT Karmayogi
-# Competency Building Product (CBP) portal as required by
-# KB tender Section 4.2.
+# Competency Building Product (CBP) portal.
 # Portal: https://cbp.igotkarmayogi.gov.in
 # ============================================================
 
@@ -33,9 +32,6 @@ class CBPUploader:
         self._session = None
         self._token = None
 
-    # ----------------------------------------------------------
-    # Auth
-    # ----------------------------------------------------------
     def _get_session(self):
         if self._session is None:
             import requests
@@ -62,35 +58,25 @@ class CBPUploader:
                 session.headers.update({"Authorization": f"Bearer {self._token}"})
                 log.info("[CBP] Login successful")
                 return True
-            log.error(f"[CBP] Login failed: no token in response")
+            log.error("[CBP] Login failed: no token in response")
             return False
         except Exception as e:
             log.error(f"[CBP] Login error: {e}")
             return False
 
-    # ----------------------------------------------------------
-    # Upload methods
-    # ----------------------------------------------------------
     def upload_video(self, video_path: str, course_id: str, lang: str) -> dict:
-        """Upload a dubbed MP4 video to CBP portal."""
         return self._upload_asset(video_path, course_id, lang, asset_type="video")
 
     def upload_audio(self, audio_path: str, course_id: str, lang: str) -> dict:
-        """Upload a dubbed MP3 audio to CBP portal."""
         return self._upload_asset(audio_path, course_id, lang, asset_type="audio")
 
     def upload_metadata(self, metadata_path: str, course_id: str, lang: str) -> dict:
-        """Upload translated course metadata (Word/Excel) to CBP portal."""
         return self._upload_asset(metadata_path, course_id, lang, asset_type="metadata")
 
     def upload_quiz(self, quiz_path: str, course_id: str, lang: str) -> dict:
-        """Upload translated quiz/assessment (Word/Excel) to CBP portal."""
         return self._upload_asset(quiz_path, course_id, lang, asset_type="assessment")
 
-    def _upload_asset(
-        self, file_path: str, course_id: str, lang: str, asset_type: str
-    ) -> dict:
-        """Generic asset upload with retry logic."""
+    def _upload_asset(self, file_path: str, course_id: str, lang: str, asset_type: str) -> dict:
         import requests
         path = Path(file_path)
         if not path.exists():
@@ -105,11 +91,7 @@ class CBPUploader:
                     resp = session.post(
                         url,
                         files={"file": (path.name, f)},
-                        data={
-                            "courseId": course_id,
-                            "language": lang,
-                            "assetType": asset_type,
-                        },
+                        data={"courseId": course_id, "language": lang, "assetType": asset_type},
                         timeout=120,
                     )
                 resp.raise_for_status()
@@ -123,9 +105,6 @@ class CBPUploader:
 
         return {"success": False, "error": f"Upload failed after 3 attempts: {file_path}"}
 
-    # ----------------------------------------------------------
-    # Batch upload a full course package
-    # ----------------------------------------------------------
     def upload_course_package(self, package_dir: str, course_id: str, lang: str) -> dict:
         """
         Upload all assets for a translated course from a directory.
@@ -140,6 +119,8 @@ class CBPUploader:
             (f"*_{lang}.mp3",   "audio"),
             (f"*_{lang}*.xlsx", "metadata"),
             (f"*_{lang}*.docx", "assessment"),
+            (f"*_{lang}.srt",   "subtitle"),
+            (f"*_{lang}.vtt",   "subtitle"),
         ]
 
         for pattern, asset_type in patterns:
@@ -153,12 +134,7 @@ class CBPUploader:
         results["success"] = len(results["errors"]) == 0
         return results
 
-    # ----------------------------------------------------------
-    # Submission report
-    # ----------------------------------------------------------
-    def generate_submission_report(
-        self, upload_results: list[dict], output_path: str
-    ) -> str:
+    def generate_submission_report(self, upload_results: list[dict], output_path: str) -> str:
         """Generate a JSON submission report for KB records."""
         report = {
             "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),

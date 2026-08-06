@@ -29,10 +29,12 @@ def run_text(args, translator: Translator):
     results = {}
     for tgt in targets:
         t0 = time.time()
-        translated = translator.translate(args.text, args.src, tgt)
+        result = translator.translate(args.text, args.src, tgt)
         elapsed = time.time() - t0
+        translated = result["text"]
         results[tgt] = {"lang": LANG_NAMES[tgt], "text": translated, "time_s": round(elapsed, 2)}
         print(f"  [{LANG_NAMES[tgt]:12s}] {translated}")
+    return results
     return results
 
 

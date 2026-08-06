@@ -10,9 +10,15 @@
 #   - Partial output preserved on failure
 # ============================================================
 
-import json, time, shutil, hashlib, os, re, threading
+import json, time, shutil, hashlib, os, re, threading, platform
+import importlib.metadata as _ilm
 from pathlib import Path
 from dataclasses import dataclass, field
+
+import torch
+torch.backends.cudnn.benchmark = True  # fastest cuDNN kernels for fixed-size inputs
+torch.backends.cuda.matmul.allow_tf32 = True  # TF32 on A6000 = ~2x matmul throughput
+torch.backends.cudnn.allow_tf32 = True
 
 from .asr import ASREngine
 from .translator import Translator
@@ -26,6 +32,90 @@ from .lang_config import LANG_NAMES, ALL_22
 from .subtitles import generate_subtitles
 
 log = get_logger("dubbing_pipeline", "pipeline.log")
+audit_log = get_logger("audit", "audit.log")
+
+
+def _model_versions() -> dict:
+    """Collect installed package versions for audit trail."""
+    pkgs = ["faster-whisper", "transformers", "parler-tts", "torch", "soundfile"]
+    out = {}
+    for p in pkgs:
+        try:
+            out[p] = _ilm.version(p)
+        except Exception:
+            out[p] = "unknown"
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["git", "-C", str(Path(__file__).parent.parent), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+        out["git_commit"] = r.stdout.strip() if r.returncode == 0 else "unknown"
+    except Exception:
+        out["git_commit"] = "unknown"
+    return out
+
+
+def _worker_dub_langs(args: tuple) -> dict:
+    """
+    Top-level function (picklable) for multiprocessing workers.
+    Sets PIPELINE_GPU env var before importing torch/models so each worker
+    uses its assigned GPU exclusively.
+    args = (gpu_id, langs, video_path, src_lang, output_dir, course_id,
+            voice_clone, reference_audio, force, asr_cache_path)
+    asr_cache_path: path to pre-computed ASR segments JSON (avoids re-running ASR per worker)
+    """
+    import os, json
+    from pathlib import Path
+    gpu_id, langs, video_path, src_lang, output_dir, course_id, \
+        voice_clone, reference_audio, force, asr_cache_path = args
+    os.environ["PIPELINE_GPU"] = str(gpu_id)
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    pipeline = DubbingPipeline()
+    # Pre-seed ASR cache into each language's checkpoint so dub_video skips ASR
+    if asr_cache_path:
+        try:
+            cache = json.loads(open(asr_cache_path, encoding="utf-8").read())
+            segments      = cache["segments"]
+            resolved_lang = cache["src_lang"]
+            duration      = cache["duration"]
+            src_lang      = resolved_lang
+            for lang in langs:
+                job_id  = pipeline._job_id(video_path, src_lang, lang)
+                out_dir = Path(output_dir) / lang
+                tmp_dir = out_dir / "tmp" / job_id
+                tmp_dir.mkdir(parents=True, exist_ok=True)
+                # Write source.wav symlink/copy path marker so Step 1 is also skipped
+                wav_dst = tmp_dir / "source.wav"
+                if not wav_dst.exists():
+                    # Hard-link or copy the shared wav to avoid re-extraction
+                    src_wav = Path(asr_cache_path).parent / "source.wav"
+                    if src_wav.exists():
+                        try:
+                            import shutil
+                            shutil.copy2(str(src_wav), str(wav_dst))
+                        except Exception:
+                            pass
+                import sys, os as _os
+                sys.path.insert(0, str(Path(__file__).parent.parent))
+                from pipeline.retry import JobCheckpoint
+                ckpt = JobCheckpoint(job_id)
+                if not ckpt.get_meta("segments"):
+                    ckpt.set_meta("segments", segments)
+                    ckpt.set_meta("detected_src_lang", resolved_lang)
+                    ckpt.set_meta("duration", duration)
+                    ckpt.flush()
+        except Exception as e:
+            pass  # fall through — worker will run ASR itself
+    results = {}
+    for lang in langs:
+        results[lang] = pipeline.dub_video(
+            video_path, src_lang, lang, output_dir, course_id,
+            voice_clone=voice_clone, reference_audio=reference_audio,
+            force=force,
+        )
+    return results
 
 try:
     from .voice_clone import VoiceCloner
@@ -148,6 +238,11 @@ class DubbingPipeline:
         key = f"{Path(video_path).name}_{tgt_lang}"
         return hashlib.md5(key.encode()).hexdigest()[:12]
 
+    @staticmethod
+    def _sanitize_id(value: str) -> str:
+        """Strip path separators and shell-special chars from user-supplied IDs."""
+        return re.sub(r"[^\w\-]", "_", value)[:64]
+
     # ----------------------------------------------------------
     # Main public API
     # ----------------------------------------------------------
@@ -193,48 +288,53 @@ class DubbingPipeline:
     ) -> DubbingResult:
 
         t0         = time.time()
+        course_id  = self._sanitize_id(course_id)
+        tgt_lang   = self._sanitize_id(tgt_lang)
         src_name   = LANG_NAMES.get(src_lang, src_lang)
         tgt_name   = LANG_NAMES.get(tgt_lang, tgt_lang)
         input_path = Path(video_path)
         is_audio   = input_path.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg")
         job_id     = self._job_id(video_path, src_lang, tgt_lang)
 
-        log.info(f"START job={job_id} file={input_path.name} {src_name}→{tgt_name}")
+        log.info(f"START job={job_id} file={input_path.name} {src_name}->{tgt_name}")
+        audit_log.info(json.dumps({
+            "event": "job_start", "job_id": job_id,
+            "file": input_path.name, "src": src_lang, "tgt": tgt_lang,
+            "course_id": course_id, "host": platform.node(),
+        }, ensure_ascii=False))
 
         result = DubbingResult(source_lang=src_lang, target_lang=tgt_lang,
                                input_path=video_path)
 
         out_dir = Path(output_dir) / tgt_lang
 
-        # KB SoW 3.1 — skip if already translated (unless force=True)
-        existing = self.check_already_translated(course_id, tgt_lang, output_dir)
-        if not force and (existing.get("video") or existing.get("audio")):
-            out_path = next(
-                (p for p in (Path(output_dir) / tgt_lang).glob(f"{course_id}_{tgt_lang}.*")
-                 if p.suffix in (".mp4", ".mp3")), None)
-            # Skip only if file is large enough to be a real dubbed video (>500KB)
-            if out_path and out_path.stat().st_size > 500_000:
-                log.info(f"[{job_id}] Already translated — skipping. Existing: {out_path}")
-                result.output_video_path = str(out_path) if out_path.suffix == ".mp4" else ""
-                result.output_audio_path = str(out_path) if out_path.suffix == ".mp3" else ""
-                result.success = True
-                result.elapsed_s = 0.0
-                return result
-            elif out_path:
-                log.warning(f"[{job_id}] Existing output too small ({out_path.stat().st_size} bytes) — re-running")
-        # force=True: wipe existing outputs so stale file is never returned
+        # Always wipe previous output files so the user never gets a stale result.
+        # ASR + translation are still checkpointed (expensive) — only TTS/assembly re-run.
+        for p in out_dir.glob(f"{course_id}_{tgt_lang}.*"):
+            if p.suffix in (".mp4", ".mp3", ".srt", ".vtt", ".json"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
         if force:
-            for p in out_dir.glob(f"{course_id}_{tgt_lang}.*"):
-                if p.suffix in (".mp4", ".mp3", ".srt", ".vtt", ".json"):
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-            log.info(f"[{job_id}] force=True — cleared existing outputs for {tgt_lang}")
+            # force=True: also wipe ASR+translation checkpoint so everything re-runs
+            try:
+                JobCheckpoint(job_id).clear()
+            except Exception:
+                pass
+            log.info(f"[{job_id}] force=True — cleared outputs + checkpoint for {tgt_lang}")
+        else:
+            log.info(f"[{job_id}] Cleared previous output for {tgt_lang} — re-running TTS/assembly")
         tmp_dir = out_dir / "tmp" / job_id
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
         ckpt = JobCheckpoint(job_id) if resume else None
+
+        job_lock = _get_job_lock(course_id, tgt_lang)
+        if not job_lock.acquire(blocking=False):
+            result.error = f"Job already running for {course_id}/{tgt_lang} — skipping duplicate"
+            log.warning(f"[{job_id}] {result.error}")
+            return result
 
         try:
             # ── Validate ───────────────────────────────────────────
@@ -242,8 +342,16 @@ class DubbingPipeline:
 
             # ── Step 1: Audio extraction ───────────────────────────
             wav_path = str(tmp_dir / "source.wav")
-            if not Path(wav_path).exists():
-                log.info(f"[{job_id}] Step 1/6: Extracting audio")
+            # Re-extract if source.wav is older than the input video (stale cache)
+            wav_exists = Path(wav_path).exists()
+            wav_stale  = wav_exists and (
+                Path(wav_path).stat().st_mtime < Path(video_path).stat().st_mtime
+            )
+            if not wav_exists or wav_stale:
+                if wav_stale:
+                    log.info(f"[{job_id}] source.wav stale — re-extracting")
+                else:
+                    log.info(f"[{job_id}] Step 1/6: Extracting audio")
                 if is_audio:
                     self.video.convert_audio(video_path, wav_path, sample_rate=16000)
                     result.duration_original = self.video.get_audio_duration(wav_path)
@@ -252,20 +360,25 @@ class DubbingPipeline:
                     result.duration_original = self.video.get_video_duration(video_path)
                 if ckpt:
                     ckpt.set_meta("duration", result.duration_original)
+                    # Clear stale ASR segments so Step 2 re-runs
+                    if wav_stale:
+                        ckpt.set_meta("segments", None)
             else:
                 result.duration_original = ckpt.get_meta("duration", 0) if ckpt else \
                     self.video.get_video_duration(video_path)
                 log.info(f"[{job_id}] Step 1/6: Audio cached")
 
             # -- Step 1b: SeamlessM4T S2ST (direct speech-to-speech) --
-            # Attempt S2ST for supported lang pairs - skips ASR+translate+TTS
-            # Only loads Seamless, not IndicTrans2
+            # Only for Indic→Indic pairs. English source always uses full ASR→Translate→TTS.
             from .lang_config import SEAMLESS_S2ST_LANGS
             s2st_wav = str(tmp_dir / "s2st_dubbed.wav")
+            # Delete stale s2st file so it never blocks the full pipeline
+            if Path(s2st_wav).exists():
+                Path(s2st_wav).unlink(missing_ok=True)
             _s2st_ok = (src_lang != "auto"
+                        and src_lang != "eng"
                         and src_lang in SEAMLESS_S2ST_LANGS
-                        and tgt_lang in SEAMLESS_S2ST_LANGS
-                        and not Path(s2st_wav).exists())
+                        and tgt_lang in SEAMLESS_S2ST_LANGS)
             if _s2st_ok:
                 log.info(f"[{job_id}] Attempting SeamlessM4T S2ST {src_lang}->{tgt_lang}")
                 if self._translator is None:
@@ -336,9 +449,20 @@ class DubbingPipeline:
             result.quality_summary = review_summary(scores)
             log.info(f"[{job_id}] Quality: {result.quality_summary}")
 
+            # ── Quality gate: silence failed-translation segments before TTS ──
+            failed_count = sum(1 for s in translated_segments if s.get("quality", {}).get("failed"))
+            if failed_count:
+                log.warning(f"[{job_id}] {failed_count}/{len(translated_segments)} segments "
+                            f"failed quality gate — writing silence for those segments")
+                translated_segments = [
+                    {**s, "text": ""} if s.get("quality", {}).get("failed") else s
+                    for s in translated_segments
+                ]
+
             # ── Step 4: TTS ────────────────────────────────────────
             log.info(f"[{job_id}] Step 4/6: TTS synthesis")
             tts_dir = str(tmp_dir / "tts_segments")
+            shutil.rmtree(tts_dir, ignore_errors=True)
             if voice_clone and self.voice_cloner and self.voice_cloner.is_supported(tgt_lang):
                 ref = reference_audio or wav_path
                 tts_segments = self.voice_cloner.synthesize_segments_with_clone(
@@ -356,13 +480,26 @@ class DubbingPipeline:
 
             # ── Step 6: Output ─────────────────────────────────────
             log.info(f"[{job_id}] Step 6/6: Writing output")
+
+            # Generate subtitles first so they can be embedded in the MP4
+            srt_path = None
+            if generate_subs and translated_segments:
+                try:
+                    sub_paths = generate_subtitles(
+                        translated_segments, str(out_dir), course_id, tgt_lang)
+                    srt_path = sub_paths.get("srt")
+                except Exception as e:
+                    log.warning(f"[{job_id}] Subtitle generation failed: {e}")
+
             if is_audio:
                 out_audio = str(out_dir / f"{course_id}_{tgt_lang}.mp3")
                 self.video.convert_audio(dubbed_wav, out_audio)
                 result.output_audio_path = out_audio
             else:
                 out_video = str(out_dir / f"{course_id}_{tgt_lang}.mp4")
-                self.video.replace_audio_in_video(video_path, dubbed_wav, out_video)
+                self.video.replace_audio_in_video(
+                    video_path, dubbed_wav, out_video,
+                    srt_path=srt_path, lang=tgt_lang)
                 result.output_video_path = out_video
                 result.duration_output   = self.video.get_video_duration(out_video)
 
@@ -383,19 +520,16 @@ class DubbingPipeline:
                     result.quality_summary["duration_ratio"]      = round(ratio, 3)
                     result.quality_summary["duration_ratio_flag"] = False
 
-            # ── Subtitle generation (KB tender Financial Schedule) ─
-            if generate_subs and translated_segments:
-                try:
-                    generate_subtitles(
-                        translated_segments, str(out_dir), course_id, tgt_lang)
-                except Exception as e:
-                    log.warning(f"[{job_id}] Subtitle generation failed: {e}")
-
             self._save_metadata(result, out_dir, course_id)
             result.success   = True
             result.elapsed_s = round(time.time() - t0, 1)
             out = result.output_video_path or result.output_audio_path
-            log.info(f"[{job_id}] SUCCESS elapsed={result.elapsed_s}s → {out}")
+            log.info(f"[{job_id}] SUCCESS elapsed={result.elapsed_s}s -> {out}")
+            audit_log.info(json.dumps({
+                "event": "job_success", "job_id": job_id,
+                "tgt": tgt_lang, "elapsed_s": result.elapsed_s,
+                "output": out, "quality": result.quality_summary,
+            }, ensure_ascii=False))
 
             # Clear checkpoint on success
             if ckpt:
@@ -405,7 +539,12 @@ class DubbingPipeline:
             result.error     = str(e)
             result.elapsed_s = round(time.time() - t0, 1)
             log.error(f"[{job_id}] FAILED: {e}", exc_info=True)
+            audit_log.info(json.dumps({
+                "event": "job_failed", "job_id": job_id,
+                "tgt": tgt_lang, "elapsed_s": result.elapsed_s, "error": str(e),
+            }, ensure_ascii=False))
         finally:
+            job_lock.release()
             # Keep tmp only on failure (for resume); clean on success
             if result.success:
                 shutil.rmtree(str(tmp_dir), ignore_errors=True)
@@ -422,8 +561,15 @@ class DubbingPipeline:
         voice_clone:     bool = False,
         reference_audio: str  = None,
         force:           bool = False,
+        num_gpus:        int  = 1,
     ) -> dict[str, DubbingResult]:
-        """Run target languages sequentially — models share one GPU context safely."""
+        """Run target languages — parallel across GPUs when num_gpus > 1."""
+        if num_gpus > 1:
+            return self.dub_course_parallel(
+                video_path, src_lang, tgt_langs, output_dir, course_id,
+                voice_clone=voice_clone, reference_audio=reference_audio,
+                force=force, num_gpus=num_gpus,
+            )
         results = {}
         for tgt_lang in tgt_langs:
             results[tgt_lang] = self.dub_video(
@@ -432,6 +578,99 @@ class DubbingPipeline:
                 force=force,
             )
         return results
+
+    def dub_course_parallel(
+        self,
+        video_path:      str,
+        src_lang:        str,
+        tgt_langs:       list[str],
+        output_dir:      str,
+        course_id:       str  = "course",
+        voice_clone:     bool = False,
+        reference_audio: str  = None,
+        force:           bool = False,
+        num_gpus:        int  = 4,
+    ) -> dict[str, DubbingResult]:
+        """
+        Distribute target languages across num_gpus GPUs using multiprocessing.
+        ASR runs ONCE here in the main process, segments are cached to disk and
+        shared to all workers — eliminates 4x redundant transcription.
+        Each worker gets its own GPU via PIPELINE_GPU and runs translate+TTS+assemble.
+        """
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+
+        # ── Step 1: Run ASR once in main process ──────────────────
+        log.info("[parallel] Running ASR once in main process (shared across all workers)")
+        self._validate_input(video_path)
+        input_path = Path(video_path)
+        is_audio   = input_path.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg")
+
+        # Shared tmp dir for ASR cache
+        asr_tmp = Path(output_dir) / "_asr_shared"
+        asr_tmp.mkdir(parents=True, exist_ok=True)
+        wav_path     = str(asr_tmp / "source.wav")
+        asr_cache_path = str(asr_tmp / "asr_cache.json")
+
+        if not Path(asr_cache_path).exists() or (
+            Path(asr_cache_path).stat().st_mtime < Path(video_path).stat().st_mtime
+        ):
+            if not Path(wav_path).exists():
+                if is_audio:
+                    self.video.convert_audio(video_path, wav_path, sample_rate=16000)
+                    duration = self.video.get_audio_duration(wav_path)
+                else:
+                    self.video.extract_audio(video_path, wav_path, sample_rate=16000)
+                    duration = self.video.get_video_duration(video_path)
+            else:
+                duration = self.video.get_video_duration(video_path)
+
+            segments = self.asr.transcribe_segments(wav_path, src_lang)
+            if src_lang == "auto" or not src_lang:
+                src_lang = segments[0].get("detected_lang", "eng") if segments else "eng"
+            log.info(f"[parallel] ASR done: {len(segments)} segments, src_lang={src_lang}")
+
+            import json as _json
+            Path(asr_cache_path).write_text(
+                _json.dumps({"segments": segments, "src_lang": src_lang, "duration": duration},
+                            ensure_ascii=False),
+                encoding="utf-8"
+            )
+        else:
+            import json as _json
+            cache    = _json.loads(Path(asr_cache_path).read_text(encoding="utf-8"))
+            src_lang = cache["src_lang"]
+            log.info(f"[parallel] ASR cache hit: {len(cache['segments'])} segments")
+
+        # ── Step 2: Distribute langs across GPUs ──────────────────
+        from collections import defaultdict
+        gpu_groups: dict[int, list[str]] = defaultdict(list)
+        for i, lang in enumerate(tgt_langs):
+            gpu_groups[i % num_gpus].append(lang)
+
+        worker_args = [
+            (gpu_id, langs, video_path, src_lang, output_dir, course_id,
+             voice_clone, reference_audio, force, asr_cache_path)
+            for gpu_id, langs in gpu_groups.items()
+        ]
+
+        log.info(f"[parallel] Spawning {len(worker_args)} workers across {num_gpus} GPUs")
+        for gpu_id, langs in gpu_groups.items():
+            log.info(f"  GPU {gpu_id}: {langs}")
+
+        with ctx.Pool(processes=len(worker_args)) as pool:
+            group_results = pool.map(_worker_dub_langs, worker_args)
+
+        # Clean up shared ASR cache
+        try:
+            shutil.rmtree(str(asr_tmp), ignore_errors=True)
+        except Exception:
+            pass
+
+        merged: dict[str, DubbingResult] = {}
+        for group in group_results:
+            merged.update(group)
+        return merged
 
     # ----------------------------------------------------------
     # Parallel translation with checkpoint
@@ -457,15 +696,29 @@ class DubbingPipeline:
 
         pending_segs  = [segments[i] for i in pending_idxs]
         pending_texts = [s.get("text", "").strip() for s in pending_segs]
-        # indices into pending_segs/pending_texts that are empty vs have text
+        # indices into pending_segs/pending_texts that are empty, non-translatable, or have text
+        from .translator import _is_fully_nontranslatable
         empty_local   = [i for i, t in enumerate(pending_texts) if not t]
-        text_local    = [i for i, t in enumerate(pending_texts) if t]
+        nt_local      = [i for i, t in enumerate(pending_texts)
+                         if t and _is_fully_nontranslatable(t)]
+        nt_set        = set(nt_local)
+        text_local    = [i for i, t in enumerate(pending_texts)
+                         if t and i not in nt_set]
 
         # Empty segments — pass through immediately
         for local_i in empty_local:
             results[pending_idxs[local_i]] = {
                 **pending_segs[local_i], "text": "", "engine": "empty",
                 "enhanced": False,
+                "quality": {"score": 1.0, "flags": [], "needs_review": False, "failed": False}
+            }
+
+        # Non-translatable segments (URLs, code, paths) — pass through unchanged
+        for local_i in nt_local:
+            orig_text = pending_texts[local_i]
+            results[pending_idxs[local_i]] = {
+                **pending_segs[local_i], "text": orig_text,
+                "engine": "passthrough_nontranslatable", "enhanced": False,
                 "quality": {"score": 1.0, "flags": [], "needs_review": False, "failed": False}
             }
 
@@ -495,14 +748,87 @@ class DubbingPipeline:
                                   "needs_review": True, "failed": True}
                     })
 
+        # Completeness guard: output count must match input count
+        if len(batch_results) != len(text_local):
+            log.error(
+                f"[{job_id}] Completeness violation: sent {len(text_local)} segments, "
+                f"got {len(batch_results)} back — falling back to per-segment"
+            )
+            batch_results = []
+            for t, dl in zip(texts_to_translate, detected_langs):
+                try:
+                    batch_results.append(
+                        self.translator.translate(t, src_lang, tgt_lang,
+                                                  glossary=self.glossary, detected_lang=dl))
+                except Exception:
+                    batch_results.append({
+                        "text": t, "engine": "failed", "enhanced": False,
+                        "score": {"score": 0.0, "flags": ["translation_error"],
+                                  "needs_review": True, "failed": True}
+                    })
+
         for batch_i, local_i in enumerate(text_local):
             seg  = pending_segs[local_i]
             r    = batch_results[batch_i]
-            done = {**seg, "text": r["text"], "engine": r["engine"],
+            # Completeness guard: never emit an empty translation for a non-empty source.
+            # Do NOT fall back to English source text — that sends English to a non-English TTS voice.
+            # Instead retry with per-segment translate() which has Seamless → NLLB fallback chain.
+            translated_text = r["text"]
+            if not translated_text.strip() and pending_texts[local_i].strip():
+                log.warning(
+                    f"[{job_id}] Empty translation for seg {seg['id']} — retrying per-segment"
+                )
+                try:
+                    retry_r = self.translator.translate(
+                        pending_texts[local_i], src_lang, tgt_lang,
+                        glossary=self.glossary,
+                        detected_lang=pending_segs[local_i].get("detected_lang"))
+                    translated_text = retry_r["text"] or pending_texts[local_i]
+                    r = {**r, "text": translated_text,
+                         "engine": retry_r.get("engine", "retry_fallback"),
+                         "score": {**r.get("score", {}),
+                                   "flags": r.get("score", {}).get("flags", []) + ["completeness_retry"],
+                                   "needs_review": True}}
+                except Exception as retry_e:
+                    log.error(f"[{job_id}] Retry also failed for seg {seg['id']}: {retry_e}")
+                    # Last resort: write silence for this segment rather than wrong-language audio
+                    translated_text = ""
+                    r = {**r, "text": "", "score": {**r.get("score", {}),
+                                                    "flags": r.get("score", {}).get("flags", []) + ["translation_failed"],
+                                                    "needs_review": True, "failed": True}}
+            done = {**seg, "text": translated_text, "engine": r["engine"],
                     "enhanced": False, "quality": r["score"]}
             results[pending_idxs[local_i]] = done
             if ckpt:
                 ckpt.mark_done(seg["id"], done)
+
+        # Completeness guard: ensure no result slot is None (would silently drop a segment)
+        for i, r in enumerate(results):
+            if r is None:
+                orig_seg = segments[i]
+                log.warning(
+                    f"[{job_id}] Segment {orig_seg.get('id')} has no translation result — "
+                    f"retrying per-segment"
+                )
+                try:
+                    retry_r = self.translator.translate(
+                        orig_seg.get("text", ""), src_lang, tgt_lang,
+                        glossary=self.glossary)
+                    results[i] = {
+                        **orig_seg,
+                        "text": retry_r["text"] or "",
+                        "engine": retry_r.get("engine", "retry_fallback"),
+                        "enhanced": False,
+                        "quality": {"score": 0.0, "flags": ["completeness_retry"],
+                                    "needs_review": True, "failed": False},
+                    }
+                except Exception:
+                    results[i] = {
+                        **orig_seg, "text": "",
+                        "engine": "failed", "enhanced": False,
+                        "quality": {"score": 0.0, "flags": ["translation_failed"],
+                                    "needs_review": True, "failed": True},
+                    }
 
         # Single flush after entire batch — not per segment
         if ckpt:
@@ -997,6 +1323,7 @@ class DubbingPipeline:
         output_dir: str, course_id: str, metadata: dict = None,
         quiz: list[dict] = None, voice_clone: bool = False,
         reference_audio: str = None, upload_to_cbp: bool = False,
+        num_gpus: int = 1,
     ) -> dict:
         summary = {"course_id": course_id, "source_lang": src_lang,
                    "target_langs": tgt_langs, "dubbing": {},
@@ -1005,7 +1332,8 @@ class DubbingPipeline:
         out_dir = Path(output_dir)
         dub_results = self.dub_course(
             video_path, src_lang, tgt_langs, output_dir, course_id,
-            voice_clone=voice_clone, reference_audio=reference_audio)
+            voice_clone=voice_clone, reference_audio=reference_audio,
+            num_gpus=num_gpus)
         summary["dubbing"] = {
             lang: {"success": r.success,
                    "output":  r.output_video_path or r.output_audio_path,
@@ -1072,6 +1400,12 @@ class DubbingPipeline:
             "quality_summary":    result.quality_summary,
             "transcript":         result.transcript,
             "translations":       result.translations,
+            "provenance": {
+                "model_versions": _model_versions(),
+                "host":           platform.node(),
+                "generated_at":   time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "contract":       "RFB IN-KBL-543730-NC-RFB",
+            },
         }
         p = out_dir / f"{course_id}_{result.target_lang}_metadata.json"
         p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")

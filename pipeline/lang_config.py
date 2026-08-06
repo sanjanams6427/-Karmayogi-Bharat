@@ -37,13 +37,17 @@ SEAMLESS_CODES = {
     "tam": "tam", "tel": "tel", "urd": "urd", "nep": "npi",
     "mai": "mai", "snd": "snd", "asm": "asm", "mni": "mni",
     "sat": "sat",
+    # bod (Bodo/Boro) — SeamlessM4T supports brx (Bodo) text translation
+    "bod": "brx",
+    # doi (Dogri) — SeamlessM4T supports doi text translation
+    "doi": "doi",
 }
 
 # SeamlessM4T S2ST — speech OUTPUT supported langs only (subset of SEAMLESS_CODES)
 # Source: SeamlessM4Tv2 model card — only these Indian langs support speech synthesis output
 # tam/mal/ory/pan/guj/asm/mai/snd NOT supported for S2ST speech output
+# S2ST only applies for Indic→Indic pairs — English source always uses ASR→Translate→TTS
 SEAMLESS_S2ST_LANGS = {
-    "eng": "eng",
     "ben": "ben", "hin": "hin", "kan": "kan",
     "tel": "tel", "urd": "urd",
 }
@@ -58,7 +62,7 @@ NLLB_CODES = {
     "nep": "npi_Deva", "mai": "mai_Deva", "snd": "snd_Arab",
     "kas": "kas_Arab", "kok": "kok_Deva", "mni": "mni_Beng",
     "san": "san_Deva", "sat": "sat_Olck", "doi": "doi_Deva",
-    # bod (Bodo) omitted — NLLB bod_Tibt is Tibetan, not Bodo language
+    "bod": "brx_Deva",  # Bodo — NLLB uses brx_Deva (Bodo/Boro in Devanagari), NOT bod_Tibt (Tibetan)
 }
 
 # IndicWhisper language codes

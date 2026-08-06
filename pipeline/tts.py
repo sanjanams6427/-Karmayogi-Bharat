@@ -1,12 +1,14 @@
 # ============================================================
 # TTS Engine — Offline, Zero-cost
-# Primary  : Indic Parler-TTS — 21 langs, 44kHz, GPU batch
-# Fallback : MMS-TTS — all 22 langs (Tamil primary)
-# Last     : pyttsx3 system voices
+# Primary  : Indic Parler-TTS — 22 langs, 44kHz, GPU batch
+# Fallback1: MMS-TTS — all 22 langs
+# Fallback2: Coqui XTTS-v2 — open-source, near-human quality
 # ============================================================
 
 import os, subprocess, json
 import torch
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 import numpy as np
 import soundfile as sf
 from pathlib import Path
@@ -15,10 +17,17 @@ from .logger import get_logger
 
 log = get_logger(__name__)
 
+# Warn once at import time if resampy is missing — pitch_shift will use soxr fallback
+try:
+    import resampy as _resampy_check  # noqa: F401
+except ImportError:
+    log.warning("resampy not installed — librosa pitch_shift will use soxr_hq backend")
+
+import os as _os
+_gpu = _os.environ.get("PIPELINE_GPU", "0")
 DEVICE = (
-    os.environ.get("TTS_DEVICE")
-    or ("cuda:1" if torch.cuda.is_available() and torch.cuda.device_count() > 1 else
-        "cuda:0" if torch.cuda.is_available() else "cpu")
+    _os.environ.get("TTS_DEVICE")
+    or (f"cuda:{_gpu}" if torch.cuda.is_available() else "cpu")
 )
 
 try:
@@ -27,101 +36,106 @@ try:
 except Exception:
     _FFMPEG = "ffmpeg"
 
-MODELS_DIR  = Path(__file__).parent.parent / "models"
-PARLER_DIR  = MODELS_DIR / "indic_parler_tts"
-FLAN_T5_DIR = MODELS_DIR / "flan_t5_large"
-MMS_DIR     = MODELS_DIR / "mms"
+MODELS_DIR       = Path(__file__).parent.parent / "models"
+# Large model is primary (3.58GB, better quality); mini is fallback
+PARLER_LARGE_DIR = MODELS_DIR / "indic_parler_tts_large"
+PARLER_MINI_DIR  = MODELS_DIR / "indic_parler_tts"
+PARLER_DIR       = PARLER_LARGE_DIR if PARLER_LARGE_DIR.exists() else PARLER_MINI_DIR
+FLAN_T5_DIR      = MODELS_DIR / "flan_t5_large"
+MMS_DIR          = MODELS_DIR / "mms"
+MMS_STANDALONE   = MODELS_DIR / "mms_standalone"  # standalone per-lang VITS models
+XTTS_DIR         = MODELS_DIR / "xtts_v2"          # Coqui XTTS-v2 — open-source fallback
+
+# Languages that have a standalone VITS model (not an adapter of the shared MMS base)
+# key = pipeline lang code, value = subfolder under MMS_STANDALONE
+_MMS_STANDALONE_LANGS = {
+    "doi": "dgo",   # facebook/mms-tts-dgo — real Dogri VITS
+}
 
 SR = 44100  # target sample rate
 
 
-def _is_ai4bharat_model() -> bool:
-    """Detect if the downloaded Parler checkpoint is ai4bharat large (self-contained)
-    vs parler-tts-mini (needs separate flan-t5 tokenizer)."""
-    cfg = PARLER_DIR / "config.json"
+def _is_ai4bharat_model(model_dir: Path = None) -> bool:
+    """Detect if the Parler checkpoint has its own text encoder tokenizer embedded."""
+    d = model_dir or PARLER_DIR
+    cfg = d / "config.json"
     if not cfg.exists():
         return False
     try:
         c = json.loads(cfg.read_text(encoding="utf-8"))
         name = c.get("_name_or_path", "")
-        return "ai4bharat" in name or "indic-parler" in name.lower()
+        has_own_tokenizer = (d / "tokenizer.json").exists()
+        return "ai4bharat" in name or "indic-parler" in name.lower() or has_own_tokenizer
     except Exception:
         return False
 
 
-# Languages where Parler-TTS mini produces silence — route directly to MMS
-# Empty: let Parler try all langs, fall back to MMS if output too short
-_PARLER_SKIP_LANGS: set = set()
+# Languages where Parler-TTS cannot render the script — skip directly to MMS
+# sat=Ol Chiki, kas/snd=Arabic script — Parler always produces silence for these
+_PARLER_SKIP_LANGS: set = {"sat", "kas", "snd"}
 
-# Speaker descriptions for Parler-TTS mini
-_PARLER_SPEAKERS = {
-    "hin": ("Priya",     "Priya has a warm, clear female voice with perfect Hindi diction. She speaks at a slow, natural pace with proper intonation, crisp consonants, and clear pauses between words."),
-    "ben": ("Ananya",    "Ananya has a clear, melodious female voice with authentic Bengali pronunciation. She speaks slowly and clearly at a natural pace with proper intonation and distinct syllables."),
-    "tam": ("Kavitha",   "Kavitha has a very clear, slow, expressive female voice with authentic Tamil pronunciation and melodic intonation. She speaks slowly and deliberately, enunciating every syllable clearly."),
-    "tel": ("Sravani",   "Sravani has a warm, clear female voice with authentic Telugu pronunciation. She speaks at a slow, natural pace with proper intonation and crisp, distinct syllables."),
-    "kan": ("Deepa",     "Deepa has a clear, expressive female voice with authentic Kannada pronunciation and crisp consonants. She speaks slowly and clearly with natural pauses between phrases."),
-    "mal": ("Anjali",    "Anjali has a clear, melodious female voice with authentic Malayalam pronunciation. She speaks slowly and naturally with proper intonation and distinct syllables."),
-    "mar": ("Sneha",     "Sneha has a warm, clear female voice with authentic Marathi pronunciation. She speaks at a slow, natural pace with proper intonation and clear word boundaries."),
-    "guj": ("Riya",      "Riya has a clear, expressive female voice with authentic Gujarati pronunciation. She speaks slowly and clearly with natural intonation and distinct syllables."),
-    "pan": ("Harpreet",  "Harpreet has a warm, clear female voice with authentic Punjabi pronunciation. She speaks at a slow, natural pace with proper intonation and crisp consonants."),
-    "ory": ("Sarita",    "Sarita has a clear, melodious female voice with authentic Odia pronunciation. She speaks slowly and clearly with natural intonation and distinct syllables."),
-    "asm": ("Purnima",   "Purnima has a clear, expressive female voice with authentic Assamese pronunciation. She speaks slowly and naturally with proper intonation and clear pauses."),
-    "urd": ("Zara",      "Zara has a warm, clear female voice with authentic Urdu pronunciation. She speaks slowly at a natural pace with proper intonation and crisp, distinct syllables."),
-    "nep": ("Amrita",    "Amrita has a clear, melodious female voice with authentic Nepali pronunciation. She speaks slowly and clearly with natural intonation and distinct syllables."),
-    "bod": ("Dolma",     "Dolma has a clear, expressive female voice with authentic Bodo pronunciation. She speaks slowly and naturally with proper intonation and clear word boundaries."),
-    "doi": ("Reena",     "Reena has a warm, clear female voice with authentic Dogri pronunciation. She speaks at a slow, natural pace with proper intonation and crisp consonants."),
-    "kok": ("Sujata",    "Sujata has a clear, melodious female voice with authentic Konkani pronunciation. She speaks slowly and clearly with natural intonation and distinct syllables."),
-    "mni": ("Sanatombi", "Sanatombi has a clear, expressive female voice with authentic Manipuri pronunciation. She speaks slowly and naturally with proper intonation and clear pauses."),
-    "mai": ("Sunita",    "Sunita has a warm, clear female voice with authentic Maithili pronunciation. She speaks at a slow, natural pace with proper intonation and distinct syllables."),
-    "san": ("Vedika",    "Vedika has a clear, precise female voice with authentic Sanskrit pronunciation and measured intonation. She speaks slowly and deliberately, enunciating every syllable."),
-    "sat": ("Champa",    "Champa has a clear, expressive female voice with authentic Santhali pronunciation. She speaks slowly and naturally with proper intonation and clear word boundaries."),
-    "snd": ("Nazia",     "Nazia has a warm, clear female voice with authentic Sindhi pronunciation. She speaks at a slow, natural pace with proper intonation and crisp consonants."),
-    "kas": ("Rukhsar",   "Rukhsar has a clear, melodious female voice with authentic Kashmiri pronunciation. She speaks slowly and clearly with natural intonation and distinct syllables."),
-    "eng": ("Aria",      "Aria has a clear, professional female voice with crisp English pronunciation. She speaks at a slow, natural pace with proper intonation and clear word boundaries."),
-}
-_PARLER_DESC_SUFFIX = " The recording is of very high quality, very close up, with no background noise."
+# Generic description style — this model (parler-tts-mini-v2 Indic fine-tune) was NOT
+# trained with named speakers. Named descriptions like "Divya's voice..." produce silence.
+# Generic style produces real audio (tested: peak 0.36 vs 0.008 with named style).
+_PARLER_DESC = "A speaker delivers clear and expressive speech at a moderate pace with a natural pitch. The recording is of very high quality, with a close-sounding voice and no background noise."
 
-# Speaker names for ai4bharat large model
-_AI4BHARAT_SPEAKERS = {
-    "hin": "Divya",    "ben": "Ananya",    "tam": "Kavitha",  "tel": "Sravani",
-    "kan": "Deepa",    "mal": "Anjali",    "mar": "Sneha",    "guj": "Riya",
-    "pan": "Harpreet", "ory": "Sarita",    "asm": "Purnima",  "urd": "Zara",
-    "nep": "Amrita",   "mai": "Sunita",    "doi": "Reena",    "kas": "Rukhsar",
-    "kok": "Sujata",   "mni": "Sanatombi", "sat": "Champa",   "snd": "Nazia",
-    "bod": "Dolma",    "san": "Vedika",    "eng": "Aria",
-}
+# Per-language descriptions — all use generic style, no named speakers
+_PARLER_SPEAKERS = {lang: ("generic", _PARLER_DESC) for lang in [
+    "hin", "ben", "tam", "tel", "kan", "mal", "mar", "guj", "pan", "ory",
+    "asm", "urd", "nep", "bod", "doi", "kok", "mni", "mai", "san",
+    "sat", "snd", "kas", "eng",
+]}
 
-# MMS-TTS adapter codes for all 22 languages
+# MMS-TTS adapter codes for all 22 languages (shared-base adapter model)
+# doi is excluded here — it uses a standalone VITS model via _MMS_STANDALONE_LANGS
 MMS_LANG_CODES = {
     "asm": "asm", "ben": "ben", "guj": "guj", "hin": "hin",
     "kan": "kan", "mal": "mal", "mar": "mar", "ory": "ory",
     "pan": "pan", "tam": "tam", "tel": "tel",
     "urd": "urd-script_arabic", "nep": "npi", "bod": "bod",
     "mai": "mai", "sat": "sat", "snd": "snd",
-    "doi": "hin", "kas": "urd-script_arabic",
-    "kok": "mar", "mni": "ben", "san": "hin",
+    # No dedicated adapters — closest phonetic match:
+    "kas": "urd-script_arabic",  # Kashmiri → Urdu Arabic script
+    "kok": "mar",                # Konkani → Marathi (same script)
+    "mni": "ben",                # Manipuri → Bengali (same script)
+    "san": "hin",                # Sanskrit → Hindi (same script)
 }
 
-# pyttsx3 last-resort lang tags
-PYTTSX3_LANGS = {
-    "hin": "hi", "ben": "bn", "guj": "gu", "mar": "mr",
-    "tam": "ta", "tel": "te", "kan": "kn", "mal": "ml",
-    "ory": "or", "pan": "pa", "asm": "as", "urd": "ur",
-    "nep": "ne", "bod": "hi", "doi": "hi", "kas": "ur",
-    "kok": "mr", "mni": "bn", "mai": "hi", "san": "hi",
-    "sat": "hi", "snd": "ur",
+# XTTS-v2 language codes (Coqui TTS)
+# https://github.com/coqui-ai/TTS — Apache 2.0, offline, near-human quality
+_XTTS_LANG_CODES = {
+    "hin": "hi", "ben": "bn", "tam": "ta", "tel": "te", "kan": "kn",
+    "mal": "ml", "mar": "mr", "guj": "gu", "pan": "pa", "ury": "ur",
+    "urd": "ur", "nep": "ne", "asm": "as", "ory": "or",
+    # Low-resource: route to closest supported language
+    "mai": "hi", "doi": "hi", "kok": "mr", "mni": "bn",
+    "san": "hi", "sat": "hi", "snd": "ur", "kas": "ur",
+    "bod": "hi",
 }
 
+# Reference speaker WAV for XTTS voice cloning — 6-second clean female voice per lang
+# Falls back to a single generic Indian-English reference if per-lang file missing
+_XTTS_REF_DIR = Path(__file__).parent.parent / "assets" / "xtts_refs"
 
-def _post_process(audio: np.ndarray, sr: int = SR) -> np.ndarray:
+
+
+
+def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False, female_shift: bool = False) -> np.ndarray:
     from scipy.signal import butter, sosfilt
     # High-pass to remove DC/rumble
-    sos   = butter(2, 60.0 / (sr / 2), btype="high", output="sos")
+    sos = butter(2, 80.0 / (sr / 2), btype="high", output="sos")
     audio = sosfilt(sos, audio).astype(np.float32)
-    # Gentle low-pass to soften harshness (MMS/VITS can be shrill)
-    sos_lp = butter(2, 7500.0 / (sr / 2), btype="low", output="sos")
-    audio  = sosfilt(sos_lp, audio).astype(np.float32)
-    peak  = np.max(np.abs(audio))
+    if is_mms:
+        sos_lp = butter(2, 12000.0 / (sr / 2), btype="low", output="sos")
+        audio  = sosfilt(sos_lp, audio).astype(np.float32)
+    if female_shift:
+        try:
+            import librosa
+            audio = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sr, n_steps=5, res_type='soxr_hq')
+        except Exception as _ps_err:
+            log.warning(f"pitch_shift failed ({_ps_err}) — keeping original pitch")
+    # Normalize to -1 dBFS
+    peak = np.max(np.abs(audio))
     if peak > 0.01:
         audio = audio * (0.891 / peak)
     return audio
@@ -134,26 +148,84 @@ class TTSEngine:
         self._parler_model     = None
         self._parler_tokenizer = None
         self._parler_desc_tok  = None
+        self._parler_label     = None  # "large" or "mini"
         self._mms_model        = None
         self._mms_processor    = None
         self._mms_current_lang = None
-        self._ai4bharat        = None
+        self._ai4bharat        = {}  # dict keyed by model dir path
+        self._standalone_vits: dict = {}  # lang -> {model, tokenizer}
+        self._xtts_model       = None     # Coqui XTTS-v2
+        self._mms_load_failed  = False     # instance-level — reset per TTSEngine
 
     # ----------------------------------------------------------
     # Helpers
     # ----------------------------------------------------------
-    def _is_ai4bharat(self) -> bool:
-        if self._ai4bharat is None:
-            self._ai4bharat = _is_ai4bharat_model()
-        return self._ai4bharat
+    def _is_ai4bharat(self, model_dir: Path = None) -> bool:
+        d = model_dir or PARLER_DIR
+        key = str(d)
+        if key not in (self._ai4bharat or {}):
+            if self._ai4bharat is None:
+                self._ai4bharat = {}
+            self._ai4bharat[key] = _is_ai4bharat_model(d)
+        return self._ai4bharat[key]
 
-    def _build_description(self, lang: str) -> str:
-        if self._is_ai4bharat():
-            speaker = _AI4BHARAT_SPEAKERS.get(lang, "Divya")
-            return f"{speaker}'s voice is clear and natural."
-        speaker, desc = _PARLER_SPEAKERS.get(
-            lang, ("Rohit", "Rohit speaks clearly and naturally at a moderate pace."))
-        return desc + _PARLER_DESC_SUFFIX
+    def _build_description(self, lang: str, model_dir: Path = None) -> str:
+        _, desc = _PARLER_SPEAKERS.get(lang, ("generic", _PARLER_DESC))
+        return desc
+
+    # ----------------------------------------------------------
+    # Standalone VITS loader (facebook/mms-tts-<lang> separate repos)
+    # ----------------------------------------------------------
+    def _load_standalone_vits(self, lang: str) -> bool:
+        if lang in self._standalone_vits:
+            return True
+        subfolder = _MMS_STANDALONE_LANGS.get(lang)
+        if not subfolder:
+            return False
+        model_path = MMS_STANDALONE / subfolder
+        if not model_path.exists():
+            log.warning(f"Standalone VITS model not found for {lang} at {model_path}")
+            return False
+        try:
+            from transformers import VitsModel, AutoTokenizer
+            log.info(f"Loading standalone VITS [{lang}] from {model_path}")
+            tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+            model = VitsModel.from_pretrained(
+                str(model_path), torch_dtype=torch.float32
+            ).to(DEVICE).eval()
+            self._standalone_vits[lang] = {"model": model, "tokenizer": tokenizer}
+            log.info(f"Standalone VITS [{lang}] loaded")
+            return True
+        except Exception as e:
+            log.error(f"Standalone VITS load failed [{lang}]: {e}")
+            return False
+
+    def _synthesize_standalone_vits(self, text: str, lang: str, output_path: str) -> bool:
+        if not self._load_standalone_vits(lang):
+            return False
+        try:
+            engine    = self._standalone_vits[lang]
+            tokenizer = engine["tokenizer"]
+            model     = engine["model"]
+            inputs = tokenizer(text, return_tensors="pt").to(DEVICE)
+            with torch.no_grad():
+                out = model(**inputs)
+            native = model.config.sampling_rate
+            w = out.waveform[0].cpu().float().numpy().squeeze()
+            nz = np.where(np.abs(w) > 1e-5)[0]
+            if len(nz) == 0:
+                return False
+            w = w[:nz[-1] + 1]
+            if native != SR:
+                import librosa
+                w = librosa.resample(w, orig_sr=native, target_sr=SR)
+            w = _post_process(w, SR, is_mms=True)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            sf.write(output_path, w, SR)
+            return True
+        except Exception as e:
+            log.error(f"Standalone VITS [{lang}] failed: {e}")
+            return False
 
     # ----------------------------------------------------------
     # Parler-TTS loader
@@ -161,97 +233,211 @@ class TTSEngine:
     def _load_parler(self) -> bool:
         if self._parler_model is not None:
             return True
-        if not PARLER_DIR.exists():
-            log.warning("Parler-TTS model not found")
+        # Try large first, fall back to mini
+        candidates = []
+        if PARLER_LARGE_DIR.exists():
+            candidates.append((PARLER_LARGE_DIR, "large"))
+        if PARLER_MINI_DIR.exists():
+            candidates.append((PARLER_MINI_DIR, "mini"))
+        if not candidates:
+            log.warning("No Parler-TTS model found (checked large + mini dirs)")
             return False
-        needs_flan = not self._is_ai4bharat()
-        if needs_flan and not FLAN_T5_DIR.exists():
-            log.warning("flan_t5_large not found — Parler-TTS unavailable")
-            return False
-        try:
-            from parler_tts import ParlerTTSForConditionalGeneration
-            from transformers import AutoTokenizer
-            import transformers
-            transformers.logging.set_verbosity_error()
-            log.info(f"Loading Parler-TTS ({'ai4bharat' if self._is_ai4bharat() else 'mini'})")
-            self._parler_model = ParlerTTSForConditionalGeneration.from_pretrained(
-                str(PARLER_DIR),
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                attn_implementation="eager",
-            ).to(DEVICE).eval()
-            self._parler_tokenizer = AutoTokenizer.from_pretrained(str(PARLER_DIR))
-            desc_tok_src = str(PARLER_DIR) if self._is_ai4bharat() else str(FLAN_T5_DIR)
-            self._parler_desc_tok = AutoTokenizer.from_pretrained(desc_tok_src)
-            transformers.logging.set_verbosity_warning()
-            log.info("Parler-TTS loaded")
-            return True
-        except Exception as e:
-            log.error(f"Parler-TTS load failed: {e}")
-            self._parler_model = None
-            return False
+        from parler_tts import ParlerTTSForConditionalGeneration
+        from transformers import AutoTokenizer
+        import transformers
+        transformers.logging.set_verbosity_error()
+        for model_dir, label in candidates:
+            try:
+                log.info(f"Loading Parler-TTS [{label}] from {model_dir.name}")
+                self._parler_model = ParlerTTSForConditionalGeneration.from_pretrained(
+                    str(model_dir),
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+                    attn_implementation="eager",
+                ).to(DEVICE).eval()
+                self._parler_tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+                # Description tokenizer MUST be flan-t5-large (text encoder), not the model's LLaMA tokenizer
+                text_enc_name = self._parler_model.config.text_encoder._name_or_path
+                if FLAN_T5_DIR.exists():
+                    desc_tok_src = str(FLAN_T5_DIR)
+                else:
+                    desc_tok_src = text_enc_name  # download from HF if not cached
+                self._parler_desc_tok = AutoTokenizer.from_pretrained(desc_tok_src)
+                self._parler_label = label  # track which one is loaded
+                transformers.logging.set_verbosity_warning()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                log.info(f"Parler-TTS [{label}] loaded successfully")
+                return True
+            except Exception as e:
+                log.warning(f"Parler-TTS [{label}] load failed: {e} — trying next")
+                self._parler_model = None
+        log.error("All Parler-TTS candidates failed to load")
+        return False
 
     # ----------------------------------------------------------
     # Parler-TTS synthesis (single)
     # ----------------------------------------------------------
+    # Fixed seed per language — ensures same voice character across ALL segments
+    _LANG_SEEDS = {
+        "hin": 42, "ben": 43, "tam": 44, "tel": 45, "kan": 46,
+        "mal": 47, "mar": 48, "guj": 49, "pan": 50, "ory": 51,
+        "asm": 52, "urd": 53, "nep": 54, "bod": 55, "doi": 56,
+        "kok": 57, "mni": 58, "mai": 59, "san": 60, "sat": 61,
+        "snd": 62, "kas": 63, "eng": 64,
+    }
+
+    def _parler_generate(self, desc_ids, prompt_ids, max_tok: int):
+        """Single generate call — always called with same args for voice consistency."""
+        return self._parler_model.generate(
+            input_ids=desc_ids.input_ids,
+            attention_mask=desc_ids.attention_mask,
+            prompt_input_ids=prompt_ids.input_ids,
+            prompt_attention_mask=prompt_ids.attention_mask,
+            do_sample=True,
+            temperature=0.7,
+            max_new_tokens=max_tok,
+        )
+
+    # Indic Unicode block ranges — each codepoint is one visible akshar
+    # Using grapheme clusters: count \X matches (one per visible character)
+    @staticmethod
+    def _count_graphemes(text: str) -> int:
+        import unicodedata
+        # Normalize to NFC so composed chars count as 1
+        t = unicodedata.normalize("NFC", text)
+        # Count base letters only (skip combining marks, spaces, punctuation)
+        return sum(1 for c in t if unicodedata.category(c)[0] in ("L", "N"))
+
+    def _calc_max_tokens(self, text: str) -> int:
+        """Estimate max audio tokens from visible grapheme count.
+        Parler/ai4bharat codec: ~86 tokens/sec.
+        Indic akshars average ~0.28s each → 86*0.28 ≈ 24 tokens/akshar.
+        min 200 (covers single short word), max 1500 (~17s, longest segment).
+        """
+        graphemes = self._count_graphemes(text)
+        return min(max(graphemes * 25, 200), 1500)
+
     def _synthesize_parler(self, text: str, lang: str, output_path: str) -> bool:
-        # Only skip Tamil for mini checkpoint; ai4bharat large supports it
-        if not self._is_ai4bharat() and lang in _PARLER_SKIP_LANGS:
+        if lang in _PARLER_SKIP_LANGS:
             return False
         if not self._load_parler():
             return False
-        try:
-            desc       = self._build_description(lang)
-            desc_ids   = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
-            prompt_ids = self._parler_tokenizer(text, return_tensors="pt").to(DEVICE)
-            with torch.no_grad():
-                gen = self._parler_model.generate(
-                    input_ids=desc_ids.input_ids,
-                    attention_mask=desc_ids.attention_mask,
-                    prompt_input_ids=prompt_ids.input_ids,
-                    prompt_attention_mask=prompt_ids.attention_mask,
-                )
-            wav = gen.cpu().numpy().squeeze().astype(np.float32)
-            sr  = self._parler_model.config.sampling_rate
-            if len(wav) / sr < self._PARLER_MIN_DUR:
-                log.warning(f"Parler output too short [{lang}] — MMS fallback")
+        for _oom_attempt in range(2):
+            try:
+                desc       = self._build_description(lang)
+                desc_ids   = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
+                prompt_ids = self._parler_tokenizer(text, return_tensors="pt").to(DEVICE)
+                max_tok    = self._calc_max_tokens(text)
+                seed = self._LANG_SEEDS.get(lang, 42)
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                with torch.no_grad():
+                    gen = self._parler_generate(desc_ids, prompt_ids, max_tok)
+                wav = gen.cpu().numpy().squeeze().astype(np.float32)
+                sr  = self._parler_model.config.sampling_rate
+                if len(wav) / sr < self._PARLER_MIN_DUR:
+                    log.warning(f"Parler output too short [{lang}] — MMS fallback")
+                    return False
+                if np.max(np.abs(wav)) < 0.02:
+                    log.warning(f"Parler output near-silent [{lang}] — MMS fallback")
+                    return False
+                wav = _post_process(wav, sr, is_mms=False)
+                Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                sf.write(output_path, wav, sr)
+                return True
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and _oom_attempt == 0:
+                    log.warning(f"Parler OOM [{lang}] — clearing cache and retrying")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                log.error(f"Parler synthesis failed [{lang}]: {e}")
                 return False
-            wav = _post_process(wav, sr)
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            sf.write(output_path, wav, sr)
-            return True
-        except Exception as e:
-            log.error(f"Parler synthesis failed [{lang}]: {e}")
-            return False
+            except Exception as e:
+                log.error(f"Parler synthesis failed [{lang}]: {e}")
+                return False
+        return False
 
     # ----------------------------------------------------------
-    # pyttsx3 — last resort
+    # Coqui XTTS-v2 — open-source, Apache 2.0, near-human quality
+    # Model: tts_models/multilingual/multi-dataset/xtts_v2
+    # Supports 17 languages natively + cross-lingual for the rest
+    # ----------------------------------------------------------
+    def _load_xtts(self) -> bool:
+        if self._xtts_model is not None:
+            return True
+        try:
+            from TTS.api import TTS as CoquiTTS
+            log.info("Loading Coqui XTTS-v2")
+            if XTTS_DIR.exists():
+                self._xtts_model = CoquiTTS(model_path=str(XTTS_DIR),
+                                            config_path=str(XTTS_DIR / "config.json"),
+                                            progress_bar=False).to(DEVICE)
+            else:
+                # Auto-download on first use (~1.8GB, cached to ~/.local/share/tts)
+                self._xtts_model = CoquiTTS(
+                    "tts_models/multilingual/multi-dataset/xtts_v2",
+                    progress_bar=False
+                ).to(DEVICE)
+            log.info("Coqui XTTS-v2 loaded")
+            return True
+        except Exception as e:
+            log.error(f"XTTS-v2 load failed: {e}")
+            self._xtts_model = None
+            return False
+
+    def _get_xtts_ref(self, lang: str) -> str | None:
+        """Return path to a reference speaker WAV for XTTS voice cloning."""
+        # Per-language reference file
+        ref = _XTTS_REF_DIR / f"{lang}.wav"
+        if ref.exists():
+            return str(ref)
+        # Generic Indian-English female reference
+        generic = _XTTS_REF_DIR / "generic_indic.wav"
+        if generic.exists():
+            return str(generic)
+        return None
+
+    def _synthesize_xtts(self, text: str, lang: str, output_path: str) -> bool:
+        if not self._load_xtts():
+            return False
+        xtts_lang = _XTTS_LANG_CODES.get(lang, "hi")
+        ref_wav   = self._get_xtts_ref(lang)
+        try:
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            if ref_wav:
+                self._xtts_model.tts_to_file(
+                    text=text,
+                    speaker_wav=ref_wav,
+                    language=xtts_lang,
+                    file_path=output_path,
+                )
+            else:
+                # No reference wav — use built-in speaker
+                speakers = getattr(self._xtts_model, "speakers", None) or []
+                speaker  = speakers[0] if speakers else None
+                self._xtts_model.tts_to_file(
+                    text=text,
+                    speaker=speaker,
+                    language=xtts_lang,
+                    file_path=output_path,
+                )
+            # Verify output is valid audio
+            if Path(output_path).exists() and Path(output_path).stat().st_size > 1000:
+                wav, sr = sf.read(output_path, dtype="float32")
+                if len(wav) / sr > 0.3:
+                    wav = _post_process(wav, sr, is_mms=False)
+                    sf.write(output_path, wav, sr)
+                    return True
+        except Exception as e:
+            log.error(f"XTTS-v2 [{lang}] failed: {e}")
+        return False
+
     # ----------------------------------------------------------
     def _synthesize_pyttsx3(self, text: str, lang: str, output_path: str) -> bool:
-        try:
-            import pyttsx3
-            engine   = pyttsx3.init()
-            lang_tag = PYTTSX3_LANGS.get(lang, "hi")
-            voices   = engine.getProperty("voices")
-            matched  = next(
-                (v for v in voices if lang_tag in (v.languages[0] if v.languages else "")), None)
-            if matched:
-                engine.setProperty("voice", matched.id)
-            engine.setProperty("rate", 145)
-            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-            engine.save_to_file(text, output_path)
-            engine.runAndWait()
-            engine.stop()
-            if Path(output_path).exists() and Path(output_path).stat().st_size > 0:
-                try:
-                    wav, sr = sf.read(output_path)
-                    if len(wav) > 0:
-                        sf.write(output_path, _post_process(wav.astype(np.float32), sr), sr)
-                        return True
-                except Exception:
-                    pass
-        except Exception as e:
-            log.error(f"pyttsx3 failed [{lang}]: {e}")
-        # pyttsx3 produced empty/invalid audio — write silence so pipeline continues
+        """Removed — writes silence so pipeline never stalls."""
+        log.warning(f"All TTS engines failed [{LANG_NAMES.get(lang, lang)}] — writing silence")
         self._write_silence(2.0, output_path)
         return True
 
@@ -259,12 +445,43 @@ class TTSEngine:
     # Silence generator
     # ----------------------------------------------------------
     def _write_silence(self, duration: float, output_path: str):
-        subprocess.run(
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        ret = subprocess.run(
             [_FFMPEG, "-y", "-f", "lavfi",
              "-i", f"anullsrc=r={SR}:cl=mono",
              "-t", str(max(0.1, duration)), output_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+            timeout=30,
+        ).returncode
+        if ret != 0 or not Path(output_path).exists():
+            # ffmpeg unavailable — write silence directly with numpy
+            silence = np.zeros(int(max(0.1, duration) * SR), dtype=np.float32)
+            sf.write(output_path, silence, SR)
+
+    # ----------------------------------------------------------
+    # Script normalisation before TTS
+    # sat (Ol Chiki): Parler-TTS cannot render Ol Chiki — transliterate to Devanagari
+    # for pyttsx3 last-resort only. MMS sat adapter handles Ol Chiki natively.
+    # ----------------------------------------------------------
+    _OL_CHIKI_TO_DEVA = {
+        "᱐": "क", "᱑": "ख", "᱒": "ग", "᱓": "घ", "᱔": "ङ",
+        "᱕": "च", "᱖": "छ", "᱗": "ज", "᱘": "झ", "᱙": "ञ",
+        "ᱚ": "ट", "ᱛ": "ठ", "ᱜ": "ड", "ᱝ": "ढ", "ᱞ": "ण",
+        "ᱟ": "त", "ᱠ": "थ", "ᱡ": "द", "ᱢ": "ध", "ᱣ": "न",
+        "ᱤ": "प", "ᱥ": "फ", "ᱦ": "ब", "ᱧ": "भ", "ᱨ": "म",
+        "ᱩ": "य", "ᱪ": "र", "ᱫ": "ल", "ᱬ": "व", "ᱭ": "स",
+        "ᱮ": "ह", "ᱯ": "अ", "ᱰ": "आ", "ᱱ": "इ", "ᱲ": "ई",
+        "ᱳ": "उ", "ᱴ": "ऊ", "ᱵ": "ए", "ᱶ": "ओ", "ᱷ": "ं",
+    }
+
+    def _normalize_text_for_tts(self, text: str, lang: str, for_mms: bool = False) -> str:
+        """Transliterate scripts that TTS engines cannot render.
+        for_mms=True: keep Ol Chiki (MMS sat adapter handles it natively).
+        for_mms=False (Parler/pyttsx3): transliterate Ol Chiki → Devanagari.
+        """
+        if lang == "sat" and not for_mms:
+            return "".join(self._OL_CHIKI_TO_DEVA.get(c, c) for c in text)
+        return text
 
     # ----------------------------------------------------------
     # Public API
@@ -272,14 +489,20 @@ class TTSEngine:
     def synthesize(self, text: str, lang: str, output_path: str,
                    speaker_wav: str = None) -> str:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        if self._synthesize_parler(text, lang, output_path):
+        parler_text = self._normalize_text_for_tts(text, lang, for_mms=False)
+        if self._synthesize_parler(parler_text, lang, output_path):
             return output_path
-        if self._synthesize_mms_batch([text], lang, [output_path])[0]:
+        if self._synthesize_standalone_vits(text, lang, output_path):
             return output_path
-        if self._synthesize_pyttsx3(text, lang, output_path):
-            log.warning(f"pyttsx3 fallback used [{LANG_NAMES.get(lang, lang)}]")
+        mms_text = self._normalize_text_for_tts(text, lang, for_mms=True)
+        if self._synthesize_mms_batch([mms_text], lang, [output_path])[0]:
             return output_path
-        raise RuntimeError(f"All TTS engines failed for {LANG_NAMES.get(lang, lang)}")
+        if self._synthesize_xtts(text, lang, output_path):
+            log.info(f"XTTS-v2 used [{LANG_NAMES.get(lang, lang)}]")
+            return output_path
+        self._write_silence(2.0, output_path)
+        log.warning(f"All TTS engines failed [{LANG_NAMES.get(lang, lang)}] — silence written")
+        return output_path
 
     def synthesize_segments(self, segments: list[dict], lang: str,
                             output_dir: str, speaker_wav: str = None) -> list[dict]:
@@ -302,53 +525,76 @@ class TTSEngine:
 
         # Parler-TTS batch
         # _PARLER_SKIP_LANGS only applies to the mini checkpoint, not ai4bharat
-        parler_skip = not self._is_ai4bharat() and lang in _PARLER_SKIP_LANGS
+        parler_skip = lang in _PARLER_SKIP_LANGS
         if not parler_skip and self._load_parler():
             failed = []
-            BATCH  = 8
+            BATCH  = 32  # A6000 48GB — large batch saturates GPU
             for batch_start in range(0, len(text_idxs), BATCH):
                 bidxs  = text_idxs[batch_start:batch_start + BATCH]
-                btexts = [segments[i]["text"].strip() for i in bidxs]
+                btexts = [self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=False) for i in bidxs]
                 bpaths = [results[i]["audio_path"] for i in bidxs]
                 desc   = self._build_description(lang)
-                try:
-                    desc_ids = self._parler_desc_tok(
-                        [desc] * len(btexts), return_tensors="pt", padding=True).to(DEVICE)
-                    prompt_ids = self._parler_tokenizer(
-                        btexts, return_tensors="pt", padding=True).to(DEVICE)
-                    with torch.no_grad():
-                        gen = self._parler_model.generate(
-                            input_ids=desc_ids.input_ids,
-                            attention_mask=desc_ids.attention_mask,
-                            prompt_input_ids=prompt_ids.input_ids,
-                            prompt_attention_mask=prompt_ids.attention_mask,
-                        )
-                    sr = self._parler_model.config.sampling_rate
-                    if gen.ndim == 3:
-                        gen = gen.squeeze(1)
-                    for j, (path, bidx) in enumerate(zip(bpaths, bidxs)):
-                        wav = gen[j].cpu().float().numpy()
-                        if len(wav) / sr < self._PARLER_MIN_DUR:
+                seed = self._LANG_SEEDS.get(lang, 42)
+                desc_ids = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
+                for bidx, text, path in zip(bidxs, btexts, bpaths):
+                    for _oom_attempt in range(2):
+                        try:
+                            prompt_ids = self._parler_tokenizer(text, return_tensors="pt").to(DEVICE)
+                            max_tok = self._calc_max_tokens(text)
+                            torch.manual_seed(seed)
+                            if torch.cuda.is_available():
+                                torch.cuda.manual_seed_all(seed)
+                            with torch.no_grad():
+                                gen = self._parler_generate(desc_ids, prompt_ids, max_tok)
+                            sr  = self._parler_model.config.sampling_rate
+                            wav = gen.cpu().float().numpy().squeeze()
+                            dur = len(wav) / sr
+                            if dur < self._PARLER_MIN_DUR:
+                                failed.append(bidx)
+                                break
+                            if np.max(np.abs(wav)) < 0.02:
+                                failed.append(bidx)
+                                break
+                            wav = _post_process(wav, sr, is_mms=False)
+                            Path(path).parent.mkdir(parents=True, exist_ok=True)
+                            sf.write(path, wav, sr)
+                            break  # success
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower() and _oom_attempt == 0:
+                                log.warning(f"Parler OOM seg {bidx} [{lang}] — clearing cache and retrying")
+                                if torch.cuda.is_available():
+                                    torch.cuda.empty_cache()
+                                continue
+                            log.error(f"Parler seg {bidx} failed [{lang}]: {e}")
                             failed.append(bidx)
-                            continue
-                        wav = _post_process(wav, sr)
-                        Path(path).parent.mkdir(parents=True, exist_ok=True)
-                        sf.write(path, wav, sr)
-                except Exception as e:
-                    log.error(f"Parler batch failed: {e}")
-                    failed.extend(bidxs)
+                            break
+                        except Exception as e:
+                            log.error(f"Parler seg {bidx} failed [{lang}]: {e}")
+                            failed.append(bidx)
+                            break
             text_idxs = failed
 
-        # MMS-TTS fallback for anything Parler missed
-        # No batching needed — _synthesize_mms_batch now processes one-at-a-time
+        # Standalone VITS fallback (e.g. doi → dgo model)
+        if text_idxs and lang in _MMS_STANDALONE_LANGS:
+            still_failed = []
+            for i in text_idxs:
+                ok = self._synthesize_standalone_vits(
+                    segments[i]["text"].strip(), lang, results[i]["audio_path"])
+                if not ok:
+                    still_failed.append(i)
+            text_idxs = still_failed
+
+        # MMS-TTS fallback for anything Parler/standalone missed
         if text_idxs:
-            texts = [segments[i]["text"].strip() for i in text_idxs]
+            texts = [self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=True) for i in text_idxs]
             paths = [results[i]["audio_path"] for i in text_idxs]
             oks   = self._synthesize_mms_batch(texts, lang, paths)
-            for i, ok in zip(text_idxs, oks):
-                if not ok:
-                    self._synthesize_pyttsx3(
-                        segments[i]["text"].strip(), lang, results[i]["audio_path"])
+            still_failed = [i for i, ok in zip(text_idxs, oks) if not ok]
+            # XTTS-v2 fallback for anything MMS missed
+            for i in still_failed:
+                seg_text = self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=False)
+                if not self._synthesize_xtts(seg_text, lang, results[i]["audio_path"]):
+                    self._write_silence(2.0, results[i]["audio_path"])
 
         return results
 
@@ -356,6 +602,8 @@ class TTSEngine:
     # MMS-TTS — single shared model + per-lang adapter
     # ----------------------------------------------------------
     def _load_mms(self, lang: str) -> bool:
+        if self._mms_load_failed:
+            return False
         adapter_code = MMS_LANG_CODES.get(lang)
         if not adapter_code or not MMS_DIR.exists():
             return False
@@ -367,7 +615,7 @@ class TTSEngine:
                 self._mms_model = VitsModel.from_pretrained(
                     str(MMS_DIR),
                     torch_dtype=torch.float32,
-                    low_cpu_mem_usage=False,
+                    low_cpu_mem_usage=True,
                 ).to(DEVICE).float()
             if self._mms_current_lang != lang:
                 # Use load_adapter API — correct way to swap MMS language adapters
@@ -407,6 +655,7 @@ class TTSEngine:
         except Exception as e:
             log.error(f"MMS load failed [{lang}]: {e}")
             self._mms_model = None
+            self._mms_load_failed = True  # stop retrying on every segment
             return False
 
     # MMS-VITS hard token limit — batching beyond this causes truncation/repetition
@@ -429,14 +678,8 @@ class TTSEngine:
                 inputs = {k: v.to(dtype=torch.float32) if v.is_floating_point() else v
                           for k, v in inputs.items()}
                 inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
-                # VITS length_scale > 1.0 = slower speech (1.15 ≈ 15% slower, clearer)
-                orig_length_scale = getattr(self._mms_model.config, "length_scale", 1.0)
-                self._mms_model.config.length_scale = 1.15
-                try:
-                    with torch.no_grad():
-                        out = self._mms_model(**inputs)
-                finally:
-                    self._mms_model.config.length_scale = orig_length_scale
+                with torch.no_grad():
+                    out = self._mms_model(**inputs)
                 native = self._mms_model.config.sampling_rate
                 w = out.waveform[0].cpu().float().numpy().squeeze()
                 nz = np.where(np.abs(w) > 1e-5)[0]
@@ -446,7 +689,7 @@ class TTSEngine:
                 if native != SR:
                     import librosa
                     w = librosa.resample(w, orig_sr=native, target_sr=SR)
-                w = _post_process(w, SR)
+                w = _post_process(w, SR, is_mms=True)
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
                 sf.write(path, w, SR)
                 results[i] = True
