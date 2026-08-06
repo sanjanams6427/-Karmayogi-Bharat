@@ -231,13 +231,12 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
         return None, "❌ Please upload a file."
     if not tgt_langs:
         return None, "❌ Select at least one target language."
-    _t0 = time.time()
 
+    _t0 = time.time()
     pipeline  = get_pipeline()
     course_id = Path(file.name).stem
     out_dir   = os.path.join(_get_output_dir(), course_id)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-
     suffix = Path(file.name).suffix.lower()
 
     # ── PDF blocked per tender §3.1 ──
@@ -248,9 +247,9 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
     if suffix in (".docx", ".doc", ".txt"):
         output_files, log_lines = _translate_plain_doc(
             file.name, src_lang, tgt_langs, out_dir, course_id, progress, pipeline)
-        _elapsed = round((time.time() - _t0) / 60, 1)
-    log_lines.insert(0, f"⏱ Completed in {_elapsed} min")
-    return _save_outputs(output_files) or None, "\n".join(log_lines)
+        elapsed = round((time.time() - _t0) / 60, 1)
+        log_lines.insert(0, f"⏱ Completed in {elapsed} min")
+        return _save_outputs(output_files) or None, "\n".join(log_lines)
 
     # ── JSON paths (existing behaviour) ──
     output_files, log_lines = [], []
@@ -282,8 +281,8 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
         except Exception as e:
             log_lines.append(f"❌ {e}")
 
-    _elapsed = round((time.time() - _t0) / 60, 1)
-    log_lines.insert(0, f"⏱ Completed in {_elapsed} min")
+    elapsed = round((time.time() - _t0) / 60, 1)
+    log_lines.insert(0, f"⏱ Completed in {elapsed} min")
     return _save_outputs(output_files) or None, "\n".join(log_lines)
 
 
