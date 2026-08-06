@@ -406,6 +406,7 @@ class VideoProcessor:
                 cmd += ["-map", "2:0", "-c:s", "mov_text"]
                 if lang:
                     cmd += ["-metadata:s:s:0", f"language={lang}"]
+                cmd += ["-disposition:s:0", "default"]
             cmd += ["-shortest", str(output_video_path), "-loglevel", "error"]
             return subprocess.run(cmd, capture_output=True, timeout=600).returncode
 

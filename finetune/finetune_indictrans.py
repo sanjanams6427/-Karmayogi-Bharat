@@ -10,6 +10,12 @@
 #   - Gradient checkpointing for activation memory savings
 #   - Best quality: all parameters updated, not just adapters
 #
+# en_indic direction: trains only on 12 high/medium-resource langs
+#   (hin, ben, tam, tel, kan, mal, mar, guj, pan, ory, asm, urd)
+#   Hindi is weighted 3x — it is the pivot lang for mni/sat/san.
+#   kok/snd/kas/bod/doi excluded — pipeline bypasses IndicTrans2 for them.
+#   indic_en / indic_indic directions: unchanged (train on all available data).
+#
 # Usage:
 #   accelerate launch --num_processes=4 --mixed_precision=bf16 \
 #       finetune/finetune_indictrans.py --direction en_indic
@@ -59,6 +65,16 @@ LR           = 3e-5   # slightly higher LR — larger effective batch
 WARMUP_STEPS = 200
 MAX_LEN      = 256
 LOG_EVERY    = 100
+
+# en_indic: 12 high/medium-resource langs only.
+# kok/snd/kas -> NLLB-only in pipeline (IndicTrans2 not used).
+# bod/doi     -> Seamless-first in pipeline (IndicTrans2 not primary).
+# mni/sat/san -> pivot via Hindi (improving hin covers these indirectly).
+EN_INDIC_TRAIN_LANGS = {
+    "hin", "ben", "tam", "tel", "kan", "mal", "mar", "guj", "pan", "ory", "asm", "urd"
+}
+# Hindi weighted 3x — pivot language for mni/sat/san
+HIN_WEIGHT = 3
 
 INDIC_INDIC_PAIRS = [
     ("hin", "ben"), ("hin", "tam"), ("hin", "tel"), ("hin", "mar"),
@@ -163,22 +179,33 @@ def build_records(direction: str, split: str, quiet: bool = False) -> list:
     tm_records = load_tm_records() if split == "train" else []
 
     if direction in ("en_indic", "indic_en"):
+        # en_indic: restrict to 12 target langs; indic_en: use all available
+        lang_set = EN_INDIC_TRAIN_LANGS if direction == "en_indic" else set(ALL_22)
         for lang in ALL_22:
+            if lang not in lang_set:
+                continue
             raw = load_jsonl(DATA_DIR / lang / f"{split}.jsonl")
             src_code = INDIC_TRANS2_CODES.get("eng" if direction == "en_indic" else lang)
             tgt_code = INDIC_TRANS2_CODES.get(lang if direction == "en_indic" else "eng")
             if not src_code or not tgt_code:
                 continue
+            lang_records = []
             for r in raw:
                 src_text = r["src"] if direction == "en_indic" else r.get("tgt", "")
                 tgt_text = r["tgt"] if direction == "en_indic" else r.get("src", "")
                 if src_text and tgt_text:
-                    records.append({"src": src_text, "tgt": tgt_text,
-                                    "src_lang": src_code, "tgt_lang": tgt_code})
+                    lang_records.append({"src": src_text, "tgt": tgt_text,
+                                         "src_lang": src_code, "tgt_lang": tgt_code})
+            # Boost Hindi 3x — pivot language for mni/sat/san
+            repeat = HIN_WEIGHT if (direction == "en_indic" and lang == "hin") else 1
+            records.extend(lang_records * repeat)
         if direction == "en_indic":
             for r in tm_records:
+                tgt_lang_short = r.get("tgt_lang", "")
+                if tgt_lang_short not in EN_INDIC_TRAIN_LANGS:
+                    continue
                 sc = INDIC_TRANS2_CODES.get("eng")
-                tc = INDIC_TRANS2_CODES.get(r.get("tgt_lang", ""))
+                tc = INDIC_TRANS2_CODES.get(tgt_lang_short)
                 if sc and tc and r.get("src") and r.get("tgt"):
                     records.append({"src": r["src"], "tgt": r["tgt"],
                                     "src_lang": sc, "tgt_lang": tc})
@@ -223,6 +250,8 @@ def train(direction: str):
         ckpt_path.mkdir(parents=True, exist_ok=True)
         log.info(f"{'='*60}")
         log.info(f"Full Fine-tune IndicTrans2 [{direction}] | FSDP | {accelerator.num_processes} GPUs")
+        if direction == "en_indic":
+            log.info(f"en_indic: {len(EN_INDIC_TRAIN_LANGS)} langs={sorted(EN_INDIC_TRAIN_LANGS)} | hin weight={HIN_WEIGHT}x")
         log.info(f"{'='*60}")
         if torch.cuda.is_available():
             for i in range(torch.cuda.device_count()):
