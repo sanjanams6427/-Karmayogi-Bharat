@@ -486,19 +486,18 @@ MODELS_DIR  = Path(__file__).parent.parent / "models"
 
 class Translator:
     # Langs routed via Hindi pivot through IndicTrans2 indic_indic
-    # mni/sat: low-resource, direct coverage unreliable
-    # san: Sanskrit direct en_indic coverage very poor, pivot via Hindi much better
-    _PIVOT_LANGS = {"mni", "sat", "san"}
+    # mni/sat: low-resource — pivot via Hindi, then SeamlessM4T as score-based fallback
+    _PIVOT_LANGS = {"mni", "sat"}
 
-    # Force NLLB as primary — IndicTrans2 tokenizer rejects or produces garbage
-    # kok: gom_Deva rejected by IndicTrans2 tokenizer
-    # snd: snd_Arab outputs English/Hindi garbage
-    # kas: kas_Arab very low coverage, outputs Hindi
-    _NLLB_ONLY = {"kok", "snd", "kas"}
+    # Force NLLB as primary — IndicTrans2 outputs Hindi/garbage for these
+    # After NLLB, try SeamlessM4T as a score-based second opinion
+    _NLLB_FIRST = {"snd", "kas"}
+
+    # Kept for backward compat — same set as _NLLB_FIRST
+    _NLLB_ONLY = _NLLB_FIRST
 
     # Use Seamless FIRST before IndicTrans2 for these langs
-    # bod/doi: IndicTrans2 has codes but Seamless gives better quality
-    _SEAMLESS_FIRST = {"bod", "doi"}
+    _SEAMLESS_FIRST: set = set()
 
     def __init__(self):
         self._indic_trans2: dict = {}
@@ -777,10 +776,10 @@ class Translator:
             (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS)
             and src_lang != "hin" and tgt_lang != "hin"
         )
-        force_nllb    = src_lang in self._NLLB_ONLY or tgt_lang in self._NLLB_ONLY
+        force_nllb    = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
         seamless_first = src_lang in self._SEAMLESS_FIRST or tgt_lang in self._SEAMLESS_FIRST
 
-        # 1a. Seamless-first langs (bod, doi) — try Seamless before IndicTrans2
+        # 1a. Seamless-first langs — try Seamless before IndicTrans2
         if seamless_first and not force_nllb and \
                 src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
             try:
@@ -790,7 +789,32 @@ class Translator:
             except Exception as e:
                 log.warning(f"Seamless-first failed {src_name}\u2192{tgt_name}: {e}")
 
-        # 1b. IndicTrans2 — primary for all other langs
+        # 1b. NLLB-first langs (kas, snd) — NLLB primary, then SeamlessM4T score-based fallback
+        if translated is None and force_nllb and \
+                src_lang in NLLB_CODES and tgt_lang in NLLB_CODES:
+            try:
+                nllb_out    = self._translate_nllb(
+                    work_text, NLLB_CODES[src_lang], NLLB_CODES[tgt_lang])
+                translated  = nllb_out
+                engine_used = "nllb"
+            except Exception as e:
+                log.warning(f"NLLB-first failed {src_name}\u2192{tgt_name}: {e}")
+            # SeamlessM4T second opinion — pick whichever scores higher
+            if translated and src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
+                try:
+                    seamless_out = self._translate_seamless(
+                        work_text, SEAMLESS_CODES[src_lang], SEAMLESS_CODES[tgt_lang])
+                    from .quality import score_segment
+                    s_nllb     = score_segment(work_text, translated,   src_lang, tgt_lang)["score"]
+                    s_seamless = score_segment(work_text, seamless_out, src_lang, tgt_lang)["score"]
+                    if s_seamless > s_nllb + 0.05:  # only switch if meaningfully better
+                        translated  = seamless_out
+                        engine_used = "seamless"
+                        log.info(f"[{tgt_lang}] SeamlessM4T ({s_seamless:.2f}) beat NLLB ({s_nllb:.2f}) — using Seamless")
+                except Exception as e:
+                    log.warning(f"SeamlessM4T second-opinion failed {src_name}\u2192{tgt_name}: {e}")
+
+        # 1c. IndicTrans2 — primary for all other langs
         if translated is None and not force_nllb and \
                 src_lang in INDIC_TRANS2_CODES and tgt_lang in INDIC_TRANS2_CODES:
             try:
@@ -805,7 +829,7 @@ class Translator:
             except Exception as e:
                 log.warning(f"IndicTrans2 failed {src_name}\u2192{tgt_name}: {e}")
 
-        # 2. SeamlessM4T fallback
+        # 2. SeamlessM4T fallback (for pivot langs that failed, and non-nllb-first langs)
         if translated is None and not force_nllb and not seamless_first and \
                 src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
             try:
@@ -815,7 +839,25 @@ class Translator:
             except Exception as e:
                 log.warning(f"SeamlessM4T failed {src_name}\u2192{tgt_name}: {e}")
 
-        # 3. NLLB-200 — final fallback, also primary for kok/snd/kas
+        # For pivot langs (mni/sat): if IndicTrans2 pivot succeeded but score is low,
+        # try SeamlessM4T as a score-based alternative
+        if translated and use_pivot and \
+                src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
+            try:
+                from .quality import score_segment
+                s_pivot = score_segment(work_text, translated, src_lang, tgt_lang)["score"]
+                if s_pivot < 0.50:  # pivot quality is poor — try Seamless
+                    seamless_out = self._translate_seamless(
+                        work_text, SEAMLESS_CODES[src_lang], SEAMLESS_CODES[tgt_lang])
+                    s_seamless = score_segment(work_text, seamless_out, src_lang, tgt_lang)["score"]
+                    if s_seamless > s_pivot:
+                        translated  = seamless_out
+                        engine_used = "seamless"
+                        log.info(f"[{tgt_lang}] SeamlessM4T ({s_seamless:.2f}) beat pivot ({s_pivot:.2f})")
+            except Exception as e:
+                log.warning(f"Pivot score-check Seamless failed {src_name}\u2192{tgt_name}: {e}")
+
+        # 3. NLLB-200 — final fallback for everything
         if translated is None and \
                 src_lang in NLLB_CODES and tgt_lang in NLLB_CODES:
             try:
@@ -869,7 +911,7 @@ class Translator:
         """
         needs_pivot  = (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS) \
                        and src_lang != "hin" and tgt_lang != "hin"
-        force_nllb   = src_lang in self._NLLB_ONLY or tgt_lang in self._NLLB_ONLY
+        force_nllb   = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
         seamless_first = src_lang in self._SEAMLESS_FIRST or tgt_lang in self._SEAMLESS_FIRST
 
         results = []
@@ -930,7 +972,7 @@ class Translator:
             (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS)
             and src_lang != "hin" and tgt_lang != "hin"
         )
-        force_nllb    = src_lang in self._NLLB_ONLY or tgt_lang in self._NLLB_ONLY
+        force_nllb    = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
         seamless_first = src_lang in self._SEAMLESS_FIRST or tgt_lang in self._SEAMLESS_FIRST
 
         # True GPU batch for IndicTrans2 — skip for pivot/nllb-only/seamless-first

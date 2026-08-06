@@ -37,10 +37,13 @@ except Exception:
     _FFMPEG = "ffmpeg"
 
 MODELS_DIR       = Path(__file__).parent.parent / "models"
-# Large model is primary (3.58GB, better quality); mini is fallback
+CKPT_DIR         = Path(__file__).parent.parent / "checkpoints"
+# Fine-tuned checkpoint takes priority over base models
+_PARLER_FT_DIR   = CKPT_DIR / "parler_tts" / "best"
 PARLER_LARGE_DIR = MODELS_DIR / "indic_parler_tts_large"
 PARLER_MINI_DIR  = MODELS_DIR / "indic_parler_tts"
-PARLER_DIR       = PARLER_LARGE_DIR if PARLER_LARGE_DIR.exists() else PARLER_MINI_DIR
+PARLER_DIR       = (_PARLER_FT_DIR   if _PARLER_FT_DIR.exists()   else
+                    PARLER_LARGE_DIR if PARLER_LARGE_DIR.exists() else PARLER_MINI_DIR)
 FLAN_T5_DIR      = MODELS_DIR / "flan_t5_large"
 MMS_DIR          = MODELS_DIR / "mms"
 MMS_STANDALONE   = MODELS_DIR / "mms_standalone"  # standalone per-lang VITS models
@@ -48,8 +51,13 @@ XTTS_DIR         = MODELS_DIR / "xtts_v2"          # Coqui XTTS-v2 — open-sour
 
 # Languages that have a standalone VITS model (not an adapter of the shared MMS base)
 # key = pipeline lang code, value = subfolder under MMS_STANDALONE
+# Download with: python scripts/download_models.py
 _MMS_STANDALONE_LANGS = {
-    "doi": "dgo",   # facebook/mms-tts-dgo — real Dogri VITS
+    "doi": "dgo",   # Dogri standalone VITS (downloaded)
+    "bod": "bod",   # Bodo standalone VITS  (downloaded)
+    "mni": "mni",   # Manipuri proxy VITS (facebook/mms-tts-ben)
+    "kok": "kok",   # Konkani proxy VITS (facebook/mms-tts-mar)
+    "kas": "kas",   # Kashmiri proxy VITS (facebook/mms-tts-urd-script_arabic)
 }
 
 SR = 44100  # target sample rate
@@ -87,18 +95,18 @@ _PARLER_SPEAKERS = {lang: ("generic", _PARLER_DESC) for lang in [
 ]}
 
 # MMS-TTS adapter codes for all 22 languages (shared-base adapter model)
-# doi is excluded here — it uses a standalone VITS model via _MMS_STANDALONE_LANGS
+# Langs with standalone VITS (doi/san/kas/snd/kok/mni) are excluded —
+# they use _MMS_STANDALONE_LANGS and only fall through to adapter if standalone missing.
 MMS_LANG_CODES = {
     "asm": "asm", "ben": "ben", "guj": "guj", "hin": "hin",
     "kan": "kan", "mal": "mal", "mar": "mar", "ory": "ory",
     "pan": "pan", "tam": "tam", "tel": "tel",
     "urd": "urd-script_arabic", "nep": "npi", "bod": "bod",
     "mai": "mai", "sat": "sat", "snd": "snd",
-    # No dedicated adapters — closest phonetic match:
-    "kas": "urd-script_arabic",  # Kashmiri → Urdu Arabic script
-    "kok": "mar",                # Konkani → Marathi (same script)
-    "mni": "ben",                # Manipuri → Bengali (same script)
-    "san": "hin",                # Sanskrit → Hindi (same script)
+    "san": "hin",               # no san adapter - hin shares Devanagari
+    "kas": "urd-script_arabic",  # no kas adapter - urd Nastaliq is closest
+    "kok": "mar",                # no kok adapter - mar shares Devanagari
+    "mni": "ben",                # no mni adapter - ben shares Bengali script
 }
 
 # XTTS-v2 language codes (Coqui TTS)
@@ -109,7 +117,8 @@ _XTTS_LANG_CODES = {
     "urd": "ur", "nep": "ne", "asm": "as", "ory": "or",
     # Low-resource: route to closest supported language
     "mai": "hi", "doi": "hi", "kok": "mr", "mni": "bn",
-    "san": "hi", "sat": "hi", "snd": "ur", "kas": "ur",
+    "san": "hi",  # Sanskrit -- closest XTTS lang; Parler is preferred for san
+    "sat": "hi", "snd": "ur", "kas": "ur",
     "bod": "hi",
 }
 
@@ -235,10 +244,12 @@ class TTSEngine:
             return True
         # Try large first, fall back to mini
         candidates = []
+        if _PARLER_FT_DIR.exists():
+            candidates.append((_PARLER_FT_DIR,   "fine-tuned"))
         if PARLER_LARGE_DIR.exists():
             candidates.append((PARLER_LARGE_DIR, "large"))
         if PARLER_MINI_DIR.exists():
-            candidates.append((PARLER_MINI_DIR, "mini"))
+            candidates.append((PARLER_MINI_DIR,  "mini"))
         if not candidates:
             log.warning("No Parler-TTS model found (checked large + mini dirs)")
             return False
@@ -574,7 +585,9 @@ class TTSEngine:
                             break
             text_idxs = failed
 
-        # Standalone VITS fallback (e.g. doi → dgo model)
+        # Standalone VITS — tried before MMS adapter for langs that have a native model
+        # (doi, san, kas, snd, kok, mni). For kas/snd/kok/mni this avoids the wrong-language
+        # MMS adapter. Falls through to MMS adapter if standalone model not downloaded.
         if text_idxs and lang in _MMS_STANDALONE_LANGS:
             still_failed = []
             for i in text_idxs:

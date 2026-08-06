@@ -39,15 +39,16 @@ def generate_srt(segments: list[dict], output_path: str) -> str:
     lines = []
     idx = 1
     for seg in segments:
-        text = seg.get("text", "").strip()
+        # Collapse embedded newlines — a newline inside text breaks the SRT timestamp line
+        text = " ".join(seg.get("text", "").split())
         if not text:
             continue
         start = _seconds_to_srt_time(seg.get("start", 0))
         end   = _seconds_to_srt_time(seg.get("end",   0))
-        lines.append(f"{idx}\n{start} --> {end}\n{text}\n")
+        lines.append(f"{idx}\r\n{start} --> {end}\r\n{text}\r\n")
         idx += 1
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    Path(output_path).write_text("\n".join(lines), encoding="utf-8")
+    Path(output_path).write_bytes(("\r\n".join(lines)).encode("utf-8-sig"))
     log.info(f"SRT generated ({idx-1} entries) → {output_path}")
     return output_path
 
@@ -56,7 +57,7 @@ def generate_vtt(segments: list[dict], output_path: str) -> str:
     """Generate WebVTT subtitle file from translated segments."""
     lines = ["WEBVTT", ""]
     for seg in segments:
-        text = seg.get("text", "").strip()
+        text = " ".join(seg.get("text", "").split())
         if not text:
             continue
         start = _seconds_to_vtt_time(seg.get("start", 0))

@@ -181,7 +181,7 @@ def _translate_plain_doc(file_path: str, src_lang: str, tgt_langs: list,
             return pipeline.translator.translate_document_batch(texts, src, tgt)
 
         for i, tgt in enumerate(tgt_langs):
-            progress((i + 1) / len(tgt_langs), desc=f"Translating → {LANG_NAMES[tgt]}")
+            progress((i + 1) / len(tgt_langs), desc=f"Translating \u2192 {LANG_NAMES.get(tgt, tgt)}")
             out_path = os.path.join(out_dir, f"{course_id}_{tgt}.docx")
             try:
                 translate_docx(file_path, out_path, _batch_translate, src_lang, tgt)

@@ -41,6 +41,8 @@ SEAMLESS_CODES = {
     "bod": "brx",
     # doi (Dogri) — SeamlessM4T supports doi text translation
     "doi": "doi",
+    # kas — SeamlessM4Tv2 supports Kashmiri text translation
+    "kas": "kas",
 }
 
 # SeamlessM4T S2ST — speech OUTPUT supported langs only (subset of SEAMLESS_CODES)
