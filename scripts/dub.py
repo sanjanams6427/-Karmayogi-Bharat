@@ -4,7 +4,6 @@
 # Usage:
 #   python dub.py --video course.mp4 --src eng --tgt hin
 #   python dub.py --video course.mp3 --src eng --tgt hin,tam,tel
-#   python dub.py --video course.mp4 --src eng --tgt all --voice-clone
 #   python dub.py --video course.mp4 --src eng --tgt all --full \
 #                 --metadata meta.json --quiz quiz.json --upload-cbp
 #   python dub.py --metadata meta.json --src eng --tgt hin --xlsx
@@ -48,12 +47,6 @@ def main():
                         help="GPU index to use (default: 0). Use --batch-videos for multi-GPU.")
     parser.add_argument("--num-gpus", type=int, default=None,
                         help="Number of GPUs for parallel dubbing (default: auto-detect all available)")
-
-    # Voice cloning
-    parser.add_argument("--voice-clone", action="store_true",
-                        help="Use voice cloning (tender pricing tier 2)")
-    parser.add_argument("--reference-audio",
-                        help="Reference audio file for voice cloning (.wav)")
 
     # Output format flags
     parser.add_argument("--xlsx", action="store_true",
@@ -130,8 +123,6 @@ def main():
     print(f"  KB Dubbing Pipeline")
     print(f"  Source: {src_name}")
     print(f"  Target: {', '.join(LANG_NAMES.get(t, t) for t in targets)}")
-    if args.voice_clone:
-        print(f"  Mode: Voice Cloning")
     print(f"{'='*60}\n")
 
     pipeline = DubbingPipeline(use_glossary=not args.no_glossary) if num_gpus == 1 else None
@@ -155,8 +146,6 @@ def main():
             course_id=args.course_id,
             metadata=metadata,
             quiz=quiz,
-            voice_clone=args.voice_clone,
-            reference_audio=args.reference_audio,
             upload_to_cbp=args.upload_cbp,
         )
 
@@ -221,8 +210,6 @@ def main():
             tgt_langs=targets,
             output_dir=args.output,
             course_id=args.course_id,
-            voice_clone=args.voice_clone,
-            reference_audio=args.reference_audio,
             force=args.force,
             num_gpus=num_gpus,
         )

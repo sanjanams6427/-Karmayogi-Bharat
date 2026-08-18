@@ -401,3 +401,28 @@ Scoring methods: heuristic (script check, length ratio, transliteration detectio
 - **Stale cache detection** — source.wav re-extracted if input video is newer than cached WAV
 - **Concurrent job protection** — per-(course_id, lang) threading lock prevents duplicate jobs
 - **Audit trail** — every job start/success/failure written to `logs/audit.log` as JSON
+
+
+
+
+S E:\Manick_AI_ML\project> accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_indictrans.py --direction indic_indic
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Scripts\accelerate.exe\__main__.py", line 4, in <module>
+  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\accelerate\__init__.py", line 16, in <module>
+    from .accelerator import Accelerator
+  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\accelerate\accelerator.py", line 32, in <module>
+    import torch
+  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\__init__.py", line 2151, in <module>
+    from torch import (
+  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\optim\__init__.py", line 12, in <module>
+    from torch.optim.adagrad import Adagrad as Adagrad
+  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
+  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
+  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
+  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
+  File "<frozen importlib._bootstrap_external>", line 1091, in get_code
+  File "<frozen importlib._bootstrap_external>", line 1191, in get_data
+KeyboardInterrupt
+PS E:\Manick_AI_ML\project> 

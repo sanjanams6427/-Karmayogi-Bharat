@@ -3,38 +3,37 @@ models/
 checkpoints/indictrans/
 checkpoints/seamless/
 
-# ── Output / temp / cache ─────────────────────────────────────
+# ── Runtime / output ──────────────────────────────────────────
 output/
 temp/
 logs/
 translation_memory/
-__pycache__/
-*.pyc
-*.pyo
-.cache/
-*.egg-info/
-dist/
-build/
+input/
+
+# ── Job checkpoints (runtime state) ──────────────────────────
+checkpoints/jobs/
 
 # ── Secrets ───────────────────────────────────────────────────
 .env
 .output_dir
 
-# ── Dataset raw audio (large HF arrow files) ─────────────────
+# ── Dataset raw audio / large HF arrow files ─────────────────
 datasets/audio/
 datasets/text/
-datasets/parallel/
-input/
-.claude/
-*.bak
-ui/requirements.txt
-scripts/git_push.bat
-scripts/test_seamless_mal.py
+datasets/tts/
+datasets/tts_wav/
 
-# ── Job checkpoints (runtime state) ──────────────────────────
-checkpoints/jobs/
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.cache/
 
-# ── Virtual environment ─────────────────────────────────────
+# ── Virtual environment ───────────────────────────────────────
 venv/
 .venv/
 env/
@@ -46,7 +45,30 @@ Thumbs.db
 .idea/
 *.swp
 
-# ── Keep these dataset index files (small JSON) ──────────────
+# ── Media / binary artifacts ──────────────────────────────────
+*.wav
+*.mp3
+*.mp4
+*.pdf
+*.bak
+
+# ── Scratch / one-off scripts (never commit) ─────────────────
+compare_*.py
+consistency_test.py
+greedy_test.py
+extract_pdf*.py
+test_parler_*.py
+test_tts.py
+inspect_parler.py
+tender_text*.txt
+scripts/git_push.bat
+scripts/wipe_outputs.bat
+_dp_full.txt
+_dp_snip.txt
+_tts_full.txt
+_vits_test.txt
+
+# ── Keep dataset index files (small JSON/JSONL) ───────────────
 !datasets/asr/
 !datasets/asr/**
 !datasets/parallel/

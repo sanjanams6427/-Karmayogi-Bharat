@@ -14,22 +14,28 @@
 #   9. Separate dev eval per language group — catches per-lang regression
 #  10. indic_indic: all 22×22 pairs (was 21 hand-picked pairs)
 #
-# Usage:
+# Usage (Windows — gloo backend, no NCCL):
 #   accelerate launch --num_processes=4 --mixed_precision=bf16 \
+#       --main_process_ip=127.0.0.1 --main_process_port=29500 \
 #       finetune/finetune_indictrans.py --direction en_indic
+#
 #   accelerate launch --num_processes=4 --mixed_precision=bf16 \
+#       --main_process_ip=127.0.0.1 --main_process_port=29500 \
 #       finetune/finetune_indictrans.py --direction all
 # ============================================================
 
 import argparse, json, os, random, sys, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-os.environ.setdefault("PL_TORCH_DISTRIBUTED_BACKEND", "gloo")
-os.environ.setdefault("TORCH_DISTRIBUTED_DEFAULT_BACKEND", "gloo")
-os.environ.setdefault("ACCELERATE_USE_FSDP", "false")
-os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+# ── Windows-safe distributed env ──────────────────────────────
+os.environ["MASTER_ADDR"] = "127.0.0.1"          # override Docker DNS (kubernetes.docker.internal)
 os.environ.setdefault("MASTER_PORT", "29500")
-os.environ["MASTER_ADDR"] = "127.0.0.1"
-os.environ.setdefault("GLOO_SOCKET_IFNAME", "loopback")
+os.environ["TORCH_DISTRIBUTED_DEFAULT_BACKEND"] = "gloo"
+os.environ["PL_TORCH_DISTRIBUTED_BACKEND"]      = "gloo"
+os.environ["ACCELERATE_USE_FSDP"]               = "false"
+os.environ["TORCHELASTIC_RESTART_COUNT"]        = "0"
+# Prevent accelerate from sending SIGINT (unsupported on Windows subprocesses)
+os.environ.setdefault("ACCELERATE_PROCESS_KILL_SIGNAL", "SIGTERM")
+# GLOO_SOCKET_IFNAME must NOT be set on Windows — gloo auto-detects the interface
 from pathlib import Path
 
 import torch
@@ -56,8 +62,8 @@ TM_PATH    = Path("translation_memory/govt_tm.jsonl")
 HF_PATH    = Path("translation_memory/human_feedback.jsonl")
 
 # ── Hyperparams ────────────────────────────────────────────────
-BATCH_SIZE      = 16      # per GPU
-GRAD_ACCUM      = 4       # effective batch = 16 * 4 * 4 GPUs = 256
+BATCH_SIZE      = 8       # per GPU — halved; grad checkpointing disabled (IndicTrans2 old API ignores use_reentrant)
+GRAD_ACCUM      = 8       # effective batch = 8 * 8 * 4 GPUs = 256 (unchanged)
 MAX_EPOCHS      = 5       # more epochs; early stopping prevents overfit
 LR              = 2e-5    # slightly lower — cosine schedule handles warmup
 WARMUP_RATIO    = 0.06    # 6% of total steps as warmup
@@ -120,18 +126,16 @@ def _quality_ok(src: str, tgt: str) -> bool:
 def _smooth_loss(logits: torch.Tensor, labels: torch.Tensor,
                  smoothing: float = LABEL_SMOOTHING) -> torch.Tensor:
     """
-    Label-smoothed cross-entropy.
+    Label-smoothed cross-entropy via F.cross_entropy.
+    Avoids summing over the full 250K-token vocab on bf16 (CUDA launch failure).
     logits: (B, T, V)   labels: (B, T)  — -100 = ignore
     """
-    vocab = logits.size(-1)
-    log_probs = F.log_softmax(logits.float(), dim=-1)
-    mask = labels != -100
-    flat_labels = labels.clone()
-    flat_labels[~mask] = 0
-    nll = -log_probs.gather(dim=-1, index=flat_labels.unsqueeze(-1)).squeeze(-1)
-    smooth = -log_probs.sum(dim=-1) / vocab
-    loss = (1 - smoothing) * nll + smoothing * smooth
-    return loss[mask].mean()
+    return F.cross_entropy(
+        logits.float().view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=-100,
+        label_smoothing=smoothing,
+    )
 
 
 # ── Dataset ────────────────────────────────────────────────────
@@ -318,7 +322,7 @@ def build_records(direction: str, split: str,
 
 # ── Train ──────────────────────────────────────────────────────
 def train(direction: str):
-    os.environ.setdefault("NCCL_BACKEND", "gloo")
+    os.environ["TORCH_DISTRIBUTED_DEFAULT_BACKEND"] = "gloo"
     accelerator = Accelerator(
         mixed_precision="bf16",
         gradient_accumulation_steps=GRAD_ACCUM,
@@ -346,7 +350,10 @@ def train(direction: str):
     model = AutoModelForSeq2SeqLM.from_pretrained(
         model_path, trust_remote_code=True, torch_dtype=torch.bfloat16
     )
-    model.gradient_checkpointing_enable()
+    # IndicTrans2 uses old _set_gradient_checkpointing API — silently ignores
+    # use_reentrant=False, causing CUDA unspecified launch failure on bf16 multi-GPU.
+    # Disabled; VRAM offset by halving BATCH_SIZE + doubling GRAD_ACCUM above.
+    # model.gradient_checkpointing_enable()
 
     # Estimate total steps using epoch-1 data (no synthetic yet)
     if is_main:

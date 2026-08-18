@@ -3,8 +3,11 @@
 # Engine: faster-whisper large-v3 (no huggingface_hub conflict)
 # ============================================================
 
-import subprocess, tempfile, os
+import re, subprocess, tempfile, os
 import torch, numpy as np
+torch.backends.cudnn.benchmark = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from pathlib import Path
 from .lang_config import LANG_NAMES
 from .lang_detect import tag_segments, fw_lang_to_internal
@@ -140,9 +143,9 @@ class ASREngine:
             raw_segs, info = model.transcribe(
                 wav,
                 language=fw_lang,
-                beam_size=5,
+                beam_size=4,
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500},
+                vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 200},
                 word_timestamps=True,
                 condition_on_previous_text=False,  # prevents Whisper hallucination loops
                 temperature=[0.0, 0.2, 0.4],       # fallback temps break repetition
@@ -165,7 +168,12 @@ class ASREngine:
 
         if not raw_segs:
             return []
-        merged = _merge_segments(raw_segs)
+        # Tamil/Telugu are morphologically rich — use longer merge windows
+        # so sentences aren’t split mid-clause
+        if lang in ("tam", "tel", "mal", "kan"):
+            merged = _merge_segments(raw_segs, min_words=5, min_dur=2.0, max_dur=15.0)
+        else:
+            merged = _merge_segments(raw_segs)
         segments = tag_segments(merged, lang)
         # Post-process Nastaliq script languages
         if lang in ("urd", "kas", "snd"):
@@ -183,22 +191,39 @@ class ASREngine:
         return " ".join(s["text"] for s in segs)
 
 
+# Pre-compiled hallucination prefix pattern — covers English and Devanagari artifacts
+_HALLUC_PREFIX_RE = re.compile(
+    r'^(?:'
+    # English Whisper hallucinations at segment boundaries
+    r'Wanner|Whener|Viengore|Venue|Guinevere|Gindis|Wener|Whener|'
+    r'Venger|Vien|Whan|Wener|Winer|Wanna|Gonna|Ginda|Gindas|'
+    r'Vanna|Venna|Vinna|Wenna|Winna'
+    r')\s+',
+    re.IGNORECASE
+)
+# Devanagari hallucination prefixes
+_HALLUC_DEVA_RE = re.compile(
+    r'^(?:छे[^\s]*|से[^\s]*|हे[^\s]*|ये[^\s]*|वे[^\s]*|जे[^\s]*|चे[^\s]*)\s+'
+)
+# Tamil/Telugu segment boundary artifacts:
+# Leading ) , . or Indic punctuation followed by space — ASR boundary bleed
+_HALLUC_BOUNDARY_RE = re.compile(
+    r'^[)\]},;.।॥\u0964\u0965]+\s+'
+)
+
+
 def _strip_hallucinations(text: str) -> str:
     """
-    Remove known Whisper hallucination patterns that appear at segment boundaries.
-    These are real English words that Whisper hallucinates when audio is unclear
-    at the start/end of a segment — they corrupt translation output.
+    Remove known Whisper hallucination patterns at segment boundaries.
+    Covers English, Devanagari, and Tamil/Telugu boundary artifacts.
     """
-    import re
-    # Sentence-initial hallucination words Whisper commonly produces
-    _HALLUC_PREFIX = re.compile(
-        r'^(?:Wanner|Whener|Viengore|Venue|Guinevere|Gindis|Wener|Whener|'
-        r'Venger|Vien|Whan|Whan|Wener|Winer|Wanna|Gonna|Ginda|Gindas|'
-        r'Wanna|Gonna|Vanna|Venna|Vinna|Vanna|Wenna|Winna)\s+',
-        re.IGNORECASE
-    )
-    text = _HALLUC_PREFIX.sub('', text).strip()
-    # Capitalise first letter after stripping
+    text = _HALLUC_PREFIX_RE.sub('', text).strip()
+    text = _HALLUC_DEVA_RE.sub('', text).strip()
+    text = _HALLUC_BOUNDARY_RE.sub('', text).strip()
+    # Strip leading incomplete syllable fragments for Tamil/Telugu:
+    # segments starting with a lone consonant cluster + space (e.g. "ப்படிப்பு", "ட்டட்")
+    text = re.sub(r'^[\u0B80-\u0BFF]{1,3}[்]\s+', '', text)   # Tamil virama-initial
+    text = re.sub(r'^[\u0C00-\u0C7F]{1,3}[\u0C4D]\s+', '', text)  # Telugu virama-initial
     if text:
         text = text[0].upper() + text[1:]
     return text

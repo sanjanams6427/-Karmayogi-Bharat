@@ -3,7 +3,9 @@ KB Translation System — Enterprise UI
 Run: python ui/app.py
 """
 
-import sys, os, json, time, threading
+import sys, os, json, time, threading, warnings
+warnings.filterwarnings("ignore", message=".*HTTP_422_UNPROCESSABLE_ENTITY.*")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="starlette")
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -52,6 +54,7 @@ _pipeline_ready = threading.Event()
 _pipeline_error = ""
 _log_lines: list[str] = []
 _log_lock  = threading.Lock()
+_job_semaphore = threading.Semaphore(1)  # only 1 job at a time — GPU has no spare VRAM for 2
 
 
 def _append_log(msg: str):
@@ -208,8 +211,7 @@ def _translate_plain_doc(file_path: str, src_lang: str, tgt_langs: list,
     for i, tgt in enumerate(tgt_langs):
         progress((i + 1) / len(tgt_langs), desc=f"Translating → {LANG_NAMES[tgt]}")
         try:
-            results = pipeline.translator.translate_batch(paragraphs, src_lang, tgt)
-            translated_paras = [r.get("text", paragraphs[j]) for j, r in enumerate(results)]
+            translated_paras = pipeline.translator.translate_document_batch(paragraphs, src_lang, tgt)
         except Exception as e:
             log_lines.append(f"❌ {LANG_NAMES[tgt]}: {e}")
             continue
@@ -287,12 +289,103 @@ def translate_doc(file, src_lang, tgt_langs, doc_type, course_title,
 
 
 # ── Tab 3: Full Course Batch ──────────────────────────────────
+def _build_scores_table(summary: dict) -> list[list]:
+    """Build rows for the per-language quality score Dataframe."""
+    rows = []
+    for lang, info in summary.get("dubbing", {}).items():
+        lang_name = LANG_NAMES.get(lang, lang)
+        if not info.get("success"):
+            rows.append([lang_name, "—", "❌ FAILED", "—", "—", "—", "—", "—"])
+            continue
+        q         = info.get("quality") or {}
+        score     = q.get("avg_score", "—")
+        pass_rate = q.get("pass_rate", "—")
+        total     = q.get("total", "—")
+        failed    = q.get("failed", 0)
+        review    = q.get("needs_review", 0)
+        dur_ratio = q.get("duration_ratio")
+        dur_flag  = q.get("duration_ratio_flag", False)
+        try:
+            s = float(score)
+            bar   = "█" * int(s * 10) + "░" * (10 - int(s * 10))
+            label = "✅ Pass" if s >= 0.55 else ("⚠️ Review" if s >= 0.30 else "❌ Failed")
+            score_str = f"{s:.2f}  [{bar}]"
+        except (TypeError, ValueError):
+            label     = "—"
+            score_str = str(score)
+        dur_str = (
+            f"⚠️ {dur_ratio:.2f}x" if dur_flag else
+            (f"✅ {dur_ratio:.2f}x" if dur_ratio is not None else "—")
+        )
+        rows.append([lang_name, score_str, label,
+                     str(pass_rate), str(total), str(failed), str(review), dur_str])
+    return rows
+
+
+def _format_quality_summary(summary: dict) -> str:
+    """Convert raw pipeline summary dict into a readable per-language quality report."""
+    lines = []
+    elapsed = summary.get("elapsed_min", "?")
+    langs   = summary.get("target_langs", [])
+    lines.append(f"⏱ Completed in {elapsed} min  |  {len(langs)} language(s)")
+    lines.append("=" * 56)
+
+    for lang, info in summary.get("dubbing", {}).items():
+        lang_name = LANG_NAMES.get(lang, lang)
+        if not info.get("success"):
+            err = info.get("error") or "unknown error"
+            lines.append(f"❌ {lang_name} ({lang})  —  FAILED: {err[:60]}")
+            continue
+
+        q = info.get("quality") or {}
+        score     = q.get("avg_score",  "—")
+        pass_rate = q.get("pass_rate",  "—")
+        total     = q.get("total",      "—")
+        failed    = q.get("failed",     0)
+        review    = q.get("needs_review", 0)
+        dur_ratio = q.get("duration_ratio")
+        dur_flag  = q.get("duration_ratio_flag", False)
+
+        # Overall status emoji
+        try:
+            s = float(score)
+            status = "✅" if s >= 0.55 else ("⚠️" if s >= 0.30 else "❌")
+        except (TypeError, ValueError):
+            status = "✅"
+
+        lines.append(f"{status} {lang_name} ({lang})")
+        lines.append(f"   Translation quality : {score}  (pass rate {pass_rate})")
+        lines.append(f"   Segments            : {total} total  |  {failed} failed  |  {review} need review")
+        if dur_ratio is not None:
+            dur_icon = "⚠️" if dur_flag else "✅"
+            lines.append(f"   Duration ratio      : {dur_icon} {dur_ratio:.2f}x"
+                         + ("  ← KB approval required" if dur_flag else ""))
+        out = info.get("output") or ""
+        if out:
+            lines.append(f"   Output              : {Path(out).name}")
+        lines.append("")
+
+    # Footer: overall pass/fail count
+    dub = summary.get("dubbing", {})
+    ok  = sum(1 for v in dub.values() if v.get("success"))
+    fail = len(dub) - ok
+    lines.append("-" * 56)
+    lines.append(f"Total: {ok} succeeded  |  {fail} failed")
+    if summary.get("metadata_xlsx"):
+        lines.append("📄 Metadata Excel exported")
+    if summary.get("quiz_docx"):
+        lines.append(f"📝 Quiz DOCX exported for {len(summary['quiz_docx'])} language(s)")
+    if summary.get("qa_reports"):
+        lines.append(f"📋 QA certificates generated for {len(summary['qa_reports'])} language(s)")
+    return "\n".join(lines)
+
+
 def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
-                   course_id, voice_clone, upload_cbp, progress=gr.Progress()):
+                   course_id, upload_cbp, progress=gr.Progress()):
     if video_file is None:
-        return None, "❌ Please upload a video/audio file."
+        return None, [], "❌ Please upload a video/audio file."
     if not tgt_langs:
-        return None, "❌ Select at least one target language."
+        return None, [], "❌ Select at least one target language."
 
     pipeline = get_pipeline()
     cid      = course_id or Path(video_file.name).stem
@@ -318,37 +411,75 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
     except Exception:
         _num_gpus = 1
 
-    progress(0.1, desc="Starting pipeline...")
-    _append_log(f"Full course batch: {cid} → {tgt_langs} | GPUs={_num_gpus}")
-    _t0 = time.time()
-    summary = pipeline.process_course_full(
-        video_file.name, src_lang, tgt_langs, out_dir, cid,
-        metadata=metadata, quiz=quiz,
-        voice_clone=voice_clone, upload_to_cbp=upload_cbp,
-        num_gpus=_num_gpus,
-    )
+    if not _job_semaphore.acquire(blocking=False):
+        return None, [], "⏳ Another job is already running. Please wait for it to finish."
+    try:
+        progress(0.05, desc=f"Starting pipeline — 0 / {len(tgt_langs)} languages…")
+        _append_log(f"Full course batch: {cid} → {tgt_langs} | GPUs={_num_gpus}")
+        _t0 = time.time()
 
-    all_files = []
-    for tgt, info in summary["dubbing"].items():
-        if info.get("output"):
-            all_files.append(info["output"])
-        # Only include SRT/VTT matching this job's course_id + lang
-        sub_dir = Path(out_dir) / tgt
-        for ext in (".srt", ".vtt"):
-            p = sub_dir / f"{cid}_{tgt}{ext}"
-            if p.exists():
-                all_files.append(str(p))
-    for p in summary.get("quiz_docx", {}).values():
-        all_files.append(p)
-    for p in summary.get("qa_reports", {}).values():
-        all_files.append(p)
-    if summary.get("metadata_xlsx", {}).get("all"):
-        all_files.append(summary["metadata_xlsx"]["all"])
+        # Run pipeline in a background thread so we can poll progress here
+        _result_box: list = [None]
+        _exc_box:    list = [None]
 
-    _elapsed = round((time.time() - _t0) / 60, 1)
-    summary["elapsed_min"] = _elapsed
-    _append_log(f"✅ Dubbing done in {_elapsed} min")
-    return _save_outputs(all_files) or None, json.dumps(summary, indent=2, default=str)
+        def _run():
+            try:
+                _result_box[0] = pipeline.process_course_full(
+                    video_file.name, src_lang, tgt_langs, out_dir, cid,
+                    metadata=metadata, quiz=quiz,
+                    upload_to_cbp=upload_cbp,
+                    num_gpus=_num_gpus,
+                )
+            except Exception as e:
+                _exc_box[0] = e
+
+        _worker = threading.Thread(target=_run, daemon=True)
+        _worker.start()
+
+        # Poll output directory for completed language folders
+        n_total = len(tgt_langs)
+        while _worker.is_alive():
+            done = sum(
+                1 for lang in tgt_langs
+                if any(Path(out_dir, lang).glob(f"{cid}_{lang}.mp4")) or
+                   any(Path(out_dir, lang).glob(f"{cid}_{lang}.mp3"))
+            )
+            frac = 0.05 + 0.90 * (done / n_total) if n_total else 0.95
+            progress(frac, desc=f"Dubbing… {done} / {n_total} languages done")
+            time.sleep(3)
+
+        _worker.join()
+        if _exc_box[0]:
+            raise _exc_box[0]
+
+        progress(0.97, desc="Collecting outputs…")
+        summary = _result_box[0]
+        all_files = []
+        for tgt, info in summary["dubbing"].items():
+            if info.get("output") and Path(info["output"]).exists():
+                all_files.append(info["output"])
+            sub_dir = Path(out_dir) / tgt
+            for ext in (".srt", ".vtt", "_qa_cert.docx", "_metadata.json"):
+                p = sub_dir / f"{cid}_{tgt}{ext}"
+                if p.exists():
+                    all_files.append(str(p))
+        for p in summary.get("quiz_docx", {}).values():
+            if p and Path(p).exists():
+                all_files.append(p)
+        for p in summary.get("qa_reports", {}).values():
+            if p and Path(p).exists():
+                all_files.append(p)
+        if summary.get("metadata_xlsx", {}).get("all") and \
+                Path(summary["metadata_xlsx"]["all"]).exists():
+            all_files.append(summary["metadata_xlsx"]["all"])
+        _elapsed = round((time.time() - _t0) / 60, 1)
+        summary["elapsed_min"] = _elapsed
+        _append_log(f"✅ Dubbing done in {_elapsed} min")
+        scores_table = _build_scores_table(summary)
+        progress(1.0, desc="Done!")
+        return _save_outputs(all_files) or None, scores_table, _format_quality_summary(summary)
+    finally:
+        _job_semaphore.release()
 
 
 # ── Tab 4: QA Report ─────────────────────────────────────────
@@ -432,26 +563,29 @@ def build_ui():
                         gr.Button("Clear", size="sm").click(
                             lambda: [], outputs=[t1_tgt])
                     with gr.Row():
-                        t1_clone = gr.Checkbox(label="🎙️ Voice Cloning (Tier 2)", value=False)
                         t1_cbp   = gr.Checkbox(label="📤 Upload to CBP Portal", value=False)
-                    t1_ref = gr.File(label="Reference Speaker Audio (.wav / .mp3)",
-                                     file_types=[".wav", ".mp3"], visible=False)
-                    t1_clone.change(lambda v: gr.update(visible=v), t1_clone, t1_ref)
                     t1_btn = gr.Button("🚀 Start Dubbing", variant="primary", size="lg")
 
                 with gr.Column(scale=2):
                     t1_dl      = gr.Files(label="⬇️ Download All Outputs (MP4 · SRT · VTT · DOCX)")
+                    t1_scores  = gr.Dataframe(
+                        headers=["Language", "Score", "Status", "Pass Rate", "Segments", "Failed", "Needs Review", "Duration Ratio"],
+                        datatype=["str", "str", "str", "str", "str", "str", "str", "str"],
+                        interactive=False,
+                        label="📊 Dubbed Output Quality Scores (per language)",
+                        wrap=False,
+                    )
                     t1_quality = gr.Textbox(
-                        label="Job Summary & Quality Scores",
-                        lines=14, interactive=False,
+                        label="Job Summary",
+                        lines=10, interactive=False,
                         placeholder="Results appear here after job completes…"
                     )
 
             t1_btn.click(
                 process_course,
                 inputs=[t1_file, t1_meta, t1_quiz, t1_src, t1_tgt,
-                        t1_id, t1_clone, t1_cbp],
-                outputs=[t1_dl, t1_quality],
+                        t1_id, t1_cbp],
+                outputs=[t1_dl, t1_scores, t1_quality],
             )
 
         # ── Tab 2: Translate Document ─────────────────────────
@@ -910,19 +1044,20 @@ def create_app():
 
 if __name__ == "__main__":
     import socket
-    def _free_port(preferred=7860):
-        for port in range(preferred, preferred + 20):
+
+    def _free_port(start: int = 7860, end: int = 7870) -> int:
+        for port in range(start, end + 1):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                if s.connect_ex(("127.0.0.1", port)) != 0:
+                if s.connect_ex(("172.23.198.15", port)) != 0:
                     return port
-        return 0  # let Gradio pick
-    port = _free_port(7860)
-    app = build_ui()
-    print(f"Starting on http://localhost:{port}")
+        return start  # fallback — let Gradio raise the error
+
+    PORT = _free_port()
+    app  = build_ui()
+    print(f"UI running at http://172.23.198.15:{PORT}  (keep this tab open, just refresh on code changes)")
     app.launch(
-        server_name="0.0.0.0",
-        server_port=port or None,
+        server_name="172.23.198.15",
+        server_port=PORT,
         share=False,
-        inbrowser=True,
-        theme=gr.themes.Soft(primary_hue="indigo"),
+        inbrowser=False,
     )

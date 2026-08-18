@@ -13,6 +13,13 @@ import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Windows console UTF-8 fix for Indic scripts
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 from pipeline.lang_config import ALL_22, LANG_NAMES
 from pipeline.translator import Translator
 from pipeline.asr import ASREngine

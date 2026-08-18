@@ -487,7 +487,8 @@ MODELS_DIR  = Path(__file__).parent.parent / "models"
 class Translator:
     # Langs routed via Hindi pivot through IndicTrans2 indic_indic
     # mni/sat: low-resource — pivot via Hindi, then SeamlessM4T as score-based fallback
-    _PIVOT_LANGS = {"mni", "sat"}
+    # mni removed from pivot — SeamlessM4T handles Manipuri natively and better
+    _PIVOT_LANGS = {"sat"}
 
     # Force NLLB as primary — IndicTrans2 outputs Hindi/garbage for these
     # After NLLB, try SeamlessM4T as a score-based second opinion
@@ -497,7 +498,8 @@ class Translator:
     _NLLB_ONLY = _NLLB_FIRST
 
     # Use Seamless FIRST before IndicTrans2 for these langs
-    _SEAMLESS_FIRST: set = set()
+    # Manipuri: route through Seamless directly instead of Hindi pivot
+    _SEAMLESS_FIRST: set = {"mni"}
 
     def __init__(self):
         self._indic_trans2: dict = {}
@@ -517,10 +519,8 @@ class Translator:
                 return self._indic_trans2[direction]
             from transformers import AutoModelForSeq2SeqLM
             from IndicTransToolkit import IndicProcessor
-            ft_path   = MODELS_DIR.parent / "checkpoints" / "indictrans" / direction / "best"
-            base_path = MODELS_DIR / "indic_tr" / direction
-            path = str(ft_path) if ft_path.exists() else str(base_path)
-            log.info(f"Loading IndicTrans2 ({direction}) from {'fine-tuned' if ft_path.exists() else 'base'} on {DEVICE}")
+            path = str(MODELS_DIR / "indic_tr" / direction)
+            log.info(f"Loading IndicTrans2 ({direction}) from base on {DEVICE}")
             # AutoTokenizer passes src_vocab_file as a kwarg which clashes with
             # IndicTransTokenizer's own src_vocab_fp positional param — load the
             # tokenizer class directly from the model's local module to avoid it.
@@ -549,6 +549,11 @@ class Translator:
             model.eval()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                # torch.compile gives ~20% speedup on repeated forward passes
+                try:
+                    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+                except Exception:
+                    pass  # compile unavailable (torch < 2.0 or Windows dynamo issue)
             processor = IndicProcessor(inference=True)
             self._indic_trans2[direction] = {
                 "tokenizer": tokenizer, "model": model, "processor": processor
@@ -674,20 +679,51 @@ class Translator:
         inputs = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
                   for k, v in inputs.items()}
         tgt_id = tokenizer.convert_tokens_to_ids(tgt_lang)
-        # Reduce repetition_penalty for short segments — Indic function words
-        # are legitimately repeated and get wrongly penalised at 1.2
+        # Tamil/Telugu/Malayalam are agglutinative — need more output tokens, no ngram penalty
+        # no_repeat_ngram_size blocks legitimate repeated suffixes in agglutinative scripts
+        tgt_short = _flores_to_short.get(tgt_lang, "eng")
+        _AGGLUTINATIVE = {"tam", "tel", "mal", "kan", "hin", "mar", "ben", "guj", "pan", "ory", "asm", "mai", "nep", "urd"}
+        max_new_tok  = 1024 if tgt_short in _AGGLUTINATIVE else 768
+        ngram_size   = 0    if tgt_short in _AGGLUTINATIVE else 3
         avg_len = sum(len(t) for t in texts) / max(len(texts), 1)
         rep_penalty = 1.1 if avg_len < 40 else 1.2
         with torch.no_grad():
             output = model.generate(
                 **inputs, forced_bos_token_id=tgt_id,
-                max_new_tokens=512, num_beams=5,
-                no_repeat_ngram_size=3, repetition_penalty=rep_penalty,
+                max_new_tokens=max_new_tok, num_beams=4,
+                no_repeat_ngram_size=ngram_size, repetition_penalty=rep_penalty,
                 length_penalty=1.0,
                 use_cache=True, early_stopping=True,
             )
         decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
         results = processor.postprocess_batch(decoded, lang=tgt_lang)
+        # Strip stray ") " prefix that IndicProcessor sometimes emits at segment start
+        results = [re.sub(r'^[)\]}>]+\s*', '', t) for t in results]
+        # Guard: IndicProcessor postprocess_batch can drop the first subword of a segment
+        # when padding causes BOS/EOS bleed in batch mode. Detect by re-running solo and
+        # comparing — if solo output is longer, use it.
+        for _bi, (_res, _orig_text) in enumerate(zip(results, texts)):
+            if _res and len(_res) < len(_orig_text) * 0.5:
+                try:
+                    _solo_batch = processor.preprocess_batch([_orig_text], src_lang=src_lang, tgt_lang=tgt_lang)
+                    _solo_inp   = tokenizer(_solo_batch, return_tensors="pt", padding=True,
+                                            truncation=True, max_length=512)
+                    _solo_inp   = {k: v.to(DEVICE) for k, v in _solo_inp.items()}
+                    _solo_inp   = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+                                   for k, v in _solo_inp.items()}
+                    with torch.no_grad():
+                        _solo_out = model.generate(
+                            **_solo_inp, forced_bos_token_id=tgt_id,
+                            max_new_tokens=max_new_tok, num_beams=4,
+                            no_repeat_ngram_size=ngram_size, repetition_penalty=rep_penalty,
+                            length_penalty=1.0, use_cache=True, early_stopping=True,
+                        )
+                    _solo_dec = tokenizer.batch_decode(_solo_out, skip_special_tokens=True)
+                    _solo_res = processor.postprocess_batch(_solo_dec, lang=tgt_lang)
+                    if _solo_res and len(_solo_res[0]) > len(_res):
+                        results[_bi] = _solo_res[0]
+                except Exception:
+                    pass  # keep original batch result
         # Restore + verify per result: non-translatable first, then factual, then format
         final = []
         for t, nt_map, fmap, fmt_map, orig in zip(results, nt_maps, factual_maps, fmt_maps, texts):
@@ -804,7 +840,6 @@ class Translator:
                 try:
                     seamless_out = self._translate_seamless(
                         work_text, SEAMLESS_CODES[src_lang], SEAMLESS_CODES[tgt_lang])
-                    from .quality import score_segment
                     s_nllb     = score_segment(work_text, translated,   src_lang, tgt_lang)["score"]
                     s_seamless = score_segment(work_text, seamless_out, src_lang, tgt_lang)["score"]
                     if s_seamless > s_nllb + 0.05:  # only switch if meaningfully better
@@ -844,7 +879,6 @@ class Translator:
         if translated and use_pivot and \
                 src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
             try:
-                from .quality import score_segment
                 s_pivot = score_segment(work_text, translated, src_lang, tgt_lang)["score"]
                 if s_pivot < 0.50:  # pivot quality is poor — try Seamless
                     seamless_out = self._translate_seamless(
@@ -904,22 +938,20 @@ class Translator:
 
     def translate_document_batch(self, texts: list[str], src_lang: str, tgt_lang: str) -> list[str]:
         """
-        Document-mode translation: raw engine call with NO protection layers.
-        No placeholder substitution, no mixed-lang stripping, no factual token
-        protection — all of which cause hallucination on document paragraphs.
+        Document-mode translation. Always uses base model.
         Returns list[str] (translated texts, 1-to-1 with input).
         """
-        needs_pivot  = (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS) \
-                       and src_lang != "hin" and tgt_lang != "hin"
-        force_nllb   = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
+        needs_pivot    = (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS) \
+                         and src_lang != "hin" and tgt_lang != "hin"
+        force_nllb     = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
         seamless_first = src_lang in self._SEAMLESS_FIRST or tgt_lang in self._SEAMLESS_FIRST
+        results        = []
 
-        results = []
-
+        # IndicTrans2 batch path
         if not needs_pivot and not force_nllb and not seamless_first \
                 and src_lang in INDIC_TRANS2_CODES and tgt_lang in INDIC_TRANS2_CODES:
             try:
-                src_code  = INDIC_TRANS2_CODES[src_lang]  # e.g. eng_Latn
+                src_code  = INDIC_TRANS2_CODES[src_lang]
                 tgt_code  = INDIC_TRANS2_CODES[tgt_lang]
                 direction = ("en_indic"    if src_code == "eng_Latn" else
                              "indic_en"    if tgt_code == "eng_Latn" else
@@ -927,35 +959,35 @@ class Translator:
                 engine    = self._load_indic_trans2(direction)
                 batch     = engine["processor"].preprocess_batch(texts, src_lang=src_code, tgt_lang=tgt_code)
                 inputs    = engine["tokenizer"](batch, return_tensors="pt", padding=True,
-                                      truncation=True, max_length=512)
+                                               truncation=True, max_length=512)
                 model_dtype = next(engine["model"].parameters()).dtype
                 inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
                 inputs = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
                           for k, v in inputs.items()}
                 tgt_id = engine["tokenizer"].convert_tokens_to_ids(tgt_code)
+                _tgt_short = {v: k for k, v in INDIC_TRANS2_CODES.items()}.get(tgt_code, "eng")
+                _AGGLUTINATIVE = {"tam", "tel", "mal", "kan", "hin", "mar", "ben", "guj", "pan", "ory", "asm", "mai", "nep", "urd"}
+                _max_tok  = 1024 if _tgt_short in _AGGLUTINATIVE else 768
+                _ngram    = 0    if _tgt_short in _AGGLUTINATIVE else 3
                 with torch.no_grad():
                     output = engine["model"].generate(
                         **inputs, forced_bos_token_id=tgt_id,
-                        max_new_tokens=512, num_beams=4,
-                        no_repeat_ngram_size=3, repetition_penalty=1.1,
+                        max_new_tokens=_max_tok, num_beams=4,
+                        no_repeat_ngram_size=_ngram, repetition_penalty=1.1,
                         length_penalty=1.0, use_cache=True, early_stopping=True,
                     )
                 decoded = engine["tokenizer"].batch_decode(output, skip_special_tokens=True)
                 results = engine["processor"].postprocess_batch(decoded, lang=tgt_code)
-                # Only strip <unk> tokens — nothing else
-                results = [_clean_unk(t) if t.strip() else src for t, src in zip(results, texts)]
-                return results
+                return [_clean_unk(t) if t.strip() else src for t, src in zip(results, texts)]
             except Exception as e:
                 log.warning(f"Doc batch IndicTrans2 failed ({src_lang}→{tgt_lang}): {e}")
 
-        # Fallback: per-paragraph via NLLB or pivot
+        # Fallback: per-paragraph via pivot / NLLB
         for text in texts:
             try:
                 if needs_pivot and not force_nllb \
                         and src_lang in INDIC_TRANS2_CODES and tgt_lang in INDIC_TRANS2_CODES:
                     t = self._pivot_via_hindi(text, src_lang, tgt_lang)
-                elif force_nllb and src_lang in NLLB_CODES and tgt_lang in NLLB_CODES:
-                    t = self._translate_nllb(text, NLLB_CODES[src_lang], NLLB_CODES[tgt_lang])
                 elif src_lang in NLLB_CODES and tgt_lang in NLLB_CODES:
                     t = self._translate_nllb(text, NLLB_CODES[src_lang], NLLB_CODES[tgt_lang])
                 else:

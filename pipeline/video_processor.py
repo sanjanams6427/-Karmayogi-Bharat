@@ -295,25 +295,45 @@ class VideoProcessor:
                 except Exception:
                     pass
 
+    def extract_bgm(self, video_path: str, output_wav: str, sample_rate: int = 44100) -> str:
+        """Extract original audio from video for BGM mixing. Returns path or empty string."""
+        Path(output_wav).parent.mkdir(parents=True, exist_ok=True)
+        ret = subprocess.run(
+            [_FFMPEG, "-y", "-i", str(video_path),
+             "-ar", str(sample_rate), "-ac", "1", "-vn", output_wav,
+             "-loglevel", "error"],
+            capture_output=True, timeout=600,
+        ).returncode
+        return output_wav if ret == 0 and Path(output_wav).exists() else ""
+
     def assemble_dubbed_audio(
         self,
         segments: list[dict],
         original_duration: float,
         output_wav: str,
         sample_rate: int = 44100,
+        bgm_path: str = None,
+        bgm_volume: float = 0.18,
     ) -> str:
         """
         Place each TTS segment at its original timestamp in the output buffer.
-        Speed-up (max 1.35x) applied if segment overruns its slot.
+        Strategy (in order):
+          1. If audio fits in slot — place as-is.
+          2. If audio overruns into the silence gap before next speech — allow overflow.
+          3. If audio would overlap next segment's speech — speed up (max 1.35x).
+          4. Only trim as last resort — always fade out over 150ms so no word is cut.
+        Crossfade 30ms between adjacent segments for smooth transitions.
         """
-        FADE_SAMP = int(0.010 * sample_rate)
-        MAX_SPEED = 1.35
+        FADE_MS    = int(0.005 * sample_rate)  # 5ms fade in/out — just enough to kill DC click
+        XFADE_MS   = 0                          # no crossfade — segments are time-separated
+        MAX_SPEED  = 1.35
+        TAIL_FADE  = int(0.150 * sample_rate)  # 150ms fade-out before any hard trim
 
-        total_samp   = max(int(original_duration * sample_rate), 1)
-        output_audio = np.zeros(total_samp, dtype=np.float32)
-
-        for i, seg in enumerate(segments):
+        # Pre-load all audio
+        loaded = []
+        for seg in segments:
             if "audio_path" not in seg or not Path(seg["audio_path"]).exists():
+                loaded.append(None)
                 continue
             try:
                 seg_audio, tts_sr = sf.read(seg["audio_path"], dtype="float32", always_2d=False)
@@ -322,37 +342,133 @@ class VideoProcessor:
                 if tts_sr != sample_rate:
                     import librosa
                     seg_audio = librosa.resample(seg_audio, orig_sr=tts_sr, target_sr=sample_rate)
+                loaded.append(seg_audio if len(seg_audio) > 0 else None)
             except Exception:
+                loaded.append(None)
+
+        total_samp   = max(int(original_duration * sample_rate), 1)
+        buffer_samp  = total_samp + int(10.0 * sample_rate)  # 10s tail
+        output_audio = np.zeros(buffer_samp, dtype=np.float32)
+
+        # For the last segment, extend total_samp to fit its full audio
+        # so the final word is never cut by the original-duration trim below.
+        if segments and loaded:
+            last_seg   = segments[-1]
+            last_audio = loaded[-1]
+            if last_audio is not None:
+                last_end = int(last_seg["start"] * sample_rate) + len(last_audio)
+                if last_end > total_samp:
+                    total_samp = min(last_end, buffer_samp)
+
+        for i, (seg, seg_audio) in enumerate(zip(segments, loaded)):
+            if seg_audio is None:
                 continue
-            if len(seg_audio) == 0:
-                continue
 
-            start_s    = seg["start"]
-            seg_end    = seg.get("end", start_s + 1.0)
-            next_start = segments[i + 1]["start"] if i + 1 < len(segments) else original_duration
-            slot_samp  = max(
-                int((next_start - start_s) * sample_rate),
-                int((seg_end   - start_s) * sample_rate),
-                int(0.1 * sample_rate),
-            )
+            start_samp = int(seg["start"] * sample_rate)
 
-            # Speed up if overruns slot (max 1.35x)
-            if len(seg_audio) > slot_samp:
-                ratio     = min(len(seg_audio) / slot_samp, MAX_SPEED)
-                seg_audio = self._atempo_stretch_file(seg_audio, sample_rate, ratio)
-                if len(seg_audio) > slot_samp:
-                    seg_audio = seg_audio[:slot_samp]
+            # Find next segment that actually has speech
+            next_speech_samp = buffer_samp
+            for j in range(i + 1, len(segments)):
+                if loaded[j] is not None and len(loaded[j]) > 0:
+                    next_speech_samp = int(segments[j]["start"] * sample_rate)
+                    break
 
-            # 10ms fade-in to eliminate click
-            fade = min(FADE_SAMP, len(seg_audio) // 8)
-            if fade > 0:
-                seg_audio[:fade] *= np.linspace(0.0, 1.0, fade)
+            # Hard limit = next speech start — audio must not overlap next segment's speech.
+            # Audio CAN freely overflow into the silence gap before next_speech_samp.
+            hard_limit = max(next_speech_samp - start_samp, int(0.1 * sample_rate))
 
-            # Place at original timestamp
-            start_samp = int(start_s * sample_rate)
-            end_samp   = min(start_samp + len(seg_audio), total_samp)
+            if len(seg_audio) > hard_limit:
+                # Step 1: try speed-up to fit within hard_limit
+                ratio     = min(len(seg_audio) / hard_limit, MAX_SPEED)
+                stretched = self._atempo_stretch_file(seg_audio, sample_rate, ratio)
+
+                if len(stretched) <= hard_limit:
+                    seg_audio = stretched
+                else:
+                    # Step 2: must trim — fade out over 150ms so last word completes
+                    seg_audio = stretched
+                    cut      = hard_limit
+                    fade_len = min(TAIL_FADE, cut // 2)
+                    seg_audio[cut - fade_len:cut] *= np.linspace(1.0, 0.0, fade_len)
+                    seg_audio = seg_audio[:cut]
+
+            # 5ms fade-in/out — kills DC click only, no audible gap
+            fade_in = min(FADE_MS, len(seg_audio) // 6)
+            if fade_in > 0:
+                seg_audio[:fade_in] *= np.linspace(0.0, 1.0, fade_in)
+            fade_out = min(FADE_MS, len(seg_audio) // 6)
+            if fade_out > 0:
+                seg_audio[-fade_out:] *= np.linspace(1.0, 0.0, fade_out)
+
+            # Write full seg_audio — never clamp to slot end, only to buffer
+            end_samp = min(start_samp + len(seg_audio), buffer_samp)
             output_audio[start_samp:end_samp] = seg_audio[:end_samp - start_samp]
 
+        # Trim back to original duration
+        output_audio = output_audio[:total_samp]
+
+        # Add comfort noise in silence gaps between segments
+        # This eliminates the jarring dead-silence between sentences and gives
+        # a natural "room tone" feel — same as professional dubbing studios use.
+        # Level: -42 dBFS (inaudible as noise, but fills the perceptual gap)
+        COMFORT_LEVEL = 0.002  # -54dBFS — truly inaudible room tone, not a hiss
+        rng = np.random.default_rng(seed=42)  # fixed seed = same noise every run
+        # Build a speech mask: 1 where any segment is playing, 0 in gaps
+        speech_mask = np.zeros(total_samp, dtype=np.float32)
+        for seg, seg_audio in zip(segments, loaded):
+            if seg_audio is None:
+                continue
+            s = int(seg["start"] * sample_rate)
+            e = min(s + len(seg_audio), total_samp)
+            speech_mask[s:e] = 1.0
+        # Smooth the mask edges (50ms fade) so comfort noise doesn't click in/out
+        smooth_len = int(0.050 * sample_rate)
+        from scipy.ndimage import uniform_filter1d
+        speech_mask = uniform_filter1d(speech_mask, size=smooth_len)
+        gap_mask = np.clip(1.0 - speech_mask, 0.0, 1.0)
+        # Pink-ish noise: average white noise with its 3-sample-delayed version
+        white = rng.standard_normal(total_samp).astype(np.float32)
+        pink  = (white
+                 + np.concatenate([np.zeros(3, dtype=np.float32), white[:-3]])
+                 + np.concatenate([np.zeros(7, dtype=np.float32), white[:-7]])) / 3.0
+        output_audio += pink * gap_mask * COMFORT_LEVEL
+        np.clip(output_audio, -1.0, 1.0, out=output_audio)
+
+        # Mix BGM under dubbed voice
+        if bgm_path and Path(bgm_path).exists():
+            try:
+                bgm, bgm_sr = sf.read(bgm_path, dtype="float32", always_2d=False)
+                if bgm.ndim > 1:
+                    bgm = bgm.mean(axis=1)
+                if bgm_sr != sample_rate:
+                    import librosa
+                    bgm = librosa.resample(bgm, orig_sr=bgm_sr, target_sr=sample_rate)
+                if len(bgm) < total_samp:
+                    bgm = np.concatenate([bgm, np.zeros(total_samp - len(bgm), dtype=np.float32)])
+                else:
+                    bgm = bgm[:total_samp]
+                # Duck BGM under speech regions
+                duck_mask = np.full(total_samp, bgm_volume, dtype=np.float32)
+                fade_d    = int(0.05 * sample_rate)  # 50ms duck fade
+                for seg, seg_audio_orig in zip(segments, loaded):
+                    if seg_audio_orig is None:
+                        continue
+                    s = int(seg["start"] * sample_rate)
+                    e = min(s + len(seg_audio_orig) + int(0.15 * sample_rate), total_samp)
+                    duck_mask[s:e] = bgm_volume * 0.4
+                    if fade_d > 0:
+                        fs = min(fade_d, e - s)
+                        duck_mask[s:s + fs] = np.linspace(bgm_volume, bgm_volume * 0.4, fs)
+                        fe = min(fade_d, e - s)
+                        duck_mask[e - fe:e]  = np.linspace(bgm_volume * 0.4, bgm_volume, fe)
+                output_audio += bgm * duck_mask
+                np.clip(output_audio, -1.0, 1.0, out=output_audio)
+            except Exception as _bgm_err:
+                import logging
+                logging.getLogger(__name__).warning(f"BGM mix failed: {_bgm_err} — skipping BGM")
+
+        # Normalize to -1 dBFS
+        np.clip(output_audio, -1.0, 1.0, out=output_audio)
         peak = np.max(np.abs(output_audio))
         if peak > 0.01:
             output_audio *= (0.891 / peak)

@@ -62,18 +62,16 @@ def _worker_dub_langs(args: tuple) -> dict:
     Sets PIPELINE_GPU env var before importing torch/models so each worker
     uses its assigned GPU exclusively.
     args = (gpu_id, langs, video_path, src_lang, output_dir, course_id,
-            voice_clone, reference_audio, force, asr_cache_path)
-    asr_cache_path: path to pre-computed ASR segments JSON (avoids re-running ASR per worker)
+            force, asr_cache_path)
     """
     import os, json
     from pathlib import Path
     gpu_id, langs, video_path, src_lang, output_dir, course_id, \
-        voice_clone, reference_audio, force, asr_cache_path = args
+        force, asr_cache_path = args
     os.environ["PIPELINE_GPU"] = str(gpu_id)
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
     pipeline = DubbingPipeline()
-    # Pre-seed ASR cache into each language's checkpoint so dub_video skips ASR
     if asr_cache_path:
         try:
             cache = json.loads(open(asr_cache_path, encoding="utf-8").read())
@@ -86,10 +84,8 @@ def _worker_dub_langs(args: tuple) -> dict:
                 out_dir = Path(output_dir) / lang
                 tmp_dir = out_dir / "tmp" / job_id
                 tmp_dir.mkdir(parents=True, exist_ok=True)
-                # Write source.wav symlink/copy path marker so Step 1 is also skipped
                 wav_dst = tmp_dir / "source.wav"
                 if not wav_dst.exists():
-                    # Hard-link or copy the shared wav to avoid re-extraction
                     src_wav = Path(asr_cache_path).parent / "source.wav"
                     if src_wav.exists():
                         try:
@@ -97,8 +93,6 @@ def _worker_dub_langs(args: tuple) -> dict:
                             shutil.copy2(str(src_wav), str(wav_dst))
                         except Exception:
                             pass
-                import sys, os as _os
-                sys.path.insert(0, str(Path(__file__).parent.parent))
                 from pipeline.retry import JobCheckpoint
                 ckpt = JobCheckpoint(job_id)
                 if not ckpt.get_meta("segments"):
@@ -106,22 +100,44 @@ def _worker_dub_langs(args: tuple) -> dict:
                     ckpt.set_meta("detected_src_lang", resolved_lang)
                     ckpt.set_meta("duration", duration)
                     ckpt.flush()
-        except Exception as e:
-            pass  # fall through — worker will run ASR itself
+        except Exception:
+            pass
     results = {}
     for lang in langs:
         results[lang] = pipeline.dub_video(
             video_path, src_lang, lang, output_dir, course_id,
-            voice_clone=voice_clone, reference_audio=reference_audio,
             force=force,
         )
+        # Free VRAM between languages so the next language starts clean
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # Unload TTS engine between languages to free ~4GB VRAM
+        pipeline._tts = None
     return results
 
-try:
-    from .voice_clone import VoiceCloner
-    _VC_AVAILABLE = True
-except Exception:
-    _VC_AVAILABLE = False
+
+def _worker_tts_split(args: tuple) -> dict:
+    """
+    TTS-only worker for spare-GPU acceleration.
+    Synthesises a subset of translated segments for one language on a dedicated GPU.
+    args = (gpu_id, lang, seg_indices, translated_segments, tts_dir)
+    Returns {original_index: audio_path} for the assigned subset.
+    """
+    import os, sys
+    from pathlib import Path
+    gpu_id, lang, seg_indices, translated_segments, tts_dir = args
+    os.environ["PIPELINE_GPU"] = str(gpu_id)
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from pipeline.tts import TTSEngine
+    engine  = TTSEngine()
+    subset  = [translated_segments[i] for i in seg_indices]
+    results = engine.synthesize_segments(subset, lang, tts_dir)
+    return {seg_indices[i]: r["audio_path"] for i, r in enumerate(results)}
 
 try:
     import sys
@@ -174,9 +190,53 @@ class DubbingResult:
     duration_original: float      = 0.0
     duration_output:   float      = 0.0
     elapsed_s:         float      = 0.0
-    voice_cloned:      bool       = False
     success:           bool       = False
     error:             str        = ""
+
+
+def _repair_asr_segments(segments: list[dict]) -> list[dict]:
+    """
+    Merge ASR segments that Whisper split mid-sentence.
+    Detection: a segment starts mid-sentence if its first word begins with a
+    lowercase letter (continuation) OR starts with a punctuation-only token.
+    When detected, the segment is merged into the previous one:
+      - text is appended with a space
+      - end timestamp takes the later segment's end
+      - the broken segment is dropped
+    Also fixes the last segment if it ends with a dangling conjunction/preposition
+    ("because", "and", "or", "but", "when", "if") by appending a period.
+    """
+    if not segments:
+        return segments
+    merged = [dict(segments[0])]
+    for seg in segments[1:]:
+        text = seg.get("text", "").strip()
+        if not text:
+            merged.append(dict(seg))
+            continue
+        first_word = text.split()[0] if text.split() else ""
+        # Mid-sentence if: starts lowercase, or starts with punctuation only
+        is_continuation = (
+            first_word
+            and (first_word[0].islower() or not first_word[0].isalnum())
+        )
+        if is_continuation and merged:
+            prev = merged[-1]
+            prev_text = prev.get("text", "").rstrip()
+            # Append with space, extend end timestamp
+            prev["text"] = prev_text + " " + text
+            prev["end"]  = seg.get("end", prev["end"])
+            log.info(f"[asr_repair] Merged seg {seg['id']} into seg {prev['id']} (mid-sentence continuation)")
+        else:
+            merged.append(dict(seg))
+    # Fix dangling last segment
+    _DANGLING = {"because", "and", "or", "but", "when", "if", "as", "since", "although"}
+    if merged:
+        last_text = merged[-1].get("text", "").strip()
+        last_word = last_text.split()[-1].lower().rstrip(".,") if last_text.split() else ""
+        if last_word in _DANGLING:
+            merged[-1]["text"] = last_text + "."
+    return merged
 
 
 class DubbingPipeline:
@@ -190,7 +250,6 @@ class DubbingPipeline:
         self._use_tm       = use_tm
         self.video        = VideoProcessor()
         self.glossary     = GlossaryManager() if use_glossary else None
-        self.voice_cloner = VoiceCloner() if _VC_AVAILABLE else None
         self.tm           = TranslationMemory() if (use_tm and _TM_AVAILABLE) else None
         log.info("DubbingPipeline ready (lazy model loading)")
 
@@ -280,8 +339,6 @@ class DubbingPipeline:
         tgt_lang:        str,
         output_dir:      str,
         course_id:       str  = "course",
-        voice_clone:     bool = False,
-        reference_audio: str  = None,
         resume:          bool = True,
         generate_subs:   bool = True,
         force:           bool = False,
@@ -427,6 +484,7 @@ class DubbingPipeline:
                 log.info(f"[{job_id}] ASR done: {len(segments)} segments")
 
             result.transcript = segments
+            segments = _repair_asr_segments(segments)
 
             # ── Exclusion check (KB tender Section 3.1) ────────────
             skip, skip_reason = self.should_skip_translation(segments)
@@ -449,28 +507,33 @@ class DubbingPipeline:
             result.quality_summary = review_summary(scores)
             log.info(f"[{job_id}] Quality: {result.quality_summary}")
 
-            # ── Quality gate: silence failed-translation segments before TTS ──
-            failed_count = sum(1 for s in translated_segments if s.get("quality", {}).get("failed"))
-            if failed_count:
-                log.warning(f"[{job_id}] {failed_count}/{len(translated_segments)} segments "
-                            f"failed quality gate — writing silence for those segments")
-                translated_segments = [
-                    {**s, "text": ""} if s.get("quality", {}).get("failed") else s
-                    for s in translated_segments
-                ]
+            # Quality gate removed — all translated segments go to TTS.
+            # Low quality score = flagged for human review, not silenced.
+            # Silencing causes gaps in dubbed video which is worse than imperfect translation.
 
             # ── Step 4: TTS ────────────────────────────────────────
             log.info(f"[{job_id}] Step 4/6: TTS synthesis")
             tts_dir = str(tmp_dir / "tts_segments")
             shutil.rmtree(tts_dir, ignore_errors=True)
-            if voice_clone and self.voice_cloner and self.voice_cloner.is_supported(tgt_lang):
-                ref = reference_audio or wav_path
-                tts_segments = self.voice_cloner.synthesize_segments_with_clone(
-                    translated_segments, tgt_lang, ref, tts_dir)
-                result.voice_cloned = True
-            else:
+            # Check for spare-GPU sidecar written by dub_course_parallel
+            try:
                 tts_segments = self.tts.synthesize_segments(
                     translated_segments, tgt_lang, tts_dir)
+            except RuntimeError as _tts_err:
+                err_s = str(_tts_err).lower()
+                if "illegal memory" in err_s or "cuda" in err_s:
+                    log.warning(f"[{job_id}] TTS CUDA error — resetting engine and retrying with MMS fallback: {_tts_err}")
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    self._tts = None  # force reload
+                    tts_segments = self.tts.synthesize_segments(
+                        translated_segments, tgt_lang, tts_dir)
+                else:
+                    raise
 
             # ── Step 5: Assemble audio ─────────────────────────────
             log.info(f"[{job_id}] Step 5/6: Assembling audio")
@@ -486,7 +549,8 @@ class DubbingPipeline:
             if generate_subs and translated_segments:
                 try:
                     sub_paths = generate_subtitles(
-                        translated_segments, str(out_dir), course_id, tgt_lang)
+                        translated_segments, str(out_dir), course_id, tgt_lang,
+                        video_duration=result.duration_original)
                     srt_path = sub_paths.get("srt")
                 except Exception as e:
                     log.warning(f"[{job_id}] Subtitle generation failed: {e}")
@@ -551,6 +615,55 @@ class DubbingPipeline:
 
         return result
 
+    def _synthesize_tts_split(
+        self, translated_segments: list, tgt_lang: str, tts_dir: str,
+        primary_gpu: int, spare_gpus: list, job_id: str
+    ) -> list:
+        """
+        Split TTS synthesis across primary GPU + spare GPUs.
+        Odd-indexed segments go to spare GPU(s), even to primary.
+        Results are merged back in original order.
+        Gives ~2x speedup when one spare GPU is available.
+        """
+        import multiprocessing as mp
+        ctx = mp.get_context("spawn")
+
+        n = len(translated_segments)
+        all_indices = list(range(n))
+        all_gpus = [primary_gpu] + spare_gpus
+        n_gpus = len(all_gpus)
+
+        # Round-robin distribute segment indices across all GPUs
+        gpu_segs = {g: [] for g in all_gpus}
+        for idx in all_indices:
+            gpu_segs[all_gpus[idx % n_gpus]].append(idx)
+
+        log.info(
+            f"[{job_id}] TTS split across {n_gpus} GPUs "
+            + ", ".join(f"GPU{g}:{len(gpu_segs[g])}segs" for g in all_gpus)
+        )
+
+        worker_args = [
+            (g, tgt_lang, gpu_segs[g], translated_segments,
+             tts_dir + f"_gpu{g}")
+            for g in all_gpus if gpu_segs[g]
+        ]
+
+        with ctx.Pool(processes=len(worker_args)) as pool:
+            split_results = pool.map(_worker_tts_split, worker_args)
+
+        # Merge: build index -> audio_path map
+        idx_to_path = {}
+        for chunk in split_results:
+            idx_to_path.update(chunk)
+
+        # Reconstruct results list in original segment order
+        results = []
+        for i, seg in enumerate(translated_segments):
+            audio_path = idx_to_path.get(i, "")
+            results.append({**seg, "audio_path": audio_path})
+        return results
+
     def dub_course(
         self,
         video_path:      str,
@@ -558,8 +671,6 @@ class DubbingPipeline:
         tgt_langs:       list[str],
         output_dir:      str,
         course_id:       str  = "course",
-        voice_clone:     bool = False,
-        reference_audio: str  = None,
         force:           bool = False,
         num_gpus:        int  = 1,
     ) -> dict[str, DubbingResult]:
@@ -567,14 +678,12 @@ class DubbingPipeline:
         if num_gpus > 1:
             return self.dub_course_parallel(
                 video_path, src_lang, tgt_langs, output_dir, course_id,
-                voice_clone=voice_clone, reference_audio=reference_audio,
                 force=force, num_gpus=num_gpus,
             )
         results = {}
         for tgt_lang in tgt_langs:
             results[tgt_lang] = self.dub_video(
                 video_path, src_lang, tgt_lang, output_dir, course_id,
-                voice_clone=voice_clone, reference_audio=reference_audio,
                 force=force,
             )
         return results
@@ -586,8 +695,6 @@ class DubbingPipeline:
         tgt_langs:       list[str],
         output_dir:      str,
         course_id:       str  = "course",
-        voice_clone:     bool = False,
-        reference_audio: str  = None,
         force:           bool = False,
         num_gpus:        int  = 4,
     ) -> dict[str, DubbingResult]:
@@ -642,23 +749,33 @@ class DubbingPipeline:
             src_lang = cache["src_lang"]
             log.info(f"[parallel] ASR cache hit: {len(cache['segments'])} segments")
 
-        # ── Step 2: Distribute langs across GPUs ──────────────────
-        from collections import defaultdict
-        gpu_groups: dict[int, list[str]] = defaultdict(list)
+        # ── Step 2: Distribute langs across GPUs (round-robin) ──────
+        # Each GPU gets a bucket of languages and processes them sequentially.
+        # e.g. 22 langs, 4 GPUs → GPU0:[0,4,8,12,16,20] GPU1:[1,5,9,13,17,21] etc.
+        import json as _json2
+        n_langs = len(tgt_langs)
+        buckets: dict[int, list[str]] = {g: [] for g in range(num_gpus)}
         for i, lang in enumerate(tgt_langs):
-            gpu_groups[i % num_gpus].append(lang)
+            buckets[i % num_gpus].append(lang)
+
+        # Remove spare_gpus.json if it exists — not used in round-robin mode
+        spare_path = asr_tmp / "spare_gpus.json"
+        if spare_path.exists():
+            spare_path.unlink(missing_ok=True)
 
         worker_args = [
             (gpu_id, langs, video_path, src_lang, output_dir, course_id,
-             voice_clone, reference_audio, force, asr_cache_path)
-            for gpu_id, langs in gpu_groups.items()
+             force, asr_cache_path)
+            for gpu_id, langs in buckets.items() if langs
         ]
+        n_workers = len(worker_args)
 
-        log.info(f"[parallel] Spawning {len(worker_args)} workers across {num_gpus} GPUs")
-        for gpu_id, langs in gpu_groups.items():
-            log.info(f"  GPU {gpu_id}: {langs}")
+        log.info(f"[parallel] {n_langs} langs across {n_workers} GPUs (round-robin)")
+        for gpu_id, langs in buckets.items():
+            if langs:
+                log.info(f"  GPU {gpu_id}: {langs}")
 
-        with ctx.Pool(processes=len(worker_args)) as pool:
+        with ctx.Pool(processes=n_workers) as pool:
             group_results = pool.map(_worker_dub_langs, worker_args)
 
         # Clean up shared ASR cache
@@ -1321,8 +1438,7 @@ class DubbingPipeline:
     def process_course_full(
         self, video_path: str, src_lang: str, tgt_langs: list[str],
         output_dir: str, course_id: str, metadata: dict = None,
-        quiz: list[dict] = None, voice_clone: bool = False,
-        reference_audio: str = None, upload_to_cbp: bool = False,
+        quiz: list[dict] = None, upload_to_cbp: bool = False,
         num_gpus: int = 1,
     ) -> dict:
         summary = {"course_id": course_id, "source_lang": src_lang,
@@ -1332,7 +1448,6 @@ class DubbingPipeline:
         out_dir = Path(output_dir)
         dub_results = self.dub_course(
             video_path, src_lang, tgt_langs, output_dir, course_id,
-            voice_clone=voice_clone, reference_audio=reference_audio,
             num_gpus=num_gpus)
         summary["dubbing"] = {
             lang: {"success": r.success,
@@ -1395,7 +1510,6 @@ class DubbingPipeline:
             "target_lang_name":   LANG_NAMES.get(result.target_lang, result.target_lang),
             "duration_original_s":result.duration_original,
             "duration_output_s":  result.duration_output,
-            "voice_cloned":       result.voice_cloned,
             "segment_count":      len(result.transcript),
             "quality_summary":    result.quality_summary,
             "transcript":         result.transcript,

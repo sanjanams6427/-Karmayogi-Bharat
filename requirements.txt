@@ -2,66 +2,63 @@
 # KB Translation System — Requirements
 # RFB IN-KBL-543730-NC-RFB | iGOT Karmayogi
 # ============================================================
-# Install PyTorch first (CUDA 12.1):
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# Then install everything else:
-#   pip install -r requirements.txt
+# 1. Install PyTorch first (CUDA 12.1):
+#    pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# 2. Then install everything else:
+#    pip install -r requirements.txt
 # ============================================================
 
 # ── UI ───────────────────────────────────────────────────────
 gradio>=4.0.0
 
 # ── Deep Learning ────────────────────────────────────────────
-# torch installed separately (see above)
-transformers>=4.40.0          # IndicTrans2, SeamlessM4T, NLLB-200, MMS-TTS, Parler-TTS
-accelerate>=0.26.0            # multi-GPU model loading
-safetensors>=0.4.0            # fast model weight loading (.safetensors)
-sentencepiece>=0.1.99         # IndicTrans2 + NLLB tokenizer
-sacremoses>=0.0.53            # Moses tokenizer (IndicTrans2 preprocessing)
+transformers>=4.40.0
+accelerate>=0.26.0
+safetensors>=0.4.0
+sentencepiece>=0.1.99
+sacremoses>=0.0.53
 
 # ── ASR ──────────────────────────────────────────────────────
-faster-whisper>=1.0.0         # faster-whisper large-v3 (all 22 langs, CT2 backend)
+faster-whisper>=1.0.0
 
 # ── Translation ──────────────────────────────────────────────
-IndicTransToolkit>=0.1.0      # IndicTrans2 pre/post-processing (IndicProcessor)
+IndicTransToolkit>=0.1.0
 
 # ── TTS ──────────────────────────────────────────────────────
-parler-tts>=0.2.2             # Parler-TTS Indic Large/Mini (primary TTS)
-# Coqui XTTS-v2 — install separately to avoid dependency conflicts:
+parler-tts>=0.2.2
+# Coqui XTTS-v2 (voice cloning — install separately to avoid conflicts):
 #   pip install coqui-tts --no-deps
-# coqui-tts>=0.24.0
 
 # ── Audio ────────────────────────────────────────────────────
-soundfile>=0.12.1             # WAV read/write (pipeline, TTS, video_processor)
-librosa>=0.10.0               # audio resampling, time-stretch, silence detection
-scipy>=1.11.0                 # butter filter, sosfilt (TTS post-processing)
-numpy>=1.24.0                 # audio buffers throughout pipeline
-resampy>=0.4.2                # librosa pitch_shift backend (TTS female voice shift)
+soundfile>=0.12.1
+librosa>=0.10.0
+scipy>=1.11.0
+numpy>=1.24.0
+resampy>=0.4.2
 
 # ── Video ────────────────────────────────────────────────────
-imageio-ffmpeg>=0.4.9         # bundled ffmpeg binary (no system ffmpeg required)
-# ffmpeg-python not used — pipeline calls ffmpeg subprocess directly via imageio_ffmpeg
+imageio-ffmpeg>=0.4.9
 
 # ── Language Detection ───────────────────────────────────────
-lingua-language-detector>=2.0.0  # per-segment language detection (lang_detect.py)
+lingua-language-detector>=2.0.0
 
 # ── Document Processing ──────────────────────────────────────
-python-docx>=1.1.0            # DOCX read/write — quiz, QA cert, metadata, review cert
-openpyxl>=3.1.0               # XLSX export — metadata, quiz, monthly report, glossary
-pdfplumber>=0.10.0            # PDF text extraction (doc_extractor.py)
+python-docx>=1.1.0
+openpyxl>=3.1.0
+pdfplumber>=0.10.0
 
-# ── CBP Portal Upload (KB tender §4.2) ───────────────────────
-requests>=2.31.0              # CBP portal HTTP upload (cbp_uploader.py)
+# ── CBP Portal Upload ────────────────────────────────────────
+requests>=2.31.0
 
 # ── HuggingFace Hub ──────────────────────────────────────────
-huggingface_hub>=0.20.0       # model download, snapshot_download
+huggingface_hub>=0.20.0
 
 # ── Utilities ────────────────────────────────────────────────
-python-dotenv>=1.0.0          # .env loading (HF_TOKEN, CBP credentials, LLM keys)
+python-dotenv>=1.0.0
 
-# ── Datasets (fine-tuning + download scripts only) ───────────
-datasets>=2.18.0              # download_datasets.py, finetune scripts
+# ── Datasets (download + finetune scripts only) ──────────────
+datasets>=2.18.0
 
-# ── Fine-tuning (optional — only needed for finetune/ scripts) ─
-# deepspeed>=0.14.0           # ZeRO-3 multi-GPU fine-tuning (ds_zero3.json)
-# bitsandbytes>=0.43.0        # 8-bit optimiser for fine-tuning on single GPU
+# ── Fine-tuning (optional — finetune/ scripts only) ──────────
+# deepspeed>=0.14.0       # ZeRO-3 multi-GPU (ds_zero3.json)
+# bitsandbytes>=0.43.0    # 8-bit optimiser for single-GPU fine-tuning
