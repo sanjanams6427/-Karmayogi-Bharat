@@ -744,14 +744,15 @@ class Translator:
             t = _verify_factual_tokens(orig, t, fmap)
             t = _restore_format_tokens(t, fmt_map)
             t = _naturalise(t)
-            # Wrong-language drift guard: detect Maithili/Bodo markers in Hindi output
-            # and retry via NLLB. Maithili uses छथि/अछि/कयल which never appear in Hindi.
-            if tgt_short == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f|\u091b\u0948\u0915', t):
+            # Wrong-language drift guard: detect Maithili markers in Hindi output.
+            # Only retry once — NLLB output is accepted as-is without re-checking.
+            # छथि/अछि/कयल/छत्हि are Maithili-exclusive; छैक removed (appears in Hindi too).
+            if tgt_short == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f', t):
                 log.warning(f"[hin] Maithili drift detected — retrying via NLLB")
                 try:
                     nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
                     if nllb_t.strip():
-                        t = _clean_unk(nllb_t)
+                        t = _clean_unk(nllb_t)  # use NLLB result directly, no drift re-check
                 except Exception as _nd:
                     log.warning(f"NLLB drift-retry failed: {_nd}")
             t, fqc_flags = _final_quality_check(orig, t, tgt_short, fmt_map, nt_map, fmap)
@@ -1060,12 +1061,14 @@ class Translator:
                     t = _clean_mixed_lang(t, tgt_lang)
                     t = _naturalise(t)
                     # Wrong-language drift guard for Hindi
-                    if tgt_lang == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f|\u091b\u0948\u0915', t):
+                    # छैक removed from pattern — it appears in normal Hindi too.
+                    # NLLB result accepted as-is without re-checking to avoid retry loop.
+                    if tgt_lang == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f', t):
                         log.warning(f"[hin] Maithili drift in batch idx={i} — retrying via NLLB")
                         try:
                             nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
                             if nllb_t.strip():
-                                t = _clean_unk(nllb_t)
+                                t = _clean_unk(nllb_t)  # use NLLB result directly, no re-check
                         except Exception as _nd:
                             log.warning(f"NLLB drift-retry failed: {_nd}")
                     # Rule 20: final quality gate — all 10 checks
