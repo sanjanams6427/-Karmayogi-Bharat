@@ -697,8 +697,18 @@ class Translator:
             )
         decoded = tokenizer.batch_decode(output, skip_special_tokens=True)
         results = processor.postprocess_batch(decoded, lang=tgt_lang)
-        # Strip stray ") " prefix that IndicProcessor sometimes emits at segment start
-        results = [re.sub(r'^[)\]}>]+\s*', '', t) for t in results]
+        # Strip stray prefix artifacts that IndicProcessor emits at segment start.
+        # Pattern: 1-4 Devanagari/script chars followed by optional Latin chars then space
+        # e.g. "छेकिन ", "छे ", "छेत्री ", "छेदक " — these are language-tag bleed-through.
+        # Also strip ") " and similar punctuation-only prefixes.
+        _PREFIX_RE = re.compile(
+            r'^(?:'
+            r'[\u0900-\u097F\u0980-\u09FF\u0A00-\u0AFF\u0B00-\u0CFF\u0D00-\u0D7F]{1,6}'
+            r'[A-Za-z\u0900-\u097F]{0,4}'
+            r'\s+'
+            r'|[)\]}>]+\s*)'
+        )
+        results = [_PREFIX_RE.sub('', t).strip() for t in results]
         # Guard: IndicProcessor postprocess_batch can drop the first subword of a segment
         # when padding causes BOS/EOS bleed in batch mode. Detect by re-running solo and
         # comparing — if solo output is longer, use it.
@@ -734,6 +744,16 @@ class Translator:
             t = _verify_factual_tokens(orig, t, fmap)
             t = _restore_format_tokens(t, fmt_map)
             t = _naturalise(t)
+            # Wrong-language drift guard: detect Maithili/Bodo markers in Hindi output
+            # and retry via NLLB. Maithili uses छथि/अछि/कयल which never appear in Hindi.
+            if tgt_short == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f|\u091b\u0948\u0915', t):
+                log.warning(f"[hin] Maithili drift detected — retrying via NLLB")
+                try:
+                    nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                    if nllb_t.strip():
+                        t = _clean_unk(nllb_t)
+                except Exception as _nd:
+                    log.warning(f"NLLB drift-retry failed: {_nd}")
             t, fqc_flags = _final_quality_check(orig, t, tgt_short, fmt_map, nt_map, fmap)
             if fqc_flags:
                 log.warning(f"FQC [{tgt_short}] seg flags={fqc_flags}")
@@ -1039,6 +1059,15 @@ class Translator:
                     t = _clean_unk(trans)
                     t = _clean_mixed_lang(t, tgt_lang)
                     t = _naturalise(t)
+                    # Wrong-language drift guard for Hindi
+                    if tgt_lang == "hin" and re.search(r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932|\u091b\u0925\u094d\u0939\u093f|\u091b\u0948\u0915', t):
+                        log.warning(f"[hin] Maithili drift in batch idx={i} — retrying via NLLB")
+                        try:
+                            nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                            if nllb_t.strip():
+                                t = _clean_unk(nllb_t)
+                        except Exception as _nd:
+                            log.warning(f"NLLB drift-retry failed: {_nd}")
                     # Rule 20: final quality gate — all 10 checks
                     t, fqc_flags = _final_quality_check(orig, t, tgt_lang, {}, {}, {})
                     if fqc_flags:

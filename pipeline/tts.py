@@ -205,12 +205,13 @@ def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False, female_
         # are the main source of the "noise between words" in Telugu/Tamil.
         sos_lp = butter(3, 7500.0 / (sr / 2), btype="low", output="sos")
         audio  = sosfilt(sos_lp, audio).astype(np.float32)
-        # Trim trailing near-silence — use 0.015 threshold (was 0.005).
-        # 0.005 kept aliasing noise tail; 0.015 cuts it cleanly without
-        # clipping the last consonant of Telugu words.
-        nz = np.where(np.abs(audio) > 0.015)[0]
+        # Trim trailing near-silence — threshold 0.003 (was 0.015).
+        # 0.015 cut into the final consonant of Telugu/Tamil retroflex stops
+        # whose amplitude decays to ~0.005 before burst release completes.
+        # 0.003 keeps the full decay; low-pass already removed aliasing noise.
+        nz = np.where(np.abs(audio) > 0.003)[0]
         if len(nz) > 0:
-            keep = min(nz[-1] + int(0.035 * sr), len(audio))  # 35ms decay tail
+            keep = min(nz[-1] + int(0.050 * sr), len(audio))  # 50ms decay tail
             audio = audio[:keep]
     if female_shift:
         try:
@@ -290,14 +291,18 @@ class TTSEngine:
             # noise_scale=0.3 — small variance gives natural prosody without
             # voice drift between chunks. 0.0 causes robotic flat intonation
             # in Telugu/Tamil; 0.667 (default) causes timbre shift per chunk.
-            model.config.noise_scale          = 0.3
-            model.config.noise_scale_duration  = 0.1
+            # noise_scale=0.0 — fully deterministic: VITS flow draws noise shaped
+            # [1, hidden, phoneme_len]; different phoneme lengths produce different
+            # noise tensors even with pinned RNG, causing voice drift per chunk.
+            # 0.0 bypasses the noise draw entirely — identical voice every chunk/segment.
+            model.config.noise_scale          = 0.0
+            model.config.noise_scale_duration  = 0.0
             for _attr in ("inference_noise_scale", "inference_noise_scale_dp"):
                 if hasattr(model.config, _attr):
-                    setattr(model.config, _attr, 0.3)
+                    setattr(model.config, _attr, 0.0)
             self._standalone_vits[lang] = {"model": model, "tokenizer": tokenizer,
                                            "seed": 42}
-            log.info(f"Standalone VITS [{lang}] loaded (noise_scale=0.3)")
+            log.info(f"Standalone VITS [{lang}] loaded (noise_scale=0.0 deterministic)")
             # Warm up once with a short text to advance past any init RNG state,
             # then capture the RNG state — this becomes the pinned state for all inference.
             # Use a real word in the target script — VITS phonemiser produces 0 tokens
@@ -336,10 +341,10 @@ class TTSEngine:
             return False
 
     # VITS token limit — beyond this the model loops/glitches/cuts off.
-    # Tamil/Telugu akshara clusters tokenize to ~3-4 tokens each — 200 tokens
-    # fits ~50-65 akshars which is a comfortable sentence length.
-    # 300 was too high: chunk boundary fell mid-word causing cut-off last syllable.
-    _VITS_MAX_TOKENS = 200
+    # Tamil/Telugu akshara clusters tokenize to ~3-4 tokens each — 250 tokens
+    # fits ~60-80 akshars. 200 was too low: chunk boundary fell mid-word
+    # causing the last syllable of the first chunk to be cut off.
+    _VITS_MAX_TOKENS = 250
 
     def _vits_chunks(self, text: str, tokenizer) -> list[str]:
         """Split text into chunks that fit within VITS token limit.
@@ -417,18 +422,15 @@ class TTSEngine:
                     log.warning(f"Standalone VITS [{lang}] waveform=None for chunk {ci} — skipping")
                     continue
                 w = out.waveform[0].detach().cpu().float().numpy().squeeze()
-                # Use 0.01 threshold (was 1e-5) — keeps Telugu consonant decay
-                # that 1e-5 was trimming, causing cut-off last syllable.
-                nz = np.where(np.abs(w) > 0.01)[0]
-                if len(nz) == 0:
+                # No per-chunk nz trim — _post_process handles trailing silence.
+                # Trimming here cuts the last consonant of retroflex stops whose
+                # amplitude decays below any threshold before burst release completes.
+                if len(w) == 0:
                     continue
-                # Keep 30ms after last active sample — preserves final consonant release
-                w = w[:min(nz[-1] + int(0.03 * native), len(w))]
-                # 2ms crossfade only — eliminates click without audible gap
-                fade = min(int(0.002 * native), len(w) // 8)
-                if fade > 0:
-                    w[:fade]  *= np.linspace(0.0, 1.0, fade)
-                    w[-fade:] *= np.linspace(1.0, 0.0, fade)
+                # 2ms fade-in only — kills DC click at chunk start, no fade-out
+                fade_in = min(int(0.002 * native), len(w) // 8)
+                if fade_in > 0:
+                    w[:fade_in] *= np.linspace(0.0, 1.0, fade_in)
                 wavs.append(w)
             if not wavs:
                 return False
@@ -701,7 +703,10 @@ class TTSEngine:
         min 200, max 1500 (~17s) — no single TTS segment should exceed 17s.
         """
         graphemes = self._count_graphemes(text)
-        return min(max(int(graphemes * 43 * 1.2), 200), 1500)
+        # 1.4x headroom (was 1.2) — ensures the last word/syllable is never
+        # truncated when the model generates slightly more tokens than estimated.
+        # Cap raised to 2000 (~23s) to accommodate longer Tamil/Telugu sentences.
+        return min(max(int(graphemes * 43 * 1.4), 250), 2000)
 
     # Per-segment generation timeout in seconds — prevents infinite hang
     _PARLER_TIMEOUT_S = 120
@@ -1080,9 +1085,33 @@ class TTSEngine:
         for i, (text, path) in enumerate(zip(texts, paths)):
             try:
                 inputs = self._mms_processor(text, return_tensors="pt")
-                # Reject if over token limit — prevents VITS repetition loop
+                # If over token limit, split and concatenate rather than skip
                 if inputs["input_ids"].shape[-1] > self._MMS_MAX_TOKENS:
-                    log.warning(f"MMS [{lang}] text too long ({inputs['input_ids'].shape[-1]} tokens), skipping")
+                    chunks = self._vits_chunks(text, self._mms_processor)
+                    wavs = []
+                    for chunk in chunks:
+                        c_inputs = self._mms_processor(chunk, return_tensors="pt")
+                        c_inputs = {k: v.to(dtype=torch.float32) if v.is_floating_point() else v
+                                    for k, v in c_inputs.items()}
+                        c_inputs = {k: v.to(DEVICE) for k, v in c_inputs.items()}
+                        with torch.no_grad():
+                            c_out = self._mms_model(**c_inputs)
+                        if c_out.waveform is not None:
+                            w = c_out.waveform[0].detach().cpu().float().numpy().squeeze()
+                            nz = np.where(np.abs(w) > 1e-5)[0]
+                            if len(nz) > 0:
+                                wavs.append(w[:nz[-1] + 1])
+                    if not wavs:
+                        continue
+                    native = self._mms_model.config.sampling_rate
+                    combined = np.concatenate(wavs)
+                    if native != SR:
+                        import librosa
+                        combined = librosa.resample(combined, orig_sr=native, target_sr=SR)
+                    combined = _post_process(combined, SR, is_mms=True)
+                    Path(path).parent.mkdir(parents=True, exist_ok=True)
+                    sf.write(path, combined, SR)
+                    results[i] = True
                     continue
                 inputs = {k: v.to(dtype=torch.float32) if v.is_floating_point() else v
                           for k, v in inputs.items()}

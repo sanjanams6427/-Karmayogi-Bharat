@@ -373,9 +373,17 @@ class VideoProcessor:
                     next_speech_samp = int(segments[j]["start"] * sample_rate)
                     break
 
-            # Hard limit = next speech start — audio must not overlap next segment's speech.
+            # Hard limit = next speech start minus 200ms breathing room.
             # Audio CAN freely overflow into the silence gap before next_speech_samp.
-            hard_limit = max(next_speech_samp - start_samp, int(0.1 * sample_rate))
+            # The 200ms buffer ensures the last word of this segment fully completes
+            # before the next segment begins (was 0ms — caused last-word cut-off).
+            # For the last segment (next_speech_samp == buffer_samp) there is no limit.
+            is_last_seg = (next_speech_samp == buffer_samp)
+            if is_last_seg:
+                hard_limit = buffer_samp - start_samp  # no trim for last segment
+            else:
+                gap = next_speech_samp - start_samp
+                hard_limit = max(gap + int(0.200 * sample_rate), int(0.1 * sample_rate))
 
             if len(seg_audio) > hard_limit:
                 # Step 1: try speed-up to fit within hard_limit
