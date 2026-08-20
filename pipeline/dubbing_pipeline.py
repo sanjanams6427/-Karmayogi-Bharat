@@ -35,8 +35,13 @@ log = get_logger("dubbing_pipeline", "pipeline.log")
 audit_log = get_logger("audit", "audit.log")
 
 
+_MODEL_VERSIONS_CACHE: dict | None = None
+
 def _model_versions() -> dict:
-    """Collect installed package versions for audit trail."""
+    """Collect installed package versions for audit trail. Cached after first call."""
+    global _MODEL_VERSIONS_CACHE
+    if _MODEL_VERSIONS_CACHE is not None:
+        return _MODEL_VERSIONS_CACHE
     pkgs = ["faster-whisper", "transformers", "parler-tts", "torch", "soundfile"]
     out = {}
     for p in pkgs:
@@ -53,6 +58,7 @@ def _model_versions() -> dict:
         out["git_commit"] = r.stdout.strip() if r.returncode == 0 else "unknown"
     except Exception:
         out["git_commit"] = "unknown"
+    _MODEL_VERSIONS_CACHE = out
     return out
 
 
@@ -149,7 +155,7 @@ except ImportError:
 
 # Max input file size: 2GB
 MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024
-ALLOWED_EXTS   = {".mp4", ".mp3", ".wav", ".flac", ".ogg", ".mkv", ".avi", ".mov"}
+ALLOWED_EXTS   = {".mp4", ".mp3", ".wav", ".flac", ".ogg", ".mkv", ".avi", ".mov", ".webm"}
 
 # Per-(course_id, tgt_lang) locks to prevent concurrent jobs overwriting each other
 _JOB_LOCKS: dict[str, threading.Lock] = {}
@@ -194,17 +200,69 @@ class DubbingResult:
     error:             str        = ""
 
 
+# Indic virama/combining marks — a segment starting with these is a mid-word continuation
+_VIRAMA_CHARS = frozenset([
+    '\u094D',  # Devanagari virama
+    '\u09CD',  # Bengali virama
+    '\u0ACD',  # Gujarati virama
+    '\u0B4D',  # Odia virama
+    '\u0BCD',  # Tamil virama
+    '\u0C4D',  # Telugu virama
+    '\u0CCD',  # Kannada virama
+    '\u0D4D',  # Malayalam virama
+    '\u0A4D',  # Gurmukhi virama
+])
+
+# Previous segment ends mid-sentence if it ends with these English words
+_DANGLING_PREV = {
+    "the", "a", "an", "of", "in", "on", "at", "to", "for", "with", "by",
+    "and", "or", "but", "as", "if", "when", "before", "after", "from",
+    "this", "that", "these", "those", "its", "their", "our", "your",
+}
+
+
+# Devanagari script range for script-change detection
+_DEVA_RE = re.compile(r'[\u0900-\u097F]')
+# Bodo-exclusive morphemes (brx_Deva) — absent in Hindi/Maithili
+_BODO_MORPHEME_RE = re.compile(
+    r'\u0932\u093e\u0902\u0913|\u0916\u093e\u0932\u093e\u092e\u094b'
+    r'|\u0917\u0941\u0926\u0941\u0902|\u092c\u093f\u0925\u093f\u0902'
+    r'|\u0938\u094b\u0930\u092c\u093f|\u0917\u0947\u091c\u0947\u0930'
+    r'|\u0932\u093e\u0935-\u0932\u093e\u0935|\u0916\u092b'
+)
+# Maithili-exclusive morphemes — absent in Hindi/Bodo
+_MAITHILI_MORPHEME_RE = re.compile(
+    r'\u091b\u0925\u093f|\u0905\u091b\u093f|\u0915\u092f\u0932'
+    r'|\u091b\u0925\u094d\u0939\u093f|\u091b\u0928\u093f|\u0905\u091b\u0928\u093f'
+)
+# Hindi-exclusive verb markers — absent in Maithili/Bodo
+_HINDI_MARKER_RE = re.compile(
+    r'\u0939\u0948(?:\u0902)?\b|\u0939\u094b\u0924\u093e\b'
+    r'|\u0915\u0930\u0924\u093e\b|\u0915\u0930\u0924\u0947\b'
+    r'|\u0939\u094b\u0924\u0940\b|\u0939\u094b\u0924\u0947\b'
+)
+
+
+def _detect_deva_sublang(text: str) -> str:
+    """Classify a Devanagari segment as 'bod', 'mai', 'hin', or 'deva' (unknown)."""
+    if _BODO_MORPHEME_RE.search(text):
+        return "bod"
+    if _MAITHILI_MORPHEME_RE.search(text):
+        return "mai"
+    if _HINDI_MARKER_RE.search(text):
+        return "hin"
+    return "deva"  # generic Devanagari — cannot distinguish
+
+
 def _repair_asr_segments(segments: list[dict]) -> list[dict]:
     """
     Merge ASR segments that Whisper split mid-sentence.
-    Detection: a segment starts mid-sentence if its first word begins with a
-    lowercase letter (continuation) OR starts with a punctuation-only token.
-    When detected, the segment is merged into the previous one:
-      - text is appended with a space
-      - end timestamp takes the later segment's end
-      - the broken segment is dropped
-    Also fixes the last segment if it ends with a dangling conjunction/preposition
-    ("because", "and", "or", "but", "when", "if") by appending a period.
+    Detects continuations via:
+      1. Latin: first word starts lowercase OR is punctuation-only
+      2. Indic: first char is a virama/combining mark (mid-akshar split)
+      3. Previous segment ends with a dangling preposition/article/conjunction
+      4. Previous segment has no sentence-ending punctuation AND the gap to
+         the next segment is < 400ms (Whisper split mid-breath, not mid-sentence)
     """
     if not segments:
         return segments
@@ -214,27 +272,65 @@ def _repair_asr_segments(segments: list[dict]) -> list[dict]:
         if not text:
             merged.append(dict(seg))
             continue
+        first_char = text[0]
         first_word = text.split()[0] if text.split() else ""
-        # Mid-sentence if: starts lowercase, or starts with punctuation only
-        is_continuation = (
-            first_word
-            and (first_word[0].islower() or not first_word[0].isalnum())
+
+        prev      = merged[-1]
+        prev_text = prev.get("text", "").rstrip()
+        prev_last_word = prev_text.split()[-1].lower().rstrip(".,;:") if prev_text.split() else ""
+
+        # Gap between end of previous segment and start of this one
+        gap_s = seg.get("start", 0) - prev.get("end", 0)
+
+        # Sentence-ending punctuation in previous segment
+        prev_ends_sentence = bool(prev_text) and prev_text[-1] in '.!?\u0964\u0965'
+
+        # Never merge across Devanagari sub-language boundaries.
+        # Bodo/Maithili/Hindi share the same script — if morpheme patterns
+        # identify different sub-languages, treat as a hard sentence boundary.
+        prev_deva = _detect_deva_sublang(prev_text) if _DEVA_RE.search(prev_text) else None
+        curr_deva = _detect_deva_sublang(text)      if _DEVA_RE.search(text)      else None
+        cross_lang = (
+            prev_deva is not None and curr_deva is not None
+            and prev_deva != "deva" and curr_deva != "deva"
+            and prev_deva != curr_deva
         )
-        if is_continuation and merged:
-            prev = merged[-1]
-            prev_text = prev.get("text", "").rstrip()
-            # Append with space, extend end timestamp
+        if cross_lang:
+            merged.append(dict(seg))
+            continue
+        is_continuation = (
+            # 1. Latin: starts lowercase or punctuation-only token
+            (first_word and (first_word[0].islower() or not first_word[0].isalnum()))
+            # 2. Indic: starts with virama = mid-akshar continuation
+            or first_char in _VIRAMA_CHARS
+            # 3. Previous segment ended with a dangling preposition/article/conjunction
+            or (
+                prev_last_word in _DANGLING_PREV
+                and not prev_ends_sentence
+            )
+            # 4. Short gap + no sentence-ending punctuation = Whisper mid-breath split
+            # 200ms threshold for English source — English natural sentence pauses
+            # are typically 300-500ms, so 200ms safely catches only mid-sentence splits.
+            # 400ms was merging adjacent sentences in English educational content.
+            or (
+                not prev_ends_sentence
+                and 0 < gap_s < 0.20
+                and prev_text  # don't merge into empty
+            )
+        )
+        if is_continuation:
             prev["text"] = prev_text + " " + text
             prev["end"]  = seg.get("end", prev["end"])
-            log.info(f"[asr_repair] Merged seg {seg['id']} into seg {prev['id']} (mid-sentence continuation)")
+            log.info(f"[asr_repair] Merged seg {seg['id']} into seg {prev['id']} "
+                     f"(gap={gap_s:.2f}s, ends_sentence={prev_ends_sentence})")
         else:
             merged.append(dict(seg))
     # Fix dangling last segment
-    _DANGLING = {"because", "and", "or", "but", "when", "if", "as", "since", "although"}
+    _DANGLING_END = {"because", "and", "or", "but", "when", "if", "as", "since", "although"}
     if merged:
         last_text = merged[-1].get("text", "").strip()
         last_word = last_text.split()[-1].lower().rstrip(".,") if last_text.split() else ""
-        if last_word in _DANGLING:
+        if last_word in _DANGLING_END:
             merged[-1]["text"] = last_text + "."
     return merged
 
@@ -351,6 +447,7 @@ class DubbingPipeline:
         tgt_name   = LANG_NAMES.get(tgt_lang, tgt_lang)
         input_path = Path(video_path)
         is_audio   = input_path.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg")
+        is_webm    = input_path.suffix.lower() == ".webm"
         job_id     = self._job_id(video_path, src_lang, tgt_lang)
 
         log.info(f"START job={job_id} file={input_path.name} {src_name}->{tgt_name}")
@@ -430,8 +527,10 @@ class DubbingPipeline:
             from .lang_config import SEAMLESS_S2ST_LANGS
             s2st_wav = str(tmp_dir / "s2st_dubbed.wav")
             # Delete stale s2st file so it never blocks the full pipeline
-            if Path(s2st_wav).exists():
+            try:
                 Path(s2st_wav).unlink(missing_ok=True)
+            except Exception:
+                pass
             _s2st_ok = (src_lang != "auto"
                         and src_lang != "eng"
                         and src_lang in SEAMLESS_S2ST_LANGS
@@ -450,7 +549,8 @@ class DubbingPipeline:
                         result.output_audio_path = out_audio
                     else:
                         out_video = str(out_dir / f"{course_id}_{tgt_lang}.mp4")
-                        self.video.replace_audio_in_video(video_path, s2st_wav, out_video)
+                        self.video.replace_audio_in_video(video_path, s2st_wav, out_video,
+                                                          is_webm=is_webm)
                         result.output_video_path = out_video
                         result.duration_output   = self.video.get_video_duration(out_video)
                     self._save_metadata(result, out_dir, course_id)
@@ -484,6 +584,13 @@ class DubbingPipeline:
                 log.info(f"[{job_id}] ASR done: {len(segments)} segments")
 
             result.transcript = segments
+            # Re-apply hallucination stripping to checkpoint-restored segments.
+            # _strip_hallucinations runs during live ASR but not on checkpoint restore,
+            # so stale checkpoints may contain ँ/ं prefix artifacts.
+            from .asr import _strip_hallucinations
+            for seg in segments:
+                seg["text"] = _strip_hallucinations(seg["text"])
+            segments = [s for s in segments if s["text"].strip()]
             segments = _repair_asr_segments(segments)
 
             # ── Exclusion check (KB tender Section 3.1) ────────────
@@ -563,7 +670,7 @@ class DubbingPipeline:
                 out_video = str(out_dir / f"{course_id}_{tgt_lang}.mp4")
                 self.video.replace_audio_in_video(
                     video_path, dubbed_wav, out_video,
-                    srt_path=srt_path, lang=tgt_lang)
+                    srt_path=srt_path, lang=tgt_lang, is_webm=is_webm)
                 result.output_video_path = out_video
                 result.duration_output   = self.video.get_video_duration(out_video)
 
@@ -712,6 +819,7 @@ class DubbingPipeline:
         self._validate_input(video_path)
         input_path = Path(video_path)
         is_audio   = input_path.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg")
+        is_webm    = input_path.suffix.lower() == ".webm"
 
         # Shared tmp dir for ASR cache
         asr_tmp = Path(output_dir) / "_asr_shared"
@@ -760,8 +868,10 @@ class DubbingPipeline:
 
         # Remove spare_gpus.json if it exists — not used in round-robin mode
         spare_path = asr_tmp / "spare_gpus.json"
-        if spare_path.exists():
+        try:
             spare_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
         worker_args = [
             (gpu_id, langs, video_path, src_lang, output_dir, course_id,
@@ -847,9 +957,13 @@ class DubbingPipeline:
         texts_to_translate = [pending_texts[i] for i in text_local]
         detected_langs     = [pending_segs[i].get("detected_lang") for i in text_local]
         try:
+            # detected_langs is only meaningful for Indic source languages.
+            # For English source, Lingua misdetects English ASR as Hindi/Bodo/Maithili
+            # — passing those as detected_langs corrupts the translation routing.
+            effective_detected = detected_langs if src_lang != "eng" else None
             batch_results = self.translator.translate_batch(
                 texts_to_translate, src_lang, tgt_lang,
-                glossary=self.glossary, detected_langs=detected_langs)
+                glossary=self.glossary, detected_langs=effective_detected)
         except Exception as e:
             log.error(f"[{job_id}] Batch translation failed, falling back per-segment: {e}")
             batch_results = []
@@ -888,8 +1002,6 @@ class DubbingPipeline:
             seg  = pending_segs[local_i]
             r    = batch_results[batch_i]
             # Completeness guard: never emit an empty translation for a non-empty source.
-            # Do NOT fall back to English source text — that sends English to a non-English TTS voice.
-            # Instead retry with per-segment translate() which has Seamless → NLLB fallback chain.
             translated_text = r["text"]
             if not translated_text.strip() and pending_texts[local_i].strip():
                 log.warning(
@@ -900,19 +1012,24 @@ class DubbingPipeline:
                         pending_texts[local_i], src_lang, tgt_lang,
                         glossary=self.glossary,
                         detected_lang=pending_segs[local_i].get("detected_lang"))
-                    translated_text = retry_r["text"] or pending_texts[local_i]
-                    r = {**r, "text": translated_text,
-                         "engine": retry_r.get("engine", "retry_fallback"),
-                         "score": {**r.get("score", {}),
-                                   "flags": r.get("score", {}).get("flags", []) + ["completeness_retry"],
-                                   "needs_review": True}}
+                    if retry_r["text"].strip():
+                        translated_text = retry_r["text"]
+                        r = {**r, "text": translated_text,
+                             "engine": retry_r.get("engine", "retry_fallback"),
+                             "score": {**r.get("score", {}),
+                                       "flags": r.get("score", {}).get("flags", []) + ["completeness_retry"],
+                                       "needs_review": True}}
                 except Exception as retry_e:
-                    log.error(f"[{job_id}] Retry also failed for seg {seg['id']}: {retry_e}")
-                    # Last resort: write silence for this segment rather than wrong-language audio
-                    translated_text = ""
-                    r = {**r, "text": "", "score": {**r.get("score", {}),
-                                                    "flags": r.get("score", {}).get("flags", []) + ["translation_failed"],
-                                                    "needs_review": True, "failed": True}}
+                    log.error(f"[{job_id}] Retry failed for seg {seg['id']}: {retry_e}")
+                # If still empty after retries, use source text as absolute last resort
+                # (better to speak English than silence for a Hindi dub)
+                if not translated_text.strip():
+                    log.error(f"[{job_id}] All retries failed for seg {seg['id']} — using source text")
+                    translated_text = pending_texts[local_i]
+                    r = {**r, "text": translated_text,
+                         "score": {**r.get("score", {}),
+                                   "flags": r.get("score", {}).get("flags", []) + ["translation_failed_source_fallback"],
+                                   "needs_review": True, "failed": True}}
             done = {**seg, "text": translated_text, "engine": r["engine"],
                     "enhanced": False, "quality": r["score"]}
             results[pending_idxs[local_i]] = done

@@ -153,7 +153,10 @@ def score_segment(source: str, translation: str,
         total_alpha = len(re.findall(r"[a-zA-Z\u0080-\uFFFF]", translation))
         if total_alpha > 0:
             indic_ratio = indic_chars / total_alpha
-            if indic_ratio < 0.5:
+            # Threshold raised from 0.5 to 0.35 — Hindi/Indic translations of
+            # technical content (iGOT, portal, module names) legitimately contain
+            # Latin brand names. 0.5 was flagging valid Hindi output as leaked source.
+            if indic_ratio < 0.35:
                 flags.append("source_language_leakage")
                 score -= 0.30
 
@@ -256,10 +259,10 @@ def review_summary(scores: list[dict]) -> dict:
     total        = len(scores)
     if not total:
         return {"total": 0, "avg_score": 0, "avg_chrf": 0,
-                "needs_review": 0, "failed": 0, "pass_rate": 0}
-    needs_review = sum(1 for s in scores if s["needs_review"])
-    failed       = sum(1 for s in scores if s["failed"])
-    avg_score    = round(sum(s["score"] for s in scores) / total, 3)
+                "avg_back_translation": None, "needs_review": 0, "failed": 0, "pass_rate": 0}
+    needs_review = sum(1 for s in scores if s.get("needs_review", False))
+    failed       = sum(1 for s in scores if s.get("failed", False))
+    avg_score    = round(sum(s.get("score", 0) for s in scores) / total, 3)
     avg_chrf     = round(sum(s.get("chrf", 0) for s in scores) / total, 3)
     bt_scores    = [s["back_translation_overlap"] for s in scores
                     if s.get("back_translation_overlap", -1) >= 0]

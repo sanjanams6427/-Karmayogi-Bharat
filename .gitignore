@@ -49,10 +49,14 @@ Thumbs.db
 *.wav
 *.mp3
 *.mp4
+*.webm
 *.pdf
 *.bak
+*.docx
+*.xlsx
 
-# ── Scratch / one-off scripts (never commit) ─────────────────
+# ── Scratch / debug / one-off scripts (never commit) ─────────
+fix_*.py
 compare_*.py
 consistency_test.py
 greedy_test.py
@@ -60,13 +64,22 @@ extract_pdf*.py
 test_parler_*.py
 test_tts.py
 inspect_parler.py
+_patch_*.py
+make_ppt*.py
+finetune/finetune_parler_tts.py
+
+# ── Scratch text dumps ────────────────────────────────────────
 tender_text*.txt
-scripts/git_push.bat
-scripts/wipe_outputs.bat
 _dp_full.txt
 _dp_snip.txt
 _tts_full.txt
 _vits_test.txt
+tmp_out.txt
+*.txt
+
+# ── Windows batch helpers ─────────────────────────────────────
+scripts/git_push.bat
+scripts/wipe_outputs.bat
 
 # ── Keep dataset index files (small JSON/JSONL) ───────────────
 !datasets/asr/

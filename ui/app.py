@@ -536,8 +536,8 @@ def build_ui():
             with gr.Row():
                 with gr.Column(scale=2):
                     t1_file = gr.File(
-                        label="Course Video / Audio (MP4 / MP3 / WAV)",
-                        file_types=[".mp4", ".mp3", ".wav", ".flac"]
+                        label="Course Video / Audio (MP4 / MP3 / WAV / WEBM)",
+                        file_types=[".mp4", ".mp3", ".wav", ".flac", ".webm"]
                     )
                     with gr.Row():
                         t1_meta = gr.File(

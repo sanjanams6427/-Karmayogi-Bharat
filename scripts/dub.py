@@ -168,7 +168,8 @@ def main():
     if args.batch_videos:
         import subprocess
         video_dir = Path(args.batch_videos)
-        videos = sorted(video_dir.glob("*.mp4")) + sorted(video_dir.glob("*.mp3"))
+        videos = (sorted(video_dir.glob("*.mp4")) + sorted(video_dir.glob("*.mp3"))
+                  + sorted(video_dir.glob("*.webm")))
         if not videos:
             print(f"ERROR: No mp4/mp3 files found in {video_dir}")
             sys.exit(1)

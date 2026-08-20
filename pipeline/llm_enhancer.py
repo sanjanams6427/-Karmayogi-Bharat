@@ -125,16 +125,22 @@ class LLMEnhancer:
         raise RuntimeError("No LLM provider available")
 
     def enhance(self, source: str, translation: str, src_lang: str, tgt_lang: str) -> str:
-        """Enhance a single translation. Returns original if LLM unavailable."""
+        """Enhance a single translation. Returns original if LLM unavailable or times out."""
         if not self.available or not translation.strip():
             return translation
+        import concurrent.futures
         try:
-            result = self._call(_ENHANCE_PROMPT.format(
-                src_lang=src_lang, tgt_lang=tgt_lang,
-                source=source, translation=translation,
-            ))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(self._call, _ENHANCE_PROMPT.format(
+                    src_lang=src_lang, tgt_lang=tgt_lang,
+                    source=source, translation=translation,
+                ))
+                result = fut.result(timeout=45)  # 45s hard cap — never stall pipeline
             log.debug(f"LLM enhanced [{tgt_lang}]: {translation[:60]} → {result[:60]}")
             return result
+        except concurrent.futures.TimeoutError:
+            log.warning(f"LLM enhance timed out after 45s [{tgt_lang}] — using raw translation")
+            return translation
         except Exception as e:
             log.warning(f"LLM enhance failed: {e} — using raw translation")
             return translation
@@ -144,17 +150,22 @@ class LLMEnhancer:
         """Enhance a batch of translations in one LLM call."""
         if not self.available or not translations:
             return translations
+        import concurrent.futures
         try:
-            raw = self._call(_BATCH_PROMPT.format(
-                src_lang=src_lang, tgt_lang=tgt_lang,
-                translations_json=json.dumps(translations, ensure_ascii=False),
-            ))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(self._call, _BATCH_PROMPT.format(
+                    src_lang=src_lang, tgt_lang=tgt_lang,
+                    translations_json=json.dumps(translations, ensure_ascii=False),
+                ))
+                raw = fut.result(timeout=90)  # 90s for batch
             start, end = raw.find("["), raw.rfind("]") + 1
             if start >= 0 and end > start:
                 enhanced = json.loads(raw[start:end])
                 if isinstance(enhanced, list) and len(enhanced) == len(translations):
                     log.info(f"LLM batch enhanced {len(translations)} segments [{tgt_lang}]")
                     return enhanced
+        except concurrent.futures.TimeoutError:
+            log.warning(f"LLM batch enhance timed out after 90s [{tgt_lang}] — using raw")
         except Exception as e:
             log.warning(f"LLM batch enhance failed: {e} — using raw translations")
         return translations

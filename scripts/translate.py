@@ -42,7 +42,6 @@ def run_text(args, translator: Translator):
         results[tgt] = {"lang": LANG_NAMES[tgt], "text": translated, "time_s": round(elapsed, 2)}
         print(f"  [{LANG_NAMES[tgt]:12s}] {translated}")
     return results
-    return results
 
 
 def run_audio(args, asr: ASREngine, translator: Translator):
@@ -53,7 +52,7 @@ def run_audio(args, asr: ASREngine, translator: Translator):
     targets = parse_targets(args.tgt)
     results = {"transcript": source_text, "translations": {}}
     for tgt in targets:
-        translated = translator.translate(source_text, args.src, tgt)
+        translated = translator.translate(source_text, args.src, tgt)["text"]
         results["translations"][tgt] = {"lang": LANG_NAMES[tgt], "text": translated}
         print(f"  [{LANG_NAMES[tgt]:12s}] {translated}")
     return results
@@ -112,13 +111,13 @@ def run_course(args, translator: Translator):
         translated_course = {
             "language": lang_name,
             "lang_code": tgt,
-            "title": translator.translate(course.get("title", ""), args.src, tgt),
+            "title": translator.translate(course.get("title", ""), args.src, tgt)["text"],
             "sections": [],
         }
         for section in course.get("sections", []):
             translated_course["sections"].append({
-                "heading": translator.translate(section.get("heading", ""), args.src, tgt),
-                "content": translator.translate(section.get("content", ""), args.src, tgt),
+                "heading": translator.translate(section.get("heading", ""), args.src, tgt)["text"],
+                "content": translator.translate(section.get("content", ""), args.src, tgt)["text"],
             })
         all_outputs[tgt] = translated_course
 
