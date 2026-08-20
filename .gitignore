@@ -54,6 +54,8 @@ Thumbs.db
 *.bak
 *.docx
 *.xlsx
+*.pptx
+*.ppt
 
 # ── Scratch / debug / one-off scripts (never commit) ─────────
 fix_*.py
@@ -76,6 +78,11 @@ _tts_full.txt
 _vits_test.txt
 tmp_out.txt
 *.txt
+
+# ── Local-only reports / presentations ───────────────────────
+reports/
+*.pptx
+*.ppt
 
 # ── Windows batch helpers ─────────────────────────────────────
 scripts/git_push.bat
