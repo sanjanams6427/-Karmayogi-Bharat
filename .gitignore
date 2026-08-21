@@ -69,6 +69,8 @@ inspect_parler.py
 _patch_*.py
 make_ppt*.py
 finetune/finetune_parler_tts.py
+pipeline/_tam_test*.py
+pipeline/_tam_test_out.txt
 
 # ── Scratch text dumps ────────────────────────────────────────
 tender_text*.txt
@@ -78,8 +80,11 @@ _tts_full.txt
 _vits_test.txt
 tmp_out.txt
 tmp*.txt
+tmp_*.txt
 _fp_out.txt
 scripts/_fp_out.txt
+_jid_body.txt
+tam_out.txt
 *.txt
 
 # ── Local-only reports / presentations ───────────────────────

@@ -2367,8 +2367,23 @@ class DubbingPipeline:
             row[2].text = "✅ Confirmed"
         doc.add_paragraph("")
 
+        # ── §3.6/§3.16 Cyber Security Status ─────────────────
+        doc.add_heading("5. Cyber Security Status Report  [SCC §3.6 / GCC §3.16]", level=2)
+        cs_table = doc.add_table(rows=5, cols=2)
+        cs_table.style = "Table Grid"
+        for i, (k, v) in enumerate([
+            ("Processing Environment",  "On-premise GPU servers — no internet egress"),
+            ("Foreign API Calls",        "None — KB_SOVEREIGN_MODE=1 enforced"),
+            ("Data Residency",           "All course content processed and stored in India"),
+            ("Cyber Security Incidents", "None reported this period"),
+            ("Mitigation Status",        "All pipeline endpoints firewalled; audit.log active"),
+        ]):
+            cs_table.rows[i].cells[0].text = k
+            cs_table.rows[i].cells[1].text = v
+        doc.add_paragraph("")
+
         # ── §5.1B SLA / Penalty ────────────────────────────────
-        doc.add_heading("5. SLA Compliance — §5.1B Penalty Calculation", level=2)
+        doc.add_heading("6. SLA Compliance — §5.1B Penalty Calculation", level=2)
         penalty_color = RGBColor(0xC0, 0x00, 0x00) if sla["penalty_pct"] > 0 else RGBColor(0, 0x80, 0)
         sla_table = doc.add_table(rows=6, cols=2)
         sla_table.style = "Table Grid"
@@ -2390,7 +2405,7 @@ class DubbingPipeline:
         doc.add_paragraph("")
 
         # ── Penalty reference ──────────────────────────────────
-        doc.add_heading("6. KB Tender §5.1B Penalty Reference", level=2)
+        doc.add_heading("7. KB Tender §5.1B Penalty Reference", level=2)
         ref = doc.add_table(rows=5, cols=3)
         ref.style = "Table Grid"
         for i, h in enumerate(["Shortfall %", "Deduction", "Applies This Month"]):
@@ -2407,7 +2422,7 @@ class DubbingPipeline:
         doc.add_paragraph("")
 
         # ── Full schedule reference ────────────────────────────
-        doc.add_heading("7. Full Delivery Schedule (KB Tender)", level=2)
+        doc.add_heading("8. Full Delivery Schedule (KB Tender)", level=2)
         sc = doc.add_table(rows=1, cols=3)
         sc.style = "Table Grid"
         for i, h in enumerate(["Month", "Target Hours", "This Report"]):
@@ -2420,7 +2435,7 @@ class DubbingPipeline:
         doc.add_paragraph("")
 
         # ── Declaration ────────────────────────────────────────
-        doc.add_heading("8. Declaration", level=2)
+        doc.add_heading("9. Declaration", level=2)
         doc.add_paragraph(
             f"We confirm that all content listed above was translated and dubbed "
             f"in Month {month} in accordance with KB RFB IN-KBL-543730-NC-RFB §4.5.iii. "

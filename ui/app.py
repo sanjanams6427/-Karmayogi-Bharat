@@ -1009,20 +1009,38 @@ def build_ui():
                 if not rows:
                     return None, "❌ No entries to export."
                 try:
-                    import openpyxl
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    from pipeline.sla_penalty import compute_sla
-                    ws.title = "Monthly Submission"
-                    ws.append(["Month","Course ID","Languages Delivered","Hours","Target Hours","Shortfall %","Penalty %","SLA Status"])
-                    _mh = {}
-                    for r in rows: _mh[r["month"]] = _mh.get(r["month"], 0) + r["hours"]
+                    # Build results dict grouped by month, then call the proper
+                    # §4.5.iii DOCX generator (all 4 mandatory fields + SLA section)
+                    from collections import defaultdict
+                    # Group rows by month — pick the highest month present
+                    months = sorted({r["month"] for r in rows})
+                    month = months[-1]  # report for the latest month in the table
+                    # Build results dict: {course_id: {lang: {success, duration_original, quality_summary}}}
+                    results = defaultdict(dict)
                     for r in rows:
-                        _s = compute_sla(r["month"], _mh[r["month"]])
-                        ws.append([r["month"],r["course"],r["langs"],r["hours"],_s["target_hours"],_s["shortfall_pct"],_s["penalty_pct"],_s["status"]])
-                    out = os.path.join(_get_output_dir(), "KB_Monthly_Submission_Report.xlsx")
-                    wb.save(out)
-                    return out, f"✅ Saved → {Path(out).name}"
+                        if r["month"] != month:
+                            continue
+                        for lang in [l.strip() for l in r["langs"].split(",") if l.strip()]:
+                            results[r["course"]][lang] = {
+                                "success": True,
+                                "duration_original": r["hours"] * 3600,
+                                "quality_summary": {},
+                                "output_video_path": "",
+                                "output_audio_path": "",
+                                "error": "",
+                            }
+                    pipeline = get_pipeline()
+                    out = os.path.join(_get_output_dir(),
+                                       f"KB_Month{month}_Submission_Report.docx")
+                    sla = pipeline.generate_monthly_report(
+                        month, dict(results), out,
+                        submitter_name="Translation Agency",
+                    )
+                    return out, (
+                        f"✅ §4.5.iii DOCX → {Path(out).name}  |  "
+                        f"SLA: {sla['status']}  |  "
+                        f"shortfall {sla['shortfall_pct']:.1f}%  penalty {sla['penalty_pct']:.0f}%"
+                    )
                 except Exception as e:
                     return None, f"❌ {e}"
 

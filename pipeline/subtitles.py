@@ -54,7 +54,7 @@ _SUB_FIXUPS: dict[str, list[tuple[str, str]]] = {
         ('\u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02 \u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02',
          '\u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02 \u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d3e \u0d28\u0d2e\u0d42\u0d28\u0d15\u0d33\u0d41\u0d02'),
         # Seg 6: "താഴ്ന്ന" (low) is untranslated sleet — remove
-        (r',\s*\u0d24\u0d3e\u0d34\u0d4d\u0d28\u0d4d\u0d28,', ','),
+        (r',\s*താഴ്ന്ന(?:\s+\S+)?(?=,)', ''),
         # Seg 10: "സംരക്ഷിക്കുന്നതിനെക്കുറിച്ചും സംരക്ഷിക്കുന്നതിനെക്കുറിച്ചും" repeated
         (r'(\u0d38\u0d02\u0d30\u0d15\u0d4d\u0d37\u0d3f\u0d15\u0d4d\u0d15\u0d41\u0d28\u0d4d\u0d28\u0d24\u0d3f\u0d28\u0d46\u0d15\u0d4d\u0d15\u0d41\u0d31\u0d3f\u0d1a\u0d4d\u0d1a\u0d41\u0d02) \1',
          r'\1'),
@@ -84,7 +84,7 @@ _SUB_FIXUPS: dict[str, list[tuple[str, str]]] = {
     ],
     "ben": [
         # Seg 6: "স্নিজ" is garbage (not a Bengali word) — remove
-        (r',\s*\u09b8\u09cd\u09a8\u09bf\u099c,', ','),
+        (r',\s*স্নিজ\s+বা\s+', ', '),
         # Seg 6: "নিম্ন" (low) is untranslated sleet — remove
         (r',\s*\u09a8\u09bf\u09ae\u09cd\u09a8,', ','),
     ],
@@ -105,6 +105,9 @@ _SUB_FIXUPS: dict[str, list[tuple[str, str]]] = {
         (r',\s*स्लीग,', ','),
         ('हवामान आणि हवामानातील', 'हवामान आणि जलवायूचे'),
     ],
+
+
+
 }
 
 

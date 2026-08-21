@@ -57,6 +57,44 @@ def _restore_format_tokens(text: str, fmt_map: dict[str, str]) -> str:
     return text
 
 
+# ── Trademark passthrough — KB tender §3.2 ───────────────────────────────
+# "Ensure translation to exclude any trademarks of the content provider."
+# Common content-provider trademarks on iGOT: Microsoft, Meta, Google, etc.
+# These are protected as non-translatable so they pass through unchanged.
+_TRADEMARK_TERMS: frozenset[str] = frozenset([
+    "Microsoft", "Meta", "Google", "YouTube", "WhatsApp", "Instagram",
+    "Facebook", "LinkedIn", "Twitter", "X", "Zerodha", "Fractal",
+    "iGOT", "Karmayogi", "XLRI", "IIT", "IIM", "IISc", "ISB",
+    "PMFBY", "PMJDY", "PMMY", "PRAGATI", "GSV", "DPI", "NEGD",
+    "MeitY", "DoPT", "CBC", "CBP", "CPPP", "NIC",
+])
+
+# Regex: whole-word match for any trademark term (case-sensitive)
+_TRADEMARK_RE = re.compile(
+    r'\b(' + '|'.join(re.escape(t) for t in sorted(_TRADEMARK_TERMS, key=len, reverse=True)) + r')\b'
+)
+
+
+def _protect_trademarks(text: str) -> tuple[str, dict[str, str]]:
+    """
+    Replace trademark terms with __TM0__, __TM1__, … placeholders.
+    Returns (protected_text, {placeholder: original_term}).
+    """
+    tm_map: dict[str, str] = {}
+    matches = list(_TRADEMARK_RE.finditer(text))
+    for i, m in enumerate(reversed(matches)):
+        ph = f"__TM{len(matches) - 1 - i}__"
+        tm_map[ph] = m.group(0)
+        text = text[:m.start()] + ph + text[m.end():]
+    return text, tm_map
+
+
+def _restore_trademarks(text: str, tm_map: dict[str, str]) -> str:
+    for ph, original in tm_map.items():
+        text = text.replace(ph, original)
+    return text
+
+
 # ── Non-translatable token protection ─────────────────────────────────────
 # Tokens that must pass through unchanged: URLs, file paths, shell commands,
 # code identifiers, email addresses, hashtags, @mentions.
@@ -409,20 +447,23 @@ _HIN_QUESTION_RE = re.compile(
 )
 
 
-def _naturalise(text: str) -> str:
+# Tamil word-boundary regex: vowel sign immediately followed by consonant
+# with no virama (U+0BCD) in between = fused word boundary → insert space.
+# Applied to both NLLB (fused) and IndicTrans2 (occasionally fused) output.
+_TAM_FUSE_RE = re.compile(r'([\u0bbe-\u0bc8\u0bca-\u0bcc])(?!\u0bcd)([\u0b95-\u0bb9])')
+# IndicTrans2 syllable-split: vowel sign + SPACE + Tamil char → collapse.
+_TAM_VS_RE = re.compile(r'([\u0bbe-\u0bcc\u0bcd]) ([\u0b80-\u0bff])')
+
+
+def _naturalise(text: str, tgt_lang: str = "") -> str:
     """Rule-based cleanup of common MT readability artifacts."""
-    # Collapse Tamil syllable-spaces: IndicTrans2 sometimes outputs spaces between
-    # every syllable (e.g. "சு ழற்சி" instead of "சுழற்சி").
-    # Detect: if >30% of spaces are between single Tamil syllables, collapse all
-    # intra-word spaces (spaces between Tamil chars with no punctuation boundary).
-    _TAM_SPACE_RE = re.compile(r'([\u0B80-\u0BFF])\s([\u0B80-\u0BFF])')
-    if _TAM_SPACE_RE.search(text):
-        tam_spaces = len(_TAM_SPACE_RE.findall(text))
-        total_spaces = text.count(' ')
-        if total_spaces > 0 and tam_spaces / total_spaces > 0.30:
-            # Collapse all spaces between Tamil characters
-            while _TAM_SPACE_RE.search(text):
-                text = _TAM_SPACE_RE.sub(r'\1\2', text)
+    # Tamil: fix both IndicTrans2 syllable-splits and NLLB word-fusions.
+    # Step 1 — collapse IndicTrans2 syllable-splits (vowel/virama + space + Tamil char).
+    # Step 2 — insert spaces at NLLB fused word boundaries (vowel sign → consonant, no virama).
+    if tgt_lang.split("_")[0] == "tam":
+        while _TAM_VS_RE.search(text):
+            text = _TAM_VS_RE.sub(r'\1\2', text)
+        text = _TAM_FUSE_RE.sub(r'\1 \2', text)
     text = _REPEAT_WORD_RE.sub(r"\1", text)
     # Also catch X மற்றும் X / X और X / X and X patterns (same word both sides of conjunction)
     text = re.sub(
@@ -995,7 +1036,7 @@ class Translator:
             t = _restore_factual_tokens(t, fmap)
             t = _verify_factual_tokens(orig, t, fmap)
             t = _restore_format_tokens(t, fmt_map)
-            t = _naturalise(t)
+            t = _naturalise(t, tgt_lang)
             # Wrong-language drift guard: detect Maithili markers in Hindi output.
             # अछि/छथि/करैत/छनि/कयल are Maithili-exclusive verb forms never found in Hindi.
             # Threshold=2: two hits = definite Maithili drift.
@@ -1203,8 +1244,9 @@ class Translator:
         src_name = LANG_NAMES.get(src_lang, src_lang)
         tgt_name = LANG_NAMES.get(tgt_lang, tgt_lang)
 
-        # Protect formatting tokens first, then non-translatable, then factual.
+        # Protect formatting tokens first, then trademarks, then non-translatable, then factual.
         work_text, fmt_map     = _protect_format_tokens(text)
+        work_text, tm_map      = _protect_trademarks(work_text)
         work_text, nt_map      = _protect_nontranslatable(work_text)
         work_text, factual_map = _protect_factual_tokens(work_text)
 
@@ -1328,10 +1370,11 @@ class Translator:
         translated = _clean_unk(translated)
         translated = _clean_mixed_lang(translated, tgt_lang)  # pass 1: engine output
         translated = _restore_nontranslatable(translated, nt_map)
+        translated = _restore_trademarks(translated, tm_map)
         translated = _restore_factual_tokens(translated, factual_map)
         translated = _verify_factual_tokens(text, translated, factual_map)
         translated = _restore_format_tokens(translated, fmt_map)
-        translated = _naturalise(translated)
+        translated = _naturalise(translated, tgt_lang)
         # Rule 20: final quality gate covers pass-2 mixed-lang clean internally
         translated, fqc_flags = _final_quality_check(
             text, translated, tgt_lang, fmt_map, nt_map, factual_map)
@@ -1463,7 +1506,7 @@ class Translator:
                     # Hindi which tends to produce shorter translations than source
                     t = _clean_unk(trans)
                     t = _clean_mixed_lang(t, tgt_lang)
-                    t = _naturalise(t)
+                    t = _naturalise(t, tgt_lang)
                     # Wrong-language drift guard for Hindi — threshold=2
                     _MAITHILI_BATCH_RE = re.compile(
                         r'\u0905\u091b\u093f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'

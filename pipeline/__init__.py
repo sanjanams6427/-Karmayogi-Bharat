@@ -15,6 +15,8 @@ from .correction_tracker import (
     get_all_tickets, get_open_tickets, get_tickets_for_course,
     ticket_summary, tickets_to_rows, export_closure_report,
     days_remaining, penalty_pct,
+    open_defect, resolve_defect, get_open_defects, defect_summary,
+    record_weekly_submission, get_weekly_batches, weekly_batch_summary,
 )
 try:
     from .llm_enhancer import LLMEnhancer

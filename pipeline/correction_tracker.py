@@ -15,8 +15,11 @@ import datetime
 from pathlib import Path
 
 TICKETS_FILE = Path(__file__).parent.parent / "translation_memory" / "correction_tickets.jsonl"
+DEFECT_FILE  = Path(__file__).parent.parent / "translation_memory" / "defect_liability.jsonl"
+WEEKLY_BATCH_FILE = Path(__file__).parent.parent / "translation_memory" / "weekly_batches.jsonl"
 DEADLINE_DAYS = 5          # KB tender: 5 calendar days
 PENALTY_PCT_PER_WEEK = 0.5  # 0.5% per week (or part thereof)
+DEFECT_LIABILITY_MONTHS = 12  # KB SCC §7.1: 12-month post-acceptance defect liability
 
 
 # ── Helpers ───────────────────────────────────────────────────
@@ -188,6 +191,188 @@ def ticket_summary(tickets: list[dict]) -> dict:
         "closed":      len(closed),
         "overdue":     len(overdue),
         "total_penalty_pct": round(total_pen, 2),
+    }
+
+
+# ── Defects Liability Period tracker (KB SCC §7.1) ──────────
+# 12-month window after formal acceptance — learner-reported defects
+
+def _load_defects() -> list[dict]:
+    if not DEFECT_FILE.exists():
+        return []
+    defects = []
+    for line in DEFECT_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                defects.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return defects
+
+
+def _save_defects(defects: list[dict]) -> None:
+    DEFECT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DEFECT_FILE.write_text(
+        "\n".join(json.dumps(d, ensure_ascii=False) for d in defects) + "\n",
+        encoding="utf-8",
+    )
+
+
+def open_defect(
+    course_id: str,
+    tgt_lang: str,
+    description: str,
+    reported_by: str = "Learner",
+    acceptance_date: str | None = None,
+) -> dict:
+    """
+    Record a learner-reported defect within the 12-month defects liability period.
+    acceptance_date: ISO date when the course was formally accepted by KB.
+    If not provided, today is used (conservative — starts the clock now).
+    Returns the new defect record.
+    """
+    acc_dt = (datetime.datetime.fromisoformat(acceptance_date)
+              if acceptance_date else datetime.datetime.now())
+    liability_end = acc_dt + datetime.timedelta(days=30 * DEFECT_LIABILITY_MONTHS)
+    defects = _load_defects()
+    defect_id = f"DEF-{len(defects) + 1:04d}"
+    record = {
+        "defect_id":       defect_id,
+        "course_id":       course_id,
+        "tgt_lang":        tgt_lang,
+        "description":     description,
+        "reported_by":     reported_by,
+        "reported_at":     _now_iso(),
+        "acceptance_date": acc_dt.isoformat(timespec="seconds"),
+        "liability_end":   liability_end.isoformat(timespec="seconds"),
+        "within_liability": datetime.datetime.now() <= liability_end,
+        "status":          "open",
+        "resolved_at":     None,
+        "resolution":      None,
+    }
+    defects.append(record)
+    _save_defects(defects)
+    return record
+
+
+def resolve_defect(defect_id: str, resolution: str) -> dict | None:
+    """Mark a defect as resolved. Returns updated record or None."""
+    defects = _load_defects()
+    for d in defects:
+        if d["defect_id"] == defect_id:
+            d["status"]      = "resolved"
+            d["resolved_at"] = _now_iso()
+            d["resolution"]  = resolution
+            _save_defects(defects)
+            return d
+    return None
+
+
+def get_open_defects(course_id: str | None = None) -> list[dict]:
+    """Return all open defects, optionally filtered by course_id."""
+    return [
+        d for d in _load_defects()
+        if d["status"] == "open"
+        and (course_id is None or d["course_id"] == course_id)
+    ]
+
+
+def defect_summary() -> dict:
+    """Aggregate defect liability stats."""
+    all_d = _load_defects()
+    open_d     = [d for d in all_d if d["status"] == "open"]
+    resolved_d = [d for d in all_d if d["status"] == "resolved"]
+    in_window  = [d for d in open_d if d.get("within_liability")]
+    return {
+        "total":    len(all_d),
+        "open":     len(open_d),
+        "resolved": len(resolved_d),
+        "in_liability_window": len(in_window),
+        "liability_months": DEFECT_LIABILITY_MONTHS,
+    }
+
+
+# ── Weekly Batch Submission Tracker (KB §4.3) ─────────────────
+# Translation agency must submit to verification agency in weekly batches
+# of 15-30 hours per week within each month.
+
+def _load_batches() -> list[dict]:
+    if not WEEKLY_BATCH_FILE.exists():
+        return []
+    batches = []
+    for line in WEEKLY_BATCH_FILE.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                batches.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return batches
+
+
+def _save_batches(batches: list[dict]) -> None:
+    WEEKLY_BATCH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    WEEKLY_BATCH_FILE.write_text(
+        "\n".join(json.dumps(b, ensure_ascii=False) for b in batches) + "\n",
+        encoding="utf-8",
+    )
+
+
+def record_weekly_submission(
+    month: int,
+    week: int,
+    course_ids: list[str],
+    langs: list[str],
+    hours: float,
+    submitted_to: str = "KB Verification Agency",
+) -> dict:
+    """
+    Record a weekly batch submission to the verification agency (KB §4.3).
+    month: contract month (1-11)
+    week:  week within month (1-4)
+    hours: total translated hours in this batch (target: 15-30 h)
+    Returns the batch record.
+    """
+    batches = _load_batches()
+    batch_id = f"WB-M{month:02d}W{week:01d}-{len(batches) + 1:03d}"
+    record = {
+        "batch_id":     batch_id,
+        "month":        month,
+        "week":         week,
+        "submitted_at": _now_iso(),
+        "submitted_to": submitted_to,
+        "course_ids":   course_ids,
+        "langs":        langs,
+        "hours":        round(hours, 2),
+        "within_target": 15.0 <= hours <= 30.0,
+        "status":       "submitted",
+    }
+    batches.append(record)
+    _save_batches(batches)
+    return record
+
+
+def get_weekly_batches(month: int | None = None) -> list[dict]:
+    """Return all weekly batch records, optionally filtered by month."""
+    return [
+        b for b in _load_batches()
+        if month is None or b["month"] == month
+    ]
+
+
+def weekly_batch_summary(month: int) -> dict:
+    """Summarise weekly batch submissions for a given month."""
+    batches = get_weekly_batches(month)
+    total_h = sum(b["hours"] for b in batches)
+    on_target = sum(1 for b in batches if b["within_target"])
+    return {
+        "month":         month,
+        "total_batches": len(batches),
+        "total_hours":   round(total_h, 2),
+        "on_target":     on_target,
+        "off_target":    len(batches) - on_target,
+        "target_range":  "15-30 hours/week",
     }
 
 

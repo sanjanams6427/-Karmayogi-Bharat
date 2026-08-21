@@ -74,6 +74,9 @@ def main():
                         help="Generate monthly batch QA self-certification (.docx) from results JSON  [KB §4.5]")
     parser.add_argument("--agency", default="Translation Agency",
                         help="Agency name printed on inception/completion reports")
+    parser.add_argument("--qa-reviewer", default="Translation Agency QA Lead",
+                        dest="qa_reviewer",
+                        help="Reviewer name printed on QA certificates")
     parser.add_argument("--agency-address", default="",
                         help="Agency address for inception report")
     parser.add_argument("--contact-person", default="",
@@ -186,7 +189,7 @@ def main():
         pkg = pipeline.generate_handover_package(
             output_dir=args.output,
             course_ids=None,
-            agency_name=args.qa_reviewer,
+            agency_name=args.agency,
         )
         print(f"\n{'='*60}")
         print("  KB §4.6 — Consolidated Completion Report & Handover Package")
