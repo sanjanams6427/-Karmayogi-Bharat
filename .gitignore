@@ -86,6 +86,13 @@ scripts/_fp_out.txt
 reports/
 *.pptx
 *.ppt
+ARCHITECTURE.md
+CODEBASE_UPDATE*.md
+INFRA_CALCULATION.md
+INTERVIEW_QA.md
+KB_Technical_Writeup*.md
+MODEL_LICENSING_AND_GAPS.md
+PROJECT_REPORT.md
 
 # ── Windows batch helpers ─────────────────────────────────────
 scripts/git_push.bat
