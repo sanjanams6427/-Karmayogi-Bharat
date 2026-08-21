@@ -12,7 +12,6 @@ from pathlib import Path
 from .lang_config import LANG_NAMES
 from .lang_detect import tag_segments, fw_lang_to_internal
 
-import os
 try:
     _gpu = int(os.environ.get("PIPELINE_GPU", "0"))
 except ValueError:
@@ -24,12 +23,12 @@ MODELS_DIR = Path(__file__).parent.parent / "models"
 # Nastaliq script normalization map for Urdu / Kashmiri / Sindhi
 # Fixes common OCR/ASR output inconsistencies in Arabic-script languages
 _NASTALIQ_NORM = {
-    "ك": "ک",   # Arabic kaf → Urdu kaf
-    "ي": "ی",   # Arabic ya → Urdu ya
-    "ة": "ت",   # ta marbuta → ta
-    "\u0649": "ی",  # alef maqsura → ya
-    "\u0624": "و",  # waw with hamza above → waw
-    "\u0626": "ی",  # ya with hamza above → ya
+    "\u0643": "\u06a9",   # Arabic kaf → Urdu kaf
+    "\u064a": "\u06cc",   # Arabic ya → Urdu ya
+    "\u0629": "\u062a",   # ta marbuta → ta
+    "\u0649": "\u06cc",   # alef maqsura → ya
+    "\u0624": "\u0648",   # waw with hamza above → waw
+    "\u0626": "\u06cc",   # ya with hamza above → ya
 }
 
 
@@ -91,8 +90,7 @@ class ASREngine:
                 src = "large-v3"
             compute = "float16" if torch.cuda.is_available() else "int8"
             print(f"[ASR] Loading faster-whisper from {src} on {ASR_DEVICE}")
-            import os as _os
-            cpu_count = _os.cpu_count() or 4
+            cpu_count = os.cpu_count() or 4
             self._fw_model = WhisperModel(
                 src,
                 device="cuda" if torch.cuda.is_available() else "cpu",
@@ -114,7 +112,6 @@ class ASREngine:
             model = self._load_fw()
             segments, info = model.transcribe(wav, beam_size=1, language=None,
                                               vad_filter=True, max_new_tokens=1)
-            # consume generator to get info populated
             _ = list(segments)
             fw_code  = info.language
             prob     = round(info.language_probability, 3)
@@ -138,23 +135,27 @@ class ASREngine:
         try:
             model = self._load_fw()
 
-            # Auto-detect language if not specified — single pass, no redundant probe
             fw_lang = None if (lang == "auto" or not lang) else FW_LANG_CODES.get(lang)
+
+            # Hindi and Devanagari langs: beam_size=5 for better compound word accuracy.
+            # Other langs: beam_size=2 for speed with minimal quality loss.
+            _DEVA_LANGS = {"hin", "mar", "nep", "mai", "san", "doi", "kok", "bod"}
+            beam = 5 if lang in _DEVA_LANGS else 2
+
             raw_segs, info = model.transcribe(
                 wav,
                 language=fw_lang,
-                beam_size=4,
+                beam_size=beam,
                 vad_filter=True,
                 vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 200},
                 word_timestamps=True,
                 condition_on_previous_text=False,  # prevents Whisper hallucination loops
                 temperature=[0.0, 0.2, 0.4],       # fallback temps break repetition
-                no_speech_threshold=0.6,
-                log_prob_threshold=-1.0,
+                no_speech_threshold=0.45,
+                log_prob_threshold=-1.2,
                 compression_ratio_threshold=2.4,
             )
             raw_segs = list(raw_segs)
-            # Resolve auto-detected language after consuming generator
             if fw_lang is None:
                 lang = fw_lang_to_internal(info.language, fallback="eng")
                 print(f"[ASR] Auto-detected language: {info.language} → {lang} "
@@ -168,18 +169,20 @@ class ASREngine:
 
         if not raw_segs:
             return []
-        # Tamil/Telugu are morphologically rich — use longer merge windows
-        # so sentences aren’t split mid-clause
+        # Tamil/Telugu/Malayalam/Kannada are morphologically rich — use longer merge windows
         if lang in ("tam", "tel", "mal", "kan"):
-            merged = _merge_segments(raw_segs, min_words=5, min_dur=2.0, max_dur=15.0)
+            merged = _merge_segments(raw_segs, min_words=5, min_dur=2.0, max_dur=8.0)
+        elif lang in ("hin", "mar", "nep", "mai", "san", "doi", "kok", "bod"):
+            # Devanagari langs: higher min_words — Hindi compound sentences are long;
+            # 6 words is barely a clause. max_dur=20s to avoid mid-sentence cuts.
+            # bod (Bodo/brx_Deva) also uses Devanagari — same merge strategy.
+            merged = _merge_segments(raw_segs, min_words=10, min_dur=2.0, max_dur=20.0)
         else:
             merged = _merge_segments(raw_segs)
         segments = tag_segments(merged, lang)
-        # Post-process Nastaliq script languages
         if lang in ("urd", "kas", "snd"):
             for seg in segments:
                 seg["text"] = _normalize_nastaliq(seg["text"])
-        # Strip ASR hallucination artifacts (garbage words at segment boundaries)
         for seg in segments:
             seg["text"] = _strip_hallucinations(seg["text"])
         segments = [s for s in segments if s["text"].strip()]
@@ -194,21 +197,85 @@ class ASREngine:
 # Pre-compiled hallucination prefix pattern — covers English and Devanagari artifacts
 _HALLUC_PREFIX_RE = re.compile(
     r'^(?:'
-    # English Whisper hallucinations at segment boundaries
     r'Wanner|Whener|Viengore|Venue|Guinevere|Gindis|Wener|Whener|'
     r'Venger|Vien|Whan|Wener|Winer|Wanna|Gonna|Ginda|Gindas|'
     r'Vanna|Venna|Vinna|Wenna|Winna'
     r')\s+',
     re.IGNORECASE
 )
-# Devanagari hallucination prefixes
+
+# Devanagari hallucination prefixes — strip known Whisper segment-boundary artifacts.
+#
+# Whisper large-v3 consistently emits छे/चे at the START of Devanagari segments
+# when it mishears the boundary. These appear in two forms:
+#   1. Standalone:  "छे वर्णन..."  — छे followed by space
+#   2. Fused:       "छेदक", "छेकिन", "छेवआ", "छेना" — artifact glued to next word
+#
+# For fused form: strip only the 2-char prefix (छे/चे) and keep the remainder.
+# The remainder is the real first word — e.g. "छेदक" → "दक" is WRONG;
+# we need to detect that "दक" is not a real word start and instead the whole
+# fused token is artifact+word. We do this by matching छे/चे at position 0
+# followed immediately by a Devanagari consonant (no matra/space) — that
+# pattern never occurs in real Hindi/Maithili/Bodo sentence-initial position.
+#
+# DO NOT strip से/हे/ये/वे/जे — common Hindi words (from/O/these/they/which).
 _HALLUC_DEVA_RE = re.compile(
-    r'^(?:छे[^\s]*|से[^\s]*|हे[^\s]*|ये[^\s]*|वे[^\s]*|जे[^\s]*|चे[^\s]*)\s+'
+    r'^(?:'
+    # Standalone: छे/चे followed by whitespace
+    r'\u091b\u0947\s+'   # छे + space
+    r'|\u091a\u0947\s+'  # चे + space
+    # Fused: छे/चे immediately followed by a Devanagari consonant (U+0915–U+0939)
+    # This is the "छेदक", "छेकिन", "छेवआ", "छेना", "छेदे" pattern.
+    # Consume only the 2-char prefix; the consonant stays.
+    r'|\u091b\u0947(?=[\u0915-\u0939])'  # छे fused with consonant
+    r'|\u091a\u0947(?=[\u0915-\u0939])'  # चे fused with consonant
+    r')'
 )
-# Tamil/Telugu segment boundary artifacts:
-# Leading ) , . or Indic punctuation followed by space — ASR boundary bleed
+
+# Known छे-fused hallucination corrections:
+# Whisper replaces the first syllable of a word with छे, producing छे+remainder.
+# Map remainder → corrected full word (most common cases in Hindi/Maithili/Bodo).
+_HALLUC_DEVA_CORRECTIONS = {
+    # छेकिन → लेकिन  (lekIn — Hindi "but/however")
+    "\u0915\u093f\u0928": "\u0932\u0947\u0915\u093f\u0928",
+    # छेदक → जलचक्र is wrong; दक alone is a fragment — drop it
+    "\u0926\u0915": "",
+    # छेदे → "दे हुए" — दे IS a real Hindi word (imperative देना) so sentinel would
+    # restore it. But छेदे is always an artifact — drop दे unconditionally here.
+    # Real sentence-initial "दे" (e.g. "दे दो", "दे रहा") never follows छे in real text.
+    "\u0926\u0947": "",  # unconditional drop — छेदे is always artifact
+    # छेवआ → वआ is a fragment — drop it
+    "\u0935\u0906": "",
+    # छेना → ना is a negation suffix — drop it
+    "\u0928\u093e": "",
+    # छेदककेँ → दककेँ is a fragment — drop it
+    "\u0926\u0915\u0915\u0947\u0901": "",
+}
+
+
+def _correct_deva_halluc(text: str) -> str:
+    """
+    After stripping छे/चे prefix, check if the first word is a known fragment
+    and either correct it to the full word or drop it.
+    """
+    if not text:
+        return text
+    parts = text.split(None, 1)
+    first = parts[0]
+    rest  = parts[1] if len(parts) > 1 else ""
+    correction = _HALLUC_DEVA_CORRECTIONS.get(first)
+    if correction is None:
+        return text  # key not in map — no correction needed
+    if correction:
+        # Full word replacement (e.g. किन → लेकिन)
+        return (correction + " " + rest).strip()
+    # Empty string — unconditional drop
+    return rest.strip()
+
+
+# Indic punctuation boundary artifacts: leading । ॥ or ASCII ) , . followed by space
 _HALLUC_BOUNDARY_RE = re.compile(
-    r'^[)\]},;.।॥\u0964\u0965]+\s+'
+    r'^[\)\]\},;.\u0964\u0965]+\s+'
 )
 
 
@@ -216,14 +283,28 @@ def _strip_hallucinations(text: str) -> str:
     """
     Remove known Whisper hallucination patterns at segment boundaries.
     Covers English, Devanagari, and Tamil/Telugu boundary artifacts.
+    Apply iteratively — stripping one artifact can expose another.
     """
     text = _HALLUC_PREFIX_RE.sub('', text).strip()
-    text = _HALLUC_DEVA_RE.sub('', text).strip()
+
+    # Strip छे/चे prefix iteratively — one pass may expose another artifact
+    for _ in range(3):
+        new = _HALLUC_DEVA_RE.sub('', text).strip()
+        if new == text:
+            break
+        text = _correct_deva_halluc(new)
+
     text = _HALLUC_BOUNDARY_RE.sub('', text).strip()
-    # Strip leading incomplete syllable fragments for Tamil/Telugu:
-    # segments starting with a lone consonant cluster + space (e.g. "ப்படிப்பு", "ட்டட்")
-    text = re.sub(r'^[\u0B80-\u0BFF]{1,3}[்]\s+', '', text)   # Tamil virama-initial
-    text = re.sub(r'^[\u0C00-\u0C7F]{1,3}[\u0C4D]\s+', '', text)  # Telugu virama-initial
+
+    # Strip leading standalone Devanagari combining marks (anusvara ँ/ं, visarga ः,
+    # chandrabindu, nukta) that Whisper emits as segment-boundary artifacts.
+    # These characters (U+0900–U+0903, U+093C) can NEVER start a real word.
+    text = re.sub(r'^[\u0900-\u0903\u093C]+\s+', '', text).strip()
+
+    # Strip leading incomplete syllable fragments for Tamil (U+0B80–U+0BFF + virama U+0BCD)
+    text = re.sub(r'^[\u0B80-\u0BFF]{1,3}\u0BCD\s+', '', text)
+    # Strip leading incomplete syllable fragments for Telugu (U+0C00–U+0C7F + virama U+0C4D)
+    text = re.sub(r'^[\u0C00-\u0C7F]{1,3}\u0C4D\s+', '', text)
     if text:
         text = text[0].upper() + text[1:]
     return text
@@ -236,7 +317,7 @@ def _merge_segments(raw_segs, min_words: int = 6, min_dur: float = 1.5,
     Rules:
       - Keep merging until >= min_words words AND >= min_dur seconds
       - Never exceed max_dur seconds
-      - Always split on sentence-ending punctuation (. ! ?)
+      - Always split on sentence-ending punctuation (. ! ? । ॥)
     """
     merged, buf_text, buf_start, buf_end = [], [], None, None
 
@@ -265,9 +346,23 @@ def _merge_segments(raw_segs, min_words: int = 6, min_dur: float = 1.5,
 
         dur = buf_end - buf_start
         words = sum(len(t.split()) for t in buf_text)
-        ends_sentence = text[-1] in ".!?。"
+        ends_sentence = text[-1] in ".!?\u3002\u0964\u0965"
 
-        if (ends_sentence and words >= min_words and dur >= min_dur) or dur >= max_dur:
+        # Only hard-split on duration if the segment ends on a sentence boundary.
+        # Never split mid-sentence — a dangling half-sentence translates badly
+        # and sounds broken in TTS.
+        force_split = dur >= max_dur and ends_sentence
+        # If we've exceeded max_dur and there's NO sentence boundary, still split
+        # to prevent the buffer growing unbounded — but only at a word boundary
+        # (the current segment end is always a word boundary in Whisper output).
+        if dur >= max_dur * 1.5 and not ends_sentence:
+            force_split = True
+        # natural_split: flush on sentence boundary when we have enough content.
+        # last_seg_words >= 2 guard prevents splitting on a lone danda (।) with
+        # only 1 word — but 2 words is enough for a complete clause.
+        last_seg_words = len(buf_text[-1].split()) if buf_text else 0
+        natural_split = ends_sentence and words >= min_words and dur >= min_dur and last_seg_words >= 2
+        if natural_split or force_split:
             flush()
             buf_text, buf_start, buf_end = [], None, None
 

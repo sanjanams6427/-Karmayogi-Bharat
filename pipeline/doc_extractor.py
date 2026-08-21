@@ -16,12 +16,11 @@ def extract_text(file_path: str) -> str:
         return p.read_text(encoding="utf-8", errors="ignore")
 
     if suffix == ".pdf":
-        try:
-            import pdfplumber
-            with pdfplumber.open(str(p)) as pdf:
-                return "\n".join(page.extract_text() or "" for page in pdf.pages)
-        except ImportError:
-            raise ImportError("Install pdfplumber: pip install pdfplumber")
+        # PDF translation blocked per KB tender §3.1 — upload original to CBP portal as-is
+        raise ValueError(
+            "PDF documents are NOT translated per KB tender §3.1. "
+            "Upload the original PDF directly to the CBP portal."
+        )
 
     if suffix in (".docx", ".doc"):
         try:

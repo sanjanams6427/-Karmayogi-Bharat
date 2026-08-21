@@ -47,6 +47,13 @@ _LINGUA_TO_INTERNAL = {
 # Languages lingua cannot detect — always trust assumed_lang
 _LINGUA_UNSUPPORTED = {"bod", "doi", "kas", "kok", "mni", "sat", "snd"}
 
+# Languages where Lingua is unreliable — too many false positives between
+# closely related scripts. For these, always trust the assumed_lang from ASR.
+# hin/mar/nep/mai/san all share Devanagari — Lingua confuses them constantly.
+# The detected_lang field is only useful for genuine multilingual Indic sources,
+# not for English-source dubbing where ASR already knows the source language.
+_LINGUA_UNRELIABLE = {"hin", "mar", "nep", "mai", "san", "doi", "kok"}
+
 _detector = None
 
 
@@ -85,9 +92,11 @@ def tag_segments(segments: list[dict], assumed_lang: str) -> list[dict]:
     """
     Add 'detected_lang' to each segment.
     - For lingua-unsupported langs (bod/doi/kas/kok/mni/sat/snd), always keep assumed_lang.
-    - For supported langs, use detection but fall back to assumed_lang (not 'eng') on failure.
+    - For Devanagari-family langs (hin/mar/nep/mai/san/kok), always keep assumed_lang—
+      Lingua confuses these constantly (hin↔mar↔nep↔mai↔san all share the same script).
+    - For other supported langs, use detection but fall back to assumed_lang on failure.
     """
-    if assumed_lang in _LINGUA_UNSUPPORTED:
+    if assumed_lang in _LINGUA_UNSUPPORTED or assumed_lang in _LINGUA_UNRELIABLE:
         return [{**s, "detected_lang": assumed_lang} for s in segments]
 
     detector = _get_detector()

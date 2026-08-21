@@ -50,6 +50,7 @@ class CBPUploader:
                 f"{self.base_url}/api/user/v1/login",
                 json={"username": self.username, "password": self.password},
                 timeout=30,
+                verify=True,  # enforce SSL certificate verification
             )
             resp.raise_for_status()
             data = resp.json()
@@ -61,7 +62,8 @@ class CBPUploader:
             log.error("[CBP] Login failed: no token in response")
             return False
         except Exception as e:
-            log.error(f"[CBP] Login error: {e}")
+            # Never log the exception message directly — it may contain credentials in URL/body
+            log.error(f"[CBP] Login error: {type(e).__name__}")
             return False
 
     def upload_video(self, video_path: str, course_id: str, lang: str) -> dict:
