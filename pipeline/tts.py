@@ -307,9 +307,16 @@ class TTSEngine:
                 from transformers import VitsModel, AutoTokenizer
                 log.info(f"Loading standalone VITS [{lang}] from {model_path}")
                 tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+                # Load on CPU first to avoid CUDA illegal memory access on some
+                # VITS checkpoints — move to DEVICE only after successful load.
                 model = VitsModel.from_pretrained(
                     str(model_path), torch_dtype=torch.float32
-                ).to(DEVICE).eval()
+                ).eval()
+                try:
+                    model = model.to(DEVICE)
+                except RuntimeError as _cuda_err:
+                    log.warning(f"Standalone VITS [{lang}] CUDA move failed ({_cuda_err}) — using CPU")
+                    model = model.to("cpu")
             # Pin noise_scale to 0.0 — eliminates stochastic voice variation between
             # segments. Default 0.667 causes different timbre on every call.
             # noise_scale_duration=0.0 locks duration predictor too (consistent pacing).
@@ -655,19 +662,29 @@ class TTSEngine:
             def _run():
                 with torch.no_grad():
                     return self._parler_model.generate(**kwargs)
-            # Use tighter timeout for Devanagari (Hindi etc.) — token cap is lower so 45s is enough
             sample_text = texts[0] if texts else ""
             deva_count = sum(1 for c in sample_text if '\u0900' <= c <= '\u097F')
             batch_timeout = ((self._PARLER_TIMEOUT_TEL if (len(sample_text) > 0 and sum(1 for c in sample_text if '\u0C00'<=c<='\u0C7F')/max(len(sample_text),1)>0.4)
                              else self._PARLER_TIMEOUT_DEVA if (len(sample_text) > 0 and deva_count / max(len(sample_text),1) > 0.4)
                              else self._PARLER_TIMEOUT_S))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(_run)
-                try:
-                    gen = _fut.result(timeout=batch_timeout * n)
-                except concurrent.futures.TimeoutError:
-                    log.error(f"Parler batch TIMEOUT [{lang}] {n} segs")
-                    return results
+            # Always create a fresh executor — never reuse one whose thread may
+            # still be running a timed-out generation (causes CUDA state corruption).
+            _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _fut = _ex.submit(_run)
+            try:
+                gen = _fut.result(timeout=batch_timeout * n)
+            except concurrent.futures.TimeoutError:
+                log.error(f"Parler batch TIMEOUT [{lang}] {n} segs")
+                _ex.shutdown(wait=False)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return results
+            finally:
+                _ex.shutdown(wait=False)
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -719,13 +736,23 @@ class TTSEngine:
                     return self._parler_generate(desc_ids, prompt_ids, max_tok,
                                                  lang=lang, encoder_outputs=encoder_outputs)
             import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-                _fut = _ex.submit(_gen_no_grad)
-                try:
-                    gen = _fut.result(timeout=timeout)
-                except concurrent.futures.TimeoutError:
-                    log.error(f"Parler single TIMEOUT [{lang}] after {timeout}s")
-                    return False
+            # Fresh executor every call — a timed-out thread must not be reused.
+            _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _fut = _ex.submit(_gen_no_grad)
+            try:
+                gen = _fut.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                log.error(f"Parler single TIMEOUT [{lang}] after {timeout}s STUCK FOR LONG TIME")
+                _ex.shutdown(wait=False)
+                if torch.cuda.is_available():
+                    try:
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                return False
+            finally:
+                _ex.shutdown(wait=False)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             wav = gen.detach().cpu().float().numpy().squeeze()
@@ -792,6 +819,9 @@ class TTSEngine:
     _PARLER_TIMEOUT_S    = 120  # all scripts — unified timeout
     _PARLER_TIMEOUT_DEVA = 120
     _PARLER_TIMEOUT_TEL  = 120
+    # After a timeout the GPU thread may still be running — track the executor
+    # so we can abandon it and create a fresh one for the next segment.
+    _parler_executor     = None
 
     def _synthesize_parler(self, text: str, lang: str, output_path: str) -> bool:
         if lang in _PARLER_SKIP_LANGS:
@@ -814,17 +844,24 @@ class TTSEngine:
                         return self._parler_generate(desc_ids, prompt_ids, max_tok,
                                                      lang=lang, encoder_outputs=enc_out)
                 import concurrent.futures
-                # Tighter timeout for Devanagari scripts
-                deva_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-                _timeout = (self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
-                            else self._PARLER_TIMEOUT_S)
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
-                    _fut = _ex.submit(_gen_no_grad_synth)
-                    try:
-                        gen = _fut.result(timeout=_timeout)
-                    except concurrent.futures.TimeoutError:
-                        log.error(f"Parler TIMEOUT [{lang}] after {_timeout}s — MMS fallback")
-                        return False
+                # Fresh executor — never reuse a thread that may still be running
+                # a timed-out generation (causes CUDA state corruption on next call).
+                _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                _fut = _ex.submit(_gen_no_grad_synth)
+                try:
+                    gen = _fut.result(timeout=_timeout)
+                except concurrent.futures.TimeoutError:
+                    log.error(f"Parler TIMEOUT [{lang}] after {_timeout}s — MMS fallback")
+                    _ex.shutdown(wait=False)
+                    if torch.cuda.is_available():
+                        try:
+                            torch.cuda.synchronize()
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    return False
+                finally:
+                    _ex.shutdown(wait=False)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 wav = gen.detach().cpu().numpy().squeeze().astype(np.float32)
