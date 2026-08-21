@@ -45,7 +45,8 @@ project/
 │   ├── doc_extractor.py           # DOCX/PDF/TXT extraction + format-preserving translation
 │   ├── voice_clone.py             # Voice cloning: Coqui XTTS-v2 (KB Tier 2 pricing)
 │   ├── cbp_uploader.py            # CBP portal upload (KB tender §4.2)
-│   ├── llm_enhancer.py            # LLM post-edit (Groq/Gemini/OpenRouter — optional)
+│   ├── llm_enhancer.py            # LLM post-edit (Groq/Gemini/OpenRouter — blocked in sovereign mode)
+│   ├── sovereign_guard.py         # ★ Sovereign AI guard — blocks foreign APIs (KB_SOVEREIGN_MODE=1)
 │   ├── logger.py                  # Structured JSON logging (pipeline.log + audit.log)
 │   └── retry.py                   # Retry decorator + JobCheckpoint (crash-safe resume)
 │
@@ -261,13 +262,26 @@ python scripts/translation_memory.py lookup --src "Competency" --tgt-lang hin
 
 ## LLM Post-Edit Enhancement (Optional)
 
-Set any one key in `.env` to activate — pipeline works fully offline without it:
+> ⚠️ **Sovereign AI Compliance — KB Tender RFB IN-KBL-543730-NC-RFB**
+> 
+> `KB_SOVEREIGN_MODE=1` is the **default and required setting** for all iGOT Karmayogi / government content.
+> When enabled, all foreign cloud LLM APIs (Groq / Gemini / OpenRouter) are **hard-blocked** — no KB content
+> can be transmitted to foreign servers. This satisfies Government of India data security, confidentiality,
+> and data residency requirements (IT Act 2000 · DPDP Act 2023 · MeitY cloud policy).
+>
+> All core AI processing (ASR · Translation · TTS) runs **fully offline on-premise** regardless of this flag.
+> Set `KB_SOVEREIGN_MODE=0` only for non-KB / non-government content.
+
+Set any one key in `.env` **and** `KB_SOVEREIGN_MODE=0` to activate LLM post-edit:
 
 ```
-GROQ_API_KEY=gsk_...        # free tier, llama-3.3-70b
-GEMINI_API_KEY=AIza...      # gemini-1.5-flash
-OPENROUTER_API_KEY=sk-...   # meta-llama/llama-3.3-70b-instruct:free
+KB_SOVEREIGN_MODE=0          # must be 0 — foreign APIs blocked by default
+GROQ_API_KEY=gsk_...         # free tier, llama-3.3-70b
+GEMINI_API_KEY=AIza...       # gemini-1.5-flash
+OPENROUTER_API_KEY=sk-...    # meta-llama/llama-3.3-70b-instruct:free
 ```
+
+Preferred sovereign alternative: [Sarvam AI](https://sarvam.ai) (India-hosted) or any MeitY-empanelled cloud AI service.
 
 ---
 
@@ -402,27 +416,21 @@ Scoring methods: heuristic (script check, length ratio, transliteration detectio
 - **Concurrent job protection** — per-(course_id, lang) threading lock prevents duplicate jobs
 - **Audit trail** — every job start/success/failure written to `logs/audit.log` as JSON
 
+---
 
+## Fine-Tuning — Multi-GPU with Accelerate
 
+```bash
+# Fine-tune IndicTrans2 (all 3 directions)
+accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_indictrans.py --direction en_indic
+accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_indictrans.py --direction indic_en
+accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_indictrans.py --direction indic_indic
 
-S E:\Manick_AI_ML\project> accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_indictrans.py --direction indic_indic
-Traceback (most recent call last):
-  File "<frozen runpy>", line 198, in _run_module_as_main
-  File "<frozen runpy>", line 88, in _run_code
-  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Scripts\accelerate.exe\__main__.py", line 4, in <module>
-  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\accelerate\__init__.py", line 16, in <module>
-    from .accelerator import Accelerator
-  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\accelerate\accelerator.py", line 32, in <module>
-    import torch
-  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\__init__.py", line 2151, in <module>
-    from torch import (
-  File "C:\Users\M1021\AppData\Local\Programs\Python\Python312\Lib\site-packages\torch\optim\__init__.py", line 12, in <module>
-    from torch.optim.adagrad import Adagrad as Adagrad
-  File "<frozen importlib._bootstrap>", line 1360, in _find_and_load
-  File "<frozen importlib._bootstrap>", line 1331, in _find_and_load_unlocked
-  File "<frozen importlib._bootstrap>", line 935, in _load_unlocked
-  File "<frozen importlib._bootstrap_external>", line 995, in exec_module
-  File "<frozen importlib._bootstrap_external>", line 1091, in get_code
-  File "<frozen importlib._bootstrap_external>", line 1191, in get_data
-KeyboardInterrupt
-PS E:\Manick_AI_ML\project> 
+# Fine-tune SeamlessM4T
+accelerate launch --num_processes=4 --mixed_precision=bf16 finetune/finetune_seamless.py
+```
+
+> **Note:** Requires `accelerate` configured for your GPU setup. Run `accelerate config` once before launching.
+> DeepSpeed ZeRO-3 config available at `finetune/ds_zero3.json` for large-scale multi-GPU runs.
+
+Checkpoints saved to `checkpoints/indictrans/<direction>/best/` and picked up automatically by the pipeline.

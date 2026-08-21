@@ -411,9 +411,54 @@ _HIN_QUESTION_RE = re.compile(
 
 def _naturalise(text: str) -> str:
     """Rule-based cleanup of common MT readability artifacts."""
+    # Collapse Tamil syllable-spaces: IndicTrans2 sometimes outputs spaces between
+    # every syllable (e.g. "சு ழற்சி" instead of "சுழற்சி").
+    # Detect: if >30% of spaces are between single Tamil syllables, collapse all
+    # intra-word spaces (spaces between Tamil chars with no punctuation boundary).
+    _TAM_SPACE_RE = re.compile(r'([\u0B80-\u0BFF])\s([\u0B80-\u0BFF])')
+    if _TAM_SPACE_RE.search(text):
+        tam_spaces = len(_TAM_SPACE_RE.findall(text))
+        total_spaces = text.count(' ')
+        if total_spaces > 0 and tam_spaces / total_spaces > 0.30:
+            # Collapse all spaces between Tamil characters
+            while _TAM_SPACE_RE.search(text):
+                text = _TAM_SPACE_RE.sub(r'\1\2', text)
     text = _REPEAT_WORD_RE.sub(r"\1", text)
+    # Also catch X மற்றும் X / X और X / X and X patterns (same word both sides of conjunction)
+    text = re.sub(
+        r'(\S{4,})\s+(?:\u0bae\u0bb1\u0bcd\u0bb1\u0bc1\u0bae\u0bcd|\u0914\u0930|and|\u0905\u0928\u094d\u0924\u0947|\u0924\u0925\u093e)\s+\1(?=\s|$|[.,;!?])',
+        r'\1', text
+    )
     text = _SPACE_BEFORE_PUNCT_RE.sub(r"\1", text)
     text = _MULTI_PUNCT_RE.sub(r"\1", text)
+    # Strip leading punctuation artifacts (comma, semicolon at sentence start)
+    text = re.sub(r'^[,;:\u0964\u0965]+\s*', '', text)
+    # Strip Bengali ঔর (Hindi "aur" in Bengali script) as sentence-initial artifact
+    text = re.sub(r'^\u0994\u09b0\s+', '', text)
+    # Strip Nepali ते/तेता/तेपनि etc. hallucination prefixes
+    text = re.sub(r'^\u0924\u0947(?:\u0924\u093e|\u092a\u0928\u093f|\u0916\u093e\u0930\u094d\u0928\u0947|\u0928\u094d\u091c\u0947\u0932|\u092a\u093e\u0938|\u0939\u093f\u0932\u094b|\u0928\u0940|\u0924\u094d\u0930\u0948)?\s+', '', text)
+    # Strip Kannada ಸೇದುವು/ಸೇದು/ಸೇಡಂ/ಸೇರ್ಪಡೆಯ hallucination prefixes (fused or standalone sentence)
+    text = re.sub(r'^\u0cb8\u0cc7(?:\u0ca6\u0cc1\u0cb5\u0cc1|\u0ca6\u0cc1|\u0ca1\u0c82|\u0cac\u0cbf\u0ca8|\u0ca6\u0ccd|\u0cb2\u0ccd|\u0cac\u0ccd|\u0cb0\u0ccd\u0caa\u0ca1\u0cc6\u0caf)[.\s]+', '', text)
+    # Strip Malayalam ഛ/ഛെ/ഛമായ/ഘ prefix artifacts
+    text = re.sub(r'^\u0d1b(?:\u0d2e\u0d3e\u0d2f|\u0d46)?\s*', '', text)
+    text = re.sub(r'^\u0d18\u0d28\u0d3f\u0d7c\u0d2e\u0d4d\u0d2e\u0d3f\u0d24\s*', '', text)
+    text = re.sub(r'^\u0d24\u0d43\s+', '', text)
+    text = re.sub(r'^\u0d24\u0d35\u0d23\u0d24\u0d4d\u0d24\u0d46\s+', '', text)
+    # Strip Odia ମରିଯୁ prefix artifact
+    text = re.sub(r'^\u0b2e\u0b30\u0b3f\u0b2f\u0b41\s*', '', text)
+    # Strip Assamese টাৰ/টা prefix artifact
+    text = re.sub(r'^\u099f\u09be(?:\u09b0)?\s+', '', text)
+    # Strip Punjabi ਨਾ ਸਿਰਫ / ਨਾ ਭੁੱਲੋ prefix artifacts
+    text = re.sub(r'^\u0a28\u0a3e\s+(?:\u0a38\u0a3f\u0a30\u0a2b\u0a3c?|\u0a2d\u0a41\u0a71\u0a32\u0a4b)\s*', '', text)
+    # Strip Marathi किवा/किवी/किडे prefix artifacts
+    text = re.sub(r'^\u0915\u093f(?:\u0935\u093e|\u0935\u0940|\u0921\u0947|\u0935\u093e\u0937\u094d\u092a\u0940\u0915\u0930\u0923)\s*', '', text)
+    # Strip Sanskrit पाल्य/पालक/पालित/पालन prefix artifacts
+    text = re.sub(r'^\u092a\u093e\u0932(?:\u094d\u092f(?:\u092e\u093e\u0928)?|\u0915|\u093f\u0924|\u0928)\s+', '', text)
+    # Strip Dogri फोरन/फोर/ऐम्म prefix artifacts
+    text = re.sub(r'^\u092b\u094b\u0930(?:\u0928)?\s+', '', text)
+    text = re.sub(r'^\u0910\u092e\u094d\u092e\s+', '', text)
+    # Strip Urdu کا / کہ sentence-initial artifacts (bare prepositions)
+    text = re.sub(r'^(?:\u06a9\u0627|\u06a9\u06c1)\s+', '', text)
     # Hindi question sentences ending with danda → replace with ?
     if _HIN_QUESTION_RE.search(text):
         text = text.rstrip('\u0964\u0965').rstrip() + '?'
@@ -530,21 +575,25 @@ MODELS_DIR  = Path(__file__).parent.parent / "models"
 
 class Translator:
     # Langs routed via Hindi pivot through IndicTrans2 indic_indic
-    # mni/sat: low-resource — pivot via Hindi, then SeamlessM4T as score-based fallback
-    # mni removed from pivot — SeamlessM4T handles Manipuri natively and better
+    # sat: low-resource — pivot via Hindi, then SeamlessM4T as score-based fallback
     _PIVOT_LANGS = {"sat"}
 
     # Force NLLB as primary — IndicTrans2 outputs Hindi/garbage for these
     # After NLLB, try SeamlessM4T as a score-based second opinion
-    # kok (Konkani): IndicTrans2 uses gom_Deva which drifts to Goan dialect — NLLB is more stable
-    _NLLB_FIRST = {"snd", "kas", "kok"}
+    # kok (Konkani): IndicTrans2 produces English passthrough + emoji garbage — NLLB is only working option
+    # ben: IndicTrans2 en_indic outputs Hindi transliterated into Bengali script — NLLB gives real Bengali
+    # mni: both IndicTrans2 and Seamless produce repeated garbage — NLLB has mni_Mtei support
+    # mar: IndicTrans2 prepends किवा/किवी/किडे artifacts — NLLB is cleaner
+    # ory: IndicTrans2 prepends ମରିଯୁ artifact on every segment — NLLB is cleaner
+    # asm: IndicTrans2 prepends টাৰ/টা artifact on every segment — NLLB is cleaner
+    # pan: IndicTrans2 prepends ਨਾ ਸਿਰਫ ("not only") on every segment — NLLB is cleaner
+    # san: IndicTrans2 prepends ਪਾਲ੍ਯ/ਪਾਲਕ artifacts — NLLB is cleaner
+    # doi: IndicTrans2 prepends ਫੋਰਨ/ਫੋਰ artifacts — NLLB is cleaner
+    _NLLB_FIRST = {"snd", "kas", "kok", "ben", "mni", "mar", "ory", "asm", "pan", "san", "doi", "mai", "kan", "mal", "tam"}
 
     # Use Seamless FIRST before IndicTrans2 for these langs
-    # Manipuri: route through Seamless directly instead of Hindi pivot
-    # Hindi removed — seamless_first blocks the IndicTrans2 GPU batch path in
-    # translate_batch(), forcing per-segment calls. IndicTrans2 batch is faster
-    # and the Maithili drift guard already handles quality for Hindi.
-    _SEAMLESS_FIRST: set = {"mni"}
+    # (mni moved to NLLB_FIRST — Seamless also produces garbage for Manipuri)
+    _SEAMLESS_FIRST: set = set()
 
     def __init__(self):
         self._indic_trans2: dict = {}
@@ -808,15 +857,103 @@ class Translator:
             active_results = processor.postprocess_batch(decoded, lang=tgt_lang)
         else:
             active_results = []
+        # Fix Tamil script word-boundary merges: IndicTrans2 occasionally fuses
+        # two words when the first ends with a vowel sign and the second starts
+        # with a consonant (e.g. பனிப்பொழிவாகீழே → பனிப்பொழிவாக கீழே).
+        # ONLY insert space when a Tamil vowel sign is immediately followed by
+        # a Tamil consonant WITH NO intervening virama (U+0BCD) — virama means
+        # the consonant is part of the same akshara cluster, not a new word.
+        _TAM_FUSE_RE = re.compile(
+            r'([\u0bbe-\u0bc8\u0bca-\u0bcc])(?!\u0bcd)([\u0b95-\u0bb9])'
+        )
+        if tgt_short == "tam":
+            active_results = [_TAM_FUSE_RE.sub(r'\1 \2', t) for t in active_results]
+
+        # Fix multi-sentence truncation: IndicTrans2 drops the first sentence when
+        # the input contains two sentences (e.g. "A. B.") — it only translates B.
+        # Detect: source has 2+ sentences (split on '. ') but output is suspiciously
+        # short relative to the first sentence alone. Re-translate sentence by sentence
+        # and concatenate.
+        _SENT_SPLIT_RE = re.compile(r'(?<=[.!?\u0964])\s+')
+        for _si, _ai in enumerate(_active_indices):
+            _src = texts[_ai]
+            _out = active_results[_si] if _si < len(active_results) else ""
+            _src_sents = [s.strip() for s in _SENT_SPLIT_RE.split(_src) if s.strip()]
+            if len(_src_sents) < 2:
+                continue
+            # If output is shorter than 50% of what the first sentence alone would produce
+            # (rough estimate: target chars ≈ source chars * 1.3 for Indic scripts),
+            # the first sentence was likely dropped — re-translate sentence by sentence.
+            _expected_min = len(_src_sents[0]) * 0.8
+            if len(_out) >= _expected_min:
+                continue
+            try:
+                _sent_results = []
+                for _sent in _src_sents:
+                    _sb = processor.preprocess_batch([_sent], src_lang=src_lang, tgt_lang=tgt_lang)
+                    _si2 = tokenizer(_sb, return_tensors="pt", padding=True,
+                                     truncation=True, max_length=512)
+                    _si2 = {k: v.to(DEVICE) for k, v in _si2.items()}
+                    _si2 = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+                            for k, v in _si2.items()}
+                    with torch.no_grad():
+                        _so = model.generate(
+                            **_si2, forced_bos_token_id=tgt_id,
+                            max_new_tokens=max_new_tok, num_beams=num_beams,
+                            no_repeat_ngram_size=ngram_size, repetition_penalty=rep_penalty,
+                            length_penalty=length_pen, use_cache=True, early_stopping=True,
+                        )
+                    _sd = tokenizer.batch_decode(_so, skip_special_tokens=True)
+                    _sr = processor.postprocess_batch(_sd, lang=tgt_lang)
+                    if _sr and _sr[0].strip():
+                        _sent_results.append(_sr[0].strip())
+                if len(_sent_results) == len(_src_sents):
+                    active_results[_si] = " ".join(_sent_results)
+                    log.info(f"[multi_sent] Re-translated {len(_src_sents)} sentences for idx={_ai}")
+            except Exception as _mse:
+                log.warning(f"[multi_sent] Failed idx={_ai}: {_mse}")
+
         # Merge active_results back into full results list (rerouted slots filled from _rerouted)
         _PREFIX_RE = re.compile(
             r'^(?:'
             r'[\u0900-\u097F]{2,3}\s+'                    # 2-3 Devanagari chars + SPACE
             r'|\u091b\u0947[\u0900-\u097F]{1,4}\s*'       # छे + 1-4 more Devanagari chars (fused artifact)
             r'|\u091a\u0947[\u0900-\u097F]{1,4}\s*'       # चे + 1-4 more Devanagari chars
+            # Nepali hallucination prefixes: ते/तेता/तेपनि/तेखार्ने/तेन्जेल/तेपास/तेहिलो etc.
+            r'|\u0924\u0947(?:\u0924\u093e|\u092a\u0928\u093f|\u0916\u093e\u0930\u094d\u0928\u0947|\u0928\u094d\u091c\u0947\u0932|\u092a\u093e\u0938|\u0939\u093f\u0932\u094b|\u0928\u0940|\u0924\u094d\u0930\u0948)?\s+'
+            # Kannada hallucination prefix: ಸೇದುವು/ಸೇದು/ಸೇಡಂ/ಸೇಬಿನ/ಸೇರ್ಪಡೆಯ (fused or standalone sentence)
+            r'|\u0cb8\u0cc7(?:\u0ca6\u0cc1\u0cb5\u0cc1|\u0ca6\u0cc1|\u0ca1\u0c82|\u0cac\u0cbf\u0ca8|\u0ca6\u0ccd|\u0cb2\u0ccd|\u0cac\u0ccd|\u0cb0\u0ccd\u0caa\u0ca1\u0cc6\u0caf)[.\s]+'
+            # Bengali: ঔর (Hindi "aur" in Bengali script) as sentence-initial artifact
+            r'|\u0994\u09b0\s+'
+            # Malayalam: ഛ/ഛെ/ഛമായ/ഘ prefix artifacts
+            r'|\u0d1b(?:\u0d2e\u0d3e\u0d2f|\u0d46)?\s*'
+            r'|\u0d18\u0d28\u0d3f\u0d7c\u0d2e\u0d4d\u0d2e\u0d3f\u0d24\s*'  # ഘനിർമ്മിത
+            # Malayalam seg 9: തൃ prefix
+            r'|\u0d24\u0d43\s+'
+            # Malayalam seg 10: തവണത്തെ → strip and keep rest
+            r'|\u0d24\u0d35\u0d23\u0d24\u0d4d\u0d24\u0d46\s+'
+            # Odia: ମରିଯୁ prefix artifact
+            r'|\u0b2e\u0b30\u0b3f\u0b2f\u0b41\s*'
+            # Assamese: টাৰ/টা prefix artifact
+            r'|\u099f\u09be(?:\u09b0)?\s+'
+            # Punjabi: ਨਾ ਸਿਰਫ / ਨਾ ਭੁੱਲੋ prefix artifacts
+            r'|\u0a28\u0a3e\s+(?:\u0a38\u0a3f\u0a30\u0a2b\u0a3c?|\u0a2d\u0a41\u0a71\u0a32\u0a4b)\s*'
+            # Marathi: किवा/किवी/किडे/किवाष्पीकरण prefix artifacts
+            r'|\u0915\u093f(?:\u0935\u093e|\u0935\u0940|\u0921\u0947|\u0935\u093e\u0937\u094d\u092a\u0940\u0915\u0930\u0923)\s*'
+            # Sanskrit: पाल्य/पालक/पालित/पालन/पाल्यमान prefix artifacts
+            r'|\u092a\u093e\u0932(?:\u094d\u092f(?:\u092e\u093e\u0928)?|\u0915|\u093f\u0924|\u0928)\s+'
+            # Dogri: फोरन/फोर/ऐम्म/गी prefix artifacts
+            r'|\u092b\u094b\u0930(?:\u0928)?\s+'
+            r'|\u0910\u092e\u094d\u092e\s+'
+            # Urdu: کا / کہ sentence-initial bare preposition artifacts
+            r'|(?:\u06a9\u0627|\u06a9\u06c1)\s+'
             r'|[)\]}>]+\s*)'
         )
         active_results = [_PREFIX_RE.sub('', t).strip() for t in active_results]
+        # Strip leading punctuation artifacts (comma, semicolon, colon at sentence start)
+        # Tamil seg 2 issue: ", ஆறுகள்" — leading comma from dropped subject
+        _LEAD_PUNCT_RE = re.compile(r'^[,;:\u0964\u0965]+\s*')
+        active_results = [_LEAD_PUNCT_RE.sub('', t).strip() for t in active_results]
         # Reconstruct full results in original order
         results = ["" ] * len(texts)
         for _slot, _ai in enumerate(_active_indices):

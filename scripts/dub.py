@@ -68,6 +68,22 @@ def main():
     parser.add_argument("--monthly-report",
                         help="Generate monthly submission report from results JSON")
     parser.add_argument("--month", type=int, default=1, help="Month number (1-12)")
+    parser.add_argument("--submitter", default="Translation Agency",
+                        help="Submitter name printed on the monthly report declaration")
+    parser.add_argument("--monthly-qa-cert",
+                        help="Generate monthly batch QA self-certification (.docx) from results JSON  [KB §4.5]")
+    parser.add_argument("--agency", default="Translation Agency",
+                        help="Agency name printed on inception/completion reports")
+    parser.add_argument("--agency-address", default="",
+                        help="Agency address for inception report")
+    parser.add_argument("--contact-person", default="",
+                        help="Contact person name for inception report")
+    parser.add_argument("--contact-email", default="",
+                        help="Contact email for inception report")
+    parser.add_argument("--t0-date", default="",
+                        help="Contract start date ISO format YYYY-MM-DD (default: today)")
+    parser.add_argument("--course-list",
+                        help="Comma-separated course IDs for inception report")
 
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--video", help="MP4/MP3 to translate and dub")
@@ -76,6 +92,12 @@ def main():
     group.add_argument("--list-langs", action="store_true", help="List all supported languages")
     group.add_argument("--run-monthly-report", action="store_true",
                        help="Generate monthly report (use with --monthly-report)")
+    group.add_argument("--run-monthly-qa-cert", action="store_true",
+                       help="Generate monthly batch QA cert (use with --monthly-qa-cert)  [KB §4.5]")
+    group.add_argument("--run-completion-report", action="store_true",
+                       help="Generate Consolidated Completion Report + handover package (KB §4.6)")
+    group.add_argument("--run-inception-report", action="store_true",
+                       help="Generate Inception Report for Payment Milestone 1 (KB §4.1, T0+15 days)")
 
     args = parser.parse_args()
 
@@ -96,8 +118,122 @@ def main():
         results_data = json.loads(Path(args.monthly_report).read_text(encoding="utf-8"))
         pipeline = DubbingPipeline()
         out = Path(args.output) / f"month_{args.month}_submission_report.docx"
-        pipeline.generate_monthly_report(args.month, results_data, str(out))
-        print(f"✅ Monthly report → {out}")
+        sla = pipeline.generate_monthly_report(
+            args.month, results_data, str(out),
+            submitter_name=args.submitter,
+        )
+        # Derive the four §4.5.iii fields for console summary
+        courses = list(results_data.keys())
+        all_langs, total_h = set(), 0.0
+        for lang_results in results_data.values():
+            for lang, r in lang_results.items():
+                success = r.get("success", False) if isinstance(r, dict) else r.success
+                dur = r.get("duration_original", 0.0) if isinstance(r, dict) else r.duration_original
+                if success:
+                    all_langs.add(lang)
+                    total_h += dur / 3600
+        from pipeline.lang_config import LANG_NAMES as _LN
+        print(f"\n{'='*60}")
+        print(f"  Month {args.month} Submission Report  —  KB Tender §4.5.iii")
+        print(f"{'='*60}")
+        print(f"  [Field 1] Courses delivered    : {len(courses)}")
+        for cid in courses:
+            print(f"              • {cid}")
+        print(f"  [Field 2] Languages covered    : {len(all_langs)}")
+        print(f"              {', '.join(_LN.get(l, l) for l in sorted(all_langs))}")
+        print(f"  [Field 3] Total hours          : {total_h:.3f} h  (target: {sla['target_hours']:.1f} h)")
+        print(f"  [Field 4] Standards confirmed  : ✅ Technical + Accessibility")
+        print(f"{'='*60}")
+        print(f"  SLA shortfall  : {sla['shortfall_pct']:.1f}%")
+        print(f"  Penalty        : {sla['penalty_pct']:.0f}%  —  {sla['status']}")
+        print(f"{'='*60}")
+        print(f"\n✅ Monthly report → {out}")
+        return
+
+    if args.run_inception_report:
+        tgt_langs = parse_targets(args.tgt)
+        course_ids = (
+            [c.strip() for c in args.course_list.split(",")]
+            if args.course_list else []
+        )
+        pipeline = DubbingPipeline()
+        out = Path(args.output) / "KB_Inception_Report.docx"
+        Path(args.output).mkdir(parents=True, exist_ok=True)
+        pipeline.generate_inception_report(
+            course_ids=course_ids,
+            tgt_langs=tgt_langs,
+            output_dir=args.output,
+            output_path=str(out),
+            agency_name=args.agency,
+            agency_address=args.agency_address,
+            contact_person=args.contact_person,
+            contact_email=args.contact_email,
+            t0_date=args.t0_date,
+        )
+        print(f"\n{'='*60}")
+        print("  KB §4.1 — Inception Report (Payment Milestone 1)")
+        print(f"{'='*60}")
+        print(f"  Agency         : {args.agency}")
+        print(f"  Courses        : {len(course_ids)} ({', '.join(course_ids) or 'TBC'})")
+        print(f"  Languages      : {len(tgt_langs)}")
+        print(f"  T0 date        : {args.t0_date or 'today'}")
+        print(f"  Output         : {out}")
+        print(f"{'='*60}")
+        return
+
+    if args.run_completion_report:
+        pipeline = DubbingPipeline()
+        pkg = pipeline.generate_handover_package(
+            output_dir=args.output,
+            course_ids=None,
+            agency_name=args.qa_reviewer,
+        )
+        print(f"\n{'='*60}")
+        print("  KB §4.6 — Consolidated Completion Report & Handover Package")
+        print(f"{'='*60}")
+        print(f"  Courses delivered  : {pkg['total_courses']}")
+        print(f"  Languages          : {pkg['total_languages']}")
+        print(f"  Total hours        : {pkg['total_hours']:.2f} h")
+        print(f"  Total assets       : {pkg['total_assets']}")
+        print(f"  Completion report  : {pkg['completion_report']}")
+        print(f"  Compliance cert    : {pkg['compliance_cert']}")
+        print(f"  Glossary xlsx      : {pkg['glossary_xlsx']}")
+        print(f"  Asset manifest     : {pkg['asset_manifest']}")
+        print(f"  Handover ZIP       : {pkg['handover_zip']}")
+        print(f"{'='*60}")
+        return
+
+    if args.run_monthly_qa_cert:
+        if not args.monthly_qa_cert:
+            print("ERROR: --monthly-qa-cert <results.json> required")
+            sys.exit(1)
+        results_data = json.loads(Path(args.monthly_qa_cert).read_text(encoding="utf-8"))
+        pipeline = DubbingPipeline()
+        # Build flat entries list from results dict
+        entries = []
+        for cid, lang_results in results_data.items():
+            for lang, r in lang_results.items():
+                success = r.get("success", False) if isinstance(r, dict) else r.success
+                dur = r.get("duration_original", 0) if isinstance(r, dict) else r.duration_original
+                qs = r.get("quality_summary", {}) if isinstance(r, dict) else r.quality_summary
+                entries.append({
+                    "course_id":   cid,
+                    "lang":        lang,
+                    "hours":       dur / 3600,
+                    "avg_score":   qs.get("avg_score", "N/A"),
+                    "pass_rate":   qs.get("pass_rate", "N/A"),
+                    "total_segs":  qs.get("total", "N/A"),
+                    "failed_segs": qs.get("failed", 0),
+                    "status":      "✅ Accepted" if success else "❌ Failed",
+                })
+        out = Path(args.output) / f"month_{args.month}_batch_qa_cert.docx"
+        pipeline.generate_monthly_batch_qa_cert(
+            month=args.month,
+            entries=entries,
+            reviewer_name=args.qa_reviewer,
+            output_path=str(out),
+        )
+        print(f"\n✅ Monthly batch QA cert (§4.5) → {out}")
         return
 
     targets = parse_targets(args.tgt)

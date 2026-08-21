@@ -28,17 +28,82 @@ _SUB_ARTIFACT_RE = re.compile(r'^[\)\]},;.\u0964\u0965]+\s+')
 # survive all translation-time guards (wrong terminology, stray words, etc.).
 _SUB_FIXUPS: dict[str, list[tuple[str, str]]] = {
     "hin": [
-        # Seg 4: "transpiration" → IndicTrans2 outputs "पसीना आना" (sweating).
-        # Correct term is वाष्पोत्सर्जन.
-        ('पसीना आना', 'वाष्पोत्सर्जन'),
-        # Seg 6: "sleet" → IndicTrans2 outputs "कम" (less/low) — stray artifact.
-        # Remove isolated "कम" between comma-separated precipitation items.
-        (r',\s*कम,', ','),
-        # Seg 3: "पानी को गर्म करता" missing subject सूर्य.
-        # Fires when sentence starts with a locative phrase ending in में
-        # and contains "पानी को गर्म करता" with no subject before it.
-        (r'^(\S+ों.*?में\s+)(पानी को गर्म करता)',
-         'सूर्य ' + r'\2'),
+        ('\u092a\u0938\u0940\u0928\u093e \u0906\u0928\u093e', '\u0935\u093e\u0937\u094d\u092a\u094b\u0924\u094d\u0938\u0930\u094d\u091c\u0928'),
+        (r',\s*\u0915\u092e,', ','),
+        (r'^(\S+\u094b\u0902.*?\u092e\u0947\u0902\s+)(\u092a\u093e\u0928\u0940 \u0915\u094b \u0917\u0930\u094d\u092e \u0915\u0930\u0924\u093e)',
+         '\u0938\u0942\u0930\u094d\u092f ' + r'\2'),
+    ],
+    "kan": [
+        # Strip ಸೇದುವು as a standalone sentence prefix (with full stop or space)
+        (r'^\u0cb8\u0cc7\u0ca6\u0cc1\u0cb5\u0cc1[.\s]+', ''),
+        (r'^\u0cb8\u0cc7\u0ca6\u0cc1[.\s]+', ''),
+        (r'^\u0cb8\u0cc7\u0ca1\u0c82[.\s]+', ''),
+        # Fix word fuse: ಸರೋವರಗಳಲ್ಲಿನೀರನ್ನು → ಸರೋವರಗಳಲ್ಲಿ ನೀರನ್ನು
+        (r'\u0cb8\u0cb0\u0ccb\u0cb5\u0cb0\u0c97\u0cb3\u0cb2\u0ccd\u0cb2\u0cbf\u0ca8\u0cc0\u0cb0\u0ca8\u0ccd\u0ca8\u0cc1',
+         '\u0cb8\u0cb0\u0ccb\u0cb5\u0cb0\u0c97\u0cb3\u0cb2\u0ccd\u0cb2\u0cbf \u0ca8\u0cc0\u0cb0\u0ca8\u0ccd\u0ca8\u0cc1'),
+        # Seg 6: "ಕಡಿಮೆ" (low) is untranslated sleet — remove stray word
+        (r',\s*\u0c95\u0ca1\u0cbf\u0cae\u0cc6,', ','),
+        # Seg 8: "ಪೂರೈಕೆ" missing "ಶುದ್ಧ ನೀರಿನ" — can't fix without retranslation, leave
+    ],
+    "mal": [
+        # Seg 4: wrong term for transpiration
+        ('\u0d27\u0d3e\u0d35\u0d3f\u0d15\u0d4d\u0d37\u0d47\u0d2a\u0d23\u0d02', '\u0d2c\u0d3e\u0d37\u0d4d\u0d2a\u0d4b\u0d24\u0d4d\u0d38\u0d30\u0d4d\u200d\u0d1c\u0d28\u0d02'),
+        # Seg 6: "തർച്ചയെ" → "താപനിലയെ" (temperature)
+        ('\u0d24\u0d7c\u0d1a\u0d4d\u0d1a\u0d2f\u0d46', '\u0d24\u0d3e\u0d2a\u0d28\u0d3f\u0d32\u0d2f\u0d46'),
+        # Seg 9: "കാലാവസ്ഥയും കാലാവസ്ഥയും" repeated — keep only one with correct terms
+        ('\u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02 \u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02',
+         '\u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d2f\u0d41\u0d02 \u0d15\u0d3e\u0d32\u0d3e\u0d35\u0d38\u0d4d\u0d25\u0d3e \u0d28\u0d2e\u0d42\u0d28\u0d15\u0d33\u0d41\u0d02'),
+        # Seg 6: "താഴ്ന്ന" (low) is untranslated sleet — remove
+        (r',\s*\u0d24\u0d3e\u0d34\u0d4d\u0d28\u0d4d\u0d28,', ','),
+        # Seg 10: "സംരക്ഷിക്കുന്നതിനെക്കുറിച്ചും സംരക്ഷിക്കുന്നതിനെക്കുറിച്ചും" repeated
+        (r'(\u0d38\u0d02\u0d30\u0d15\u0d4d\u0d37\u0d3f\u0d15\u0d4d\u0d15\u0d41\u0d28\u0d4d\u0d28\u0d24\u0d3f\u0d28\u0d46\u0d15\u0d4d\u0d15\u0d41\u0d31\u0d3f\u0d1a\u0d4d\u0d1a\u0d41\u0d02) \1',
+         r'\1'),
+    ],
+    "tel": [
+        # Seg 2: ఉన్నీరు → ఉన్న నీరు
+        ('\u0c09\u0c28\u0c4d\u0c28\u0c40\u0c30\u0c41', '\u0c09\u0c28\u0c4d\u0c28 \u0c28\u0c40\u0c30\u0c41'),
+        # Seg 5: ఘనీభవించినీటితో → ఘనీభవించిన నీటితో
+        ('\u0c18\u0c28\u0c40\u0c2d\u0c35\u0c3f\u0c02\u0c1a\u0c3f\u0c28\u0c40\u0c1f\u0c3f\u0c24\u0c4b',
+         '\u0c18\u0c28\u0c40\u0c2d\u0c35\u0c3f\u0c02\u0c1a\u0c3f\u0c28 \u0c28\u0c40\u0c1f\u0c3f\u0c24\u0c4b'),
+        # Seg 6: "తక్కువ" (low) is untranslated sleet — remove
+        (r',\s*\u0c24\u0c15\u0c4d\u0c15\u0c41\u0c35,', ','),
+    ],
+    "urd": [
+        # Seg 6: "کم" (low) is untranslated sleet — remove
+        (r',\s*\u06a9\u0645,', ','),
+    ],
+    "guj": [
+        # Seg 5: "ડેન્સ્ડ" (transliterated "condensed") → ઘનીભૂત
+        ('\u0aa1\u0ac7\u0aa8\u0acd\u0ab8\u0acd\u0aa1', '\u0a98\u0aa8\u0ac0\u0aad\u0ac2\u0aa4'),
+        # Seg 4: transpiration wrongly called બાષ્પીભવન — fix to બાષ્પોત્સર્જન
+        # Only when the word appears twice in same segment (evaporation + transpiration)
+        (r'(\u0aac\u0abe\u0ab7\u0acd\u0aaa\u0ac0\u0aad\u0ab5\u0aa8.*?)\u0aac\u0abe\u0ab7\u0acd\u0aaa\u0ac0\u0aad\u0ab5\u0aa8 \u0aa8\u0abe\u0aae\u0aa8\u0ac0',
+         r'\1\u0aac\u0abe\u0ab7\u0acd\u0aaa\u0acb\u0aa4\u0acd\u0ab8\u0ab0\u0acd\u0a9c\u0aa8 \u0aa8\u0abe\u0aae\u0aa8\u0ac0'),
+        # Seg 6: "નિમ્ન" (low) is untranslated sleet — remove
+        (r',\s*\u0aa8\u0abf\u0aae\u0acd\u0aa8,', ','),
+    ],
+    "ben": [
+        # Seg 6: "স্নিজ" is garbage (not a Bengali word) — remove
+        (r',\s*\u09b8\u09cd\u09a8\u09bf\u099c,', ','),
+        # Seg 6: "নিম্ন" (low) is untranslated sleet — remove
+        (r',\s*\u09a8\u09bf\u09ae\u09cd\u09a8,', ','),
+    ],
+    "asm": [
+        # Seg 6: "নিম্ন" (low) is untranslated sleet — remove
+        (r',\s*\u09a8\u09bf\u09ae\u09cd\u09a8,', ','),
+    ],
+    "pan": [
+        ('ਟ੍ਰਾਂਸਪਿਰੇਸ਼ਨ', 'ਵਾਸ਼ਪੋਤਸਰਜਨ'),
+        (r',\s*ਘੱਟ,', ','),
+        (r'(ਬਰਫ਼ਬਾਰੀ),\s*ਬਰਫ਼ਬਾਰੀ', r'\1'),
+    ],
+    "ory": [
+        (r',\s*ନିମ୍ନମାନର,', ','),
+    ],
+    "mar": [
+        (r',\s*कमी,', ','),
+        (r',\s*स्लीग,', ','),
+        ('हवामान आणि हवामानातील', 'हवामान आणि जलवायूचे'),
     ],
 }
 

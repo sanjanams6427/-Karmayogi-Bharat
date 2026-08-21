@@ -8,6 +8,7 @@ import os, json
 from pathlib import Path
 from .logger import get_logger
 from .retry import retry
+from .sovereign_guard import assert_sovereign_allowed, sovereign_mode_enabled
 
 log = get_logger("llm")
 
@@ -58,6 +59,8 @@ class LLMEnhancer:
                      "(set GROQ_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY in .env)")
 
     def _detect_provider(self) -> str | None:
+        if sovereign_mode_enabled():
+            return None  # all foreign APIs blocked in sovereign mode
         if _groq_key():       return "groq"
         if _gemini_key():     return "gemini"
         if _openrouter_key(): return "openrouter"
@@ -69,6 +72,7 @@ class LLMEnhancer:
 
     @retry(max_attempts=3, delay=1.0)
     def _call_groq(self, prompt: str) -> str:
+        assert_sovereign_allowed("groq")
         import urllib.request
         payload = json.dumps({
             "model": "llama-3.3-70b-versatile",
@@ -86,6 +90,7 @@ class LLMEnhancer:
 
     @retry(max_attempts=3, delay=1.0)
     def _call_gemini(self, prompt: str) -> str:
+        assert_sovereign_allowed("gemini")
         import urllib.request
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
@@ -101,6 +106,7 @@ class LLMEnhancer:
 
     @retry(max_attempts=3, delay=1.0)
     def _call_openrouter(self, prompt: str) -> str:
+        assert_sovereign_allowed("openrouter")
         import urllib.request
         payload = json.dumps({
             "model": "meta-llama/llama-3.3-70b-instruct:free",

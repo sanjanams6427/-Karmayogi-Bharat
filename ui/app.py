@@ -387,6 +387,13 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
     if not tgt_langs:
         return None, [], "❌ Select at least one target language."
 
+    # KB tender §3.1 — Non-SCORM content only
+    from pipeline.scorm_guard import is_scorm_package
+    _scorm, _scorm_reason = is_scorm_package(video_file.name)
+    if _scorm:
+        return None, [], f"❌ SCORM content rejected — {_scorm_reason}. Upload the raw MP4/MP3/WAV source file."
+
+
     pipeline = get_pipeline()
     cid      = course_id or Path(video_file.name).stem
     out_dir  = os.path.join(_get_output_dir(), cid)
@@ -458,6 +465,8 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
         for tgt, info in summary["dubbing"].items():
             if info.get("output") and Path(info["output"]).exists():
                 all_files.append(info["output"])
+            if info.get("output_mp3") and Path(info["output_mp3"]).exists():
+                all_files.append(info["output_mp3"])
             sub_dir = Path(out_dir) / tgt
             for ext in (".srt", ".vtt", "_qa_cert.docx", "_metadata.json"):
                 p = sub_dir / f"{cid}_{tgt}{ext}"
@@ -776,6 +785,125 @@ def build_ui():
                 outputs=[rv_table, _rev_state, rv_stats],
             )
 
+        # ── Tab 5: Corrections ────────────────────────────────
+        with gr.Tab("🔧 Corrections"):
+            gr.Markdown(
+                "**Correction Cycle Tracker — KB Tender §5.1B**  \n"
+                "Raise a ticket when KB flags an issue. Deadline: **5 calendar days** from feedback.  \n"
+                "Delay penalty: **0.5% per week** (or part thereof) beyond deadline."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### Raise New Correction Ticket")
+                    ct_course    = gr.Textbox(label="Course ID", placeholder="KB_COURSE_001")
+                    ct_lang      = gr.Dropdown(tgt_choices, value="hin", label="Language")
+                    ct_feedback  = gr.Textbox(label="Feedback from KB / Verification Agency",
+                                              lines=3, placeholder="Describe the issue flagged...")
+                    ct_raised_by = gr.Textbox(label="Raised By", value="KB Verification Agency")
+                    ct_date      = gr.Textbox(label="Feedback Date (YYYY-MM-DD, blank=today)",
+                                              placeholder="2025-07-15")
+                    ct_raise_btn = gr.Button("📨 Raise Ticket", variant="primary")
+                    ct_raise_log = gr.Textbox(label="Status", lines=2, interactive=False)
+                with gr.Column(scale=3):
+                    gr.Markdown("### Open / In-Progress Tickets")
+                    ct_table = gr.Dataframe(
+                        headers=["Ticket ID","Course","Lang","Status","Feedback","Deadline","Penalty"],
+                        datatype=["str","str","str","str","str","str","str"],
+                        interactive=False, wrap=True, label="Correction Tickets"
+                    )
+                    ct_refresh_btn = gr.Button("🔄 Refresh Tickets")
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### Update / Close Ticket")
+                    ct_ticket_id  = gr.Textbox(label="Ticket ID (e.g. COR-0001)")
+                    ct_resolution = gr.Textbox(label="Resolution / Corrective Action", lines=3,
+                                               placeholder="Describe what was corrected...")
+                    ct_closed_by  = gr.Textbox(label="Closed By", value="Translation Agency")
+                    with gr.Row():
+                        ct_inprog_btn = gr.Button("⏳ Mark In Progress")
+                        ct_close_btn  = gr.Button("✅ Close Ticket", variant="primary")
+                    ct_close_log  = gr.Textbox(label="Status", lines=2, interactive=False)
+                with gr.Column(scale=2):
+                    gr.Markdown("### Export Closure Report")
+                    ct_rep_course = gr.Textbox(label="Course ID (blank = all courses)")
+                    ct_rep_lang   = gr.Dropdown(
+                        [("All languages", "")] + list(tgt_choices),
+                        value="", label="Language (blank = all)"
+                    )
+                    ct_rep_agency = gr.Textbox(label="Agency Name", value="Translation Agency")
+                    ct_rep_btn    = gr.Button("📄 Export Closure Report (.docx)", variant="primary")
+                    ct_rep_dl     = gr.File(label="⬇️ Download Closure Report")
+                    ct_rep_log    = gr.Textbox(label="Status", lines=2, interactive=False)
+
+            def _ct_load():
+                from pipeline.correction_tracker import get_all_tickets, tickets_to_rows
+                return tickets_to_rows(get_all_tickets())
+
+            def _ct_raise(course, lang, feedback, raised_by, date_str):
+                from pipeline.correction_tracker import raise_ticket
+                if not course or not feedback:
+                    return _ct_load(), "❌ Course ID and feedback are required."
+                try:
+                    fd = date_str.strip() if date_str and date_str.strip() else None
+                    if fd:
+                        import datetime as _dt; _dt.datetime.fromisoformat(fd)
+                    t = raise_ticket(course, lang, feedback,
+                                     raised_by=raised_by or "KB Verification Agency",
+                                     feedback_date=fd)
+                    return _ct_load(), f"✅ {t['ticket_id']} raised. Deadline: {t['deadline'][:10]}"
+                except Exception as e:
+                    return _ct_load(), f"❌ {e}"
+
+            def _ct_inprog(ticket_id):
+                from pipeline.correction_tracker import update_ticket_status
+                if not (ticket_id or "").strip():
+                    return _ct_load(), "❌ Enter a Ticket ID."
+                t = update_ticket_status(ticket_id.strip(), "in_progress")
+                return _ct_load(), (f"⏳ {ticket_id} marked in_progress." if t
+                                    else f"❌ Ticket {ticket_id} not found.")
+
+            def _ct_close(ticket_id, resolution, closed_by):
+                from pipeline.correction_tracker import close_ticket
+                if not (ticket_id or "").strip() or not (resolution or "").strip():
+                    return _ct_load(), "❌ Ticket ID and resolution are required."
+                t = close_ticket(ticket_id.strip(), resolution=resolution,
+                                 closed_by=closed_by or "Translation Agency")
+                if t:
+                    pen = t["penalty_pct"]
+                    return _ct_load(), (f"✅ {ticket_id} closed. "
+                                        + (f"⚠️ Penalty: {pen:.1f}%" if pen > 0 else "✅ No penalty"))
+                return _ct_load(), f"❌ Ticket {ticket_id} not found."
+
+            def _ct_export(course, lang, agency):
+                from pipeline.correction_tracker import (
+                    get_all_tickets, get_tickets_for_course, export_closure_report)
+                course = (course or "").strip(); lang = (lang or "").strip()
+                tickets = (get_tickets_for_course(course, lang or None) if course
+                           else [t for t in get_all_tickets()
+                                 if not lang or t["tgt_lang"] == lang])
+                if not tickets:
+                    return None, "❌ No tickets found for the selected filter."
+                label = f"{course or 'all'}_{lang or 'all'}"
+                out = os.path.join(_get_output_dir(), f"KB_Correction_Closure_{label}.docx")
+                try:
+                    export_closure_report(tickets, out, agency_name=agency or "Translation Agency")
+                    return out, f"✅ Saved → {Path(out).name} ({len(tickets)} tickets)"
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            ct_raise_btn.click(_ct_raise,
+                inputs=[ct_course, ct_lang, ct_feedback, ct_raised_by, ct_date],
+                outputs=[ct_table, ct_raise_log])
+            ct_refresh_btn.click(_ct_load, outputs=[ct_table])
+            ct_inprog_btn.click(_ct_inprog,
+                inputs=[ct_ticket_id], outputs=[ct_table, ct_close_log])
+            ct_close_btn.click(_ct_close,
+                inputs=[ct_ticket_id, ct_resolution, ct_closed_by],
+                outputs=[ct_table, ct_close_log])
+            ct_rep_btn.click(_ct_export,
+                inputs=[ct_rep_course, ct_rep_lang, ct_rep_agency],
+                outputs=[ct_rep_dl, ct_rep_log])
+
         # ── Tab 5: Settings ───────────────────────────────────
         with gr.Tab("⚙️ Settings"):
             with gr.Row():
@@ -785,6 +913,17 @@ def build_ui():
                                           type="password", placeholder="hf_...")
                     save_btn    = gr.Button("💾 Save Token", variant="primary")
                     save_status = gr.Textbox(label="Status", lines=2, interactive=False)
+                    gr.Markdown("---")
+                    from pipeline.sovereign_guard import sovereign_mode_enabled
+                    _sov = ("🔒 ENABLED — Foreign LLM APIs blocked"
+                            if sovereign_mode_enabled() else "⚠️ DISABLED (non-KB only)")
+                    gr.Markdown(
+                        "### 🇮🇳 Sovereign AI Compliance — KB Tender RFB IN-KBL-543730-NC-RFB\n"
+                        f"**Status: {_sov}**  \n"
+                        "All core AI (ASR/Translation/TTS) runs fully **offline on-premise**.  \n"
+                        "Set `KB_SOVEREIGN_MODE=1` in `.env` to block foreign LLM APIs.  \n"
+                        "> Compliant: IT Act 2000 · DPDP Act 2023 · MeitY cloud policy."
+                    )
                     gr.Markdown("---")
                     out_dir_box = gr.Textbox(
                         label="📂 Output Save Folder",
@@ -814,9 +953,9 @@ def build_ui():
                 # ── Tab 6: Monthly Delivery Tracker ──────────────────
         with gr.Tab("📅 Monthly Delivery"):
             gr.Markdown(
-                "**Monthly Delivery Tracker — KB Tender §4.4**  \n"
-                "Track course hours delivered per month. SLA: 50–125 hrs/month. "
-                "Generate Month-wise Submission Report for CBP portal upload."
+                "**Monthly Delivery Tracker — KB Tender §4.4 + §5.1B SLA Penalties**  \n"
+                "Schedule: 1→50|2→55|3→100|4→125|5→100|6→125|7→100|8→125|9→100|10→125|11→100 hrs  \n"
+                "Penalty: <5%=none | 5–10%=2% | 10–20%=4% | >20%=5%"
             )
             with gr.Row():
                 with gr.Column(scale=2):
@@ -833,7 +972,7 @@ def build_ui():
                         interactive=False,
                         label="Monthly Submissions"
                     )
-                    md_summary = gr.Textbox(label="Monthly Summary", lines=5, interactive=False)
+                    md_summary = gr.Textbox(label="Monthly SLA Summary (KB Tender §5.1B)", lines=8, interactive=False)
             with gr.Row():
                 md_report_btn = gr.Button("📄 Export Month-wise Submission Report (.xlsx)", variant="primary")
                 md_complete_btn = gr.Button("📦 Export Consolidated Completion Report (.xlsx)")
@@ -841,25 +980,30 @@ def build_ui():
                 md_dl  = gr.File(label="⬇️ Download Report")
                 md_log = gr.Textbox(label="Status", lines=3, interactive=False)
 
-            def _md_add(month, course, langs, hours, rows):
-                if not month or not course:
-                    return rows, rows, "❌ Month and Course ID are required."
-                total_this_month = sum(r["hours"] for r in rows if r["month"] == month) + hours
-                status = "✅ On track" if total_this_month <= 125 else "⚠️ Exceeds 125hr SLA cap"
-                if total_this_month < 50:
-                    status = "⚠️ Below 50hr minimum"
+            def _md_add(month_str, course, langs, hours, rows):
+                from pipeline.sla_penalty import compute_sla, MONTHLY_SCHEDULE
+                from collections import defaultdict
+                if not month_str or not course:
+                    return rows, [[r["month"],r["course"],r["langs"],r["hours"],r.get("status","")] for r in rows], "❌ Month and Course ID are required."
+                try:
+                    month = int(str(month_str).strip())
+                except ValueError:
+                    return rows, [[r["month"],r["course"],r["langs"],r["hours"],r.get("status","")] for r in rows], "❌ Month must be 1–11."
                 rows = rows + [{"month": month, "course": course,
-                                "langs": ", ".join(langs), "hours": hours, "status": status}]
-                table = [[r["month"], r["course"], r["langs"], r["hours"], r["status"]] for r in rows]
-                months = sorted(set(r["month"] for r in rows))
-                summary_lines = []
-                for m in months:
-                    mrows = [r for r in rows if r["month"] == m]
-                    total = sum(r["hours"] for r in mrows)
-                    courses = len(mrows)
-                    flag = "✅" if 50 <= total <= 125 else "⚠️"
-                    summary_lines.append(f"{flag} {m}: {total:.1f} hrs across {courses} course(s)")
-                return rows, table, "\n".join(summary_lines)
+                                "langs": ", ".join(langs), "hours": hours}]
+                mh = defaultdict(float)
+                for r in rows: mh[r["month"]] += r["hours"]
+                table = []
+                for r in rows:
+                    sla = compute_sla(r["month"], mh[r["month"]])
+                    r["status"] = sla["status"]
+                    table.append([str(r["month"]),r["course"],r["langs"],r["hours"],sla["status"]])
+                lines = ["KB Tender §5.1B — SLA per Month", "-"*52]
+                for m in sorted(mh):
+                    sla = compute_sla(m, mh[m])
+                    tgt = MONTHLY_SCHEDULE.get(m, 0)
+                    lines.append(f"Month {m:>2}: {mh[m]:>6.1f}/{tgt:<5.0f}h  shortfall {sla['shortfall_pct']:>5.1f}%  penalty {sla['penalty_pct']:.0f}%  {sla['status']}")
+                return rows, table, "\n".join(lines)
 
             def _md_export_monthly(rows):
                 if not rows:
@@ -868,10 +1012,14 @@ def build_ui():
                     import openpyxl
                     wb = openpyxl.Workbook()
                     ws = wb.active
+                    from pipeline.sla_penalty import compute_sla
                     ws.title = "Monthly Submission"
-                    ws.append(["Month", "Course ID", "Languages Delivered", "Hours", "Status"])
+                    ws.append(["Month","Course ID","Languages Delivered","Hours","Target Hours","Shortfall %","Penalty %","SLA Status"])
+                    _mh = {}
+                    for r in rows: _mh[r["month"]] = _mh.get(r["month"], 0) + r["hours"]
                     for r in rows:
-                        ws.append([r["month"], r["course"], r["langs"], r["hours"], r["status"]])
+                        _s = compute_sla(r["month"], _mh[r["month"]])
+                        ws.append([r["month"],r["course"],r["langs"],r["hours"],_s["target_hours"],_s["shortfall_pct"],_s["penalty_pct"],_s["status"]])
                     out = os.path.join(_get_output_dir(), "KB_Monthly_Submission_Report.xlsx")
                     wb.save(out)
                     return out, f"✅ Saved → {Path(out).name}"
@@ -879,30 +1027,94 @@ def build_ui():
                     return None, f"❌ {e}"
 
             def _md_export_completion(rows):
-                if not rows:
-                    return None, "❌ No entries to export."
+                """KB §4.6 — Consolidated Completion Report + Handover Package."""
                 try:
-                    import openpyxl
-                    wb = openpyxl.Workbook()
-                    ws = wb.active
-                    ws.title = "Completion Report"
-                    ws.append(["Month", "Course ID", "Languages Delivered", "Hours", "Status"])
-                    for r in rows:
-                        ws.append([r["month"], r["course"], r["langs"], r["hours"], r["status"]])
-                    # Summary sheet
-                    ws2 = wb.create_sheet("Summary")
-                    ws2.append(["Month", "Total Hours", "Total Courses", "SLA Status"])
-                    months = sorted(set(r["month"] for r in rows))
-                    for m in months:
-                        mrows = [r for r in rows if r["month"] == m]
-                        total = sum(r["hours"] for r in mrows)
-                        flag = "On track" if 50 <= total <= 125 else "SLA breach"
-                        ws2.append([m, round(total, 2), len(mrows), flag])
-                    out = os.path.join(_get_output_dir(), "KB_Consolidated_Completion_Report.xlsx")
-                    wb.save(out)
-                    return out, f"✅ Saved → {Path(out).name}"
+                    pipeline = get_pipeline()
+                    pkg = pipeline.generate_handover_package(
+                        output_dir=_get_output_dir(),
+                        agency_name="Translation Agency",
+                    )
+                    msg = (
+                        f"✅ Handover package ready → {Path(pkg['handover_zip']).name}  |  "
+                        f"{pkg['total_courses']} courses  |  {pkg['total_languages']} languages  |  "
+                        f"{pkg['total_hours']:.1f} h  |  {pkg['total_assets']} assets"
+                    )
+                    return pkg["handover_zip"], msg
                 except Exception as e:
                     return None, f"❌ {e}"
+
+            gr.Markdown("---")
+            gr.Markdown(
+                "### 📋 Inception Report — Payment Milestone 1 (KB §4.1)  \n"
+                "Submit within **T0+15 calendar days** to trigger **15% payment**.  \n"
+                "Covers: contract details · course inventory · language routing · "
+                "AI stack · 11-month delivery plan · team plan · QA process · "
+                "risk register · payment milestones."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    ir_agency   = gr.Textbox(label="Agency Name",
+                                             value="Translation Agency")
+                    ir_address  = gr.Textbox(label="Agency Address",
+                                             placeholder="e.g. 123 MG Road, Bengaluru")
+                    ir_contact  = gr.Textbox(label="Contact Person",
+                                             placeholder="e.g. Dr. Priya Nair")
+                    ir_email    = gr.Textbox(label="Contact Email",
+                                             placeholder="e.g. priya@agency.in")
+                    ir_t0       = gr.Textbox(label="Contract Start Date T0 (YYYY-MM-DD, blank=today)",
+                                             placeholder="2025-07-01")
+                    ir_courses  = gr.Textbox(
+                        label="Course IDs (comma-separated, blank=TBC)",
+                        placeholder="KB_COURSE_001, KB_COURSE_002"
+                    )
+                    ir_langs    = gr.CheckboxGroup(
+                        tgt_choices, value=KB_11,
+                        label="Target Languages in Scope"
+                    )
+                    with gr.Row():
+                        gr.Button("KB 11", size="sm").click(
+                            lambda: KB_11, outputs=[ir_langs])
+                        gr.Button("All 22", size="sm").click(
+                            lambda: [c for _, c in tgt_choices], outputs=[ir_langs])
+                    ir_btn = gr.Button(
+                        "📋 Generate Inception Report (.docx)",
+                        variant="primary"
+                    )
+                with gr.Column(scale=2):
+                    ir_dl  = gr.File(label="⬇️ Download Inception Report (.docx)")
+                    ir_log = gr.Textbox(label="Status", lines=4, interactive=False)
+
+            def _ir_generate(agency, address, contact, email, t0, courses_str, langs):
+                if not langs:
+                    return None, "❌ Select at least one target language."
+                try:
+                    pipeline = get_pipeline()
+                    course_ids = [c.strip() for c in courses_str.split(",") if c.strip()]
+                    out = os.path.join(_get_output_dir(), "KB_Inception_Report.docx")
+                    pipeline.generate_inception_report(
+                        course_ids=course_ids,
+                        tgt_langs=langs,
+                        output_dir=_get_output_dir(),
+                        output_path=out,
+                        agency_name=agency or "Translation Agency",
+                        agency_address=address or "",
+                        contact_person=contact or "",
+                        contact_email=email or "",
+                        t0_date=t0.strip() if t0 and t0.strip() else "",
+                    )
+                    return out, (
+                        f"✅ Inception Report generated → {Path(out).name}  |  "
+                        f"{len(course_ids)} course(s)  |  {len(langs)} language(s)"
+                    )
+                except Exception as e:
+                    return None, f"❌ {e}"
+
+            ir_btn.click(
+                _ir_generate,
+                inputs=[ir_agency, ir_address, ir_contact, ir_email,
+                        ir_t0, ir_courses, ir_langs],
+                outputs=[ir_dl, ir_log],
+            )
 
             md_add_btn.click(
                 _md_add,
@@ -913,6 +1125,77 @@ def build_ui():
             md_complete_btn.click(_md_export_completion, inputs=[md_state], outputs=[md_dl, md_log])
 
         # ── Tab 7: Glossary ───────────────────────────────────
+        # -- Tab 8: POC Package --
+        with gr.Tab("POC Package"):
+            gr.Markdown(
+                "**Proof of Concept Packager - 50 Technical Marks (KB Tender)**  \n"
+                "Dub one course into **Hindi + Punjabi** and bundle all outputs into a "
+                "ZIP with a cover note for drive-link submission to the evaluation committee."
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    poc_video   = gr.File(
+                        label="Source Video / Audio (MP4 / MP3 / WAV)",
+                        file_types=[".mp4", ".mp3", ".wav", ".flac", ".webm"]
+                    )
+                    poc_id      = gr.Textbox(label="Course ID", value="KB_POC_001")
+                    poc_src     = gr.Dropdown(src_choices, value="eng", label="Source Language")
+                    poc_agency  = gr.Textbox(label="Agency Name", value="Translation Agency")
+                    poc_contact = gr.Textbox(label="Contact Person", placeholder="Dr. Priya Nair")
+                    poc_email   = gr.Textbox(label="Contact Email", placeholder="priya@agency.in")
+                    poc_force   = gr.Checkbox(label="Force re-dub (ignore existing output)", value=False)
+                    poc_only    = gr.Checkbox(label="Package only (skip dubbing)", value=False)
+                    poc_btn     = gr.Button("Run + Package POC", variant="primary", size="lg")
+                with gr.Column(scale=2):
+                    poc_dl  = gr.File(label="Download POC ZIP (upload to drive link)")
+                    poc_log = gr.Textbox(label="Status", lines=8, interactive=False)
+
+            def _poc_run(video_file, course_id, src_lang, agency, contact, email,
+                         force, package_only, progress=gr.Progress()):
+                import sys as _sys
+                _sys.path.insert(0, str(Path(__file__).parent.parent))
+                from scripts.poc_package import _dub_poc, build_poc_package
+                cid     = course_id or "KB_POC_001"
+                out_dir = _get_output_dir()
+                lines   = []
+                if not package_only:
+                    if video_file is None:
+                        return None, "Upload a video file or tick Package only."
+                    if not _job_semaphore.acquire(blocking=False):
+                        return None, "Another job is running. Please wait."
+                    try:
+                        progress(0.1, desc="Dubbing Hindi + Punjabi...")
+                        results = _dub_poc(video_file.name, src_lang, cid, out_dir, force)
+                        for lang, r in results.items():
+                            from pipeline.lang_config import LANG_NAMES
+                            status = "OK" if r.success else ("FAILED: " + r.error[:60])
+                            lines.append(LANG_NAMES.get(lang, lang) + ": " + status)
+                    finally:
+                        _job_semaphore.release()
+                progress(0.85, desc="Packaging...")
+                try:
+                    zip_path = build_poc_package(
+                        course_id=cid, output_dir=out_dir,
+                        agency_name=agency or "Translation Agency",
+                        contact_person=contact or "",
+                        contact_email=email or "",
+                    )
+                    size_mb = round(Path(zip_path).stat().st_size / 1024 / 1024, 1)
+                    lines.append("POC ZIP ready: " + Path(zip_path).name + " (" + str(size_mb) + " MB)")
+                    lines.append("Upload this ZIP to your drive link for the evaluation committee.")
+                    progress(1.0, desc="Done!")
+                    return zip_path, "\n".join(lines)
+                except Exception as e:
+                    return None, "ERROR: " + str(e)
+
+            poc_btn.click(
+                _poc_run,
+                inputs=[poc_video, poc_id, poc_src, poc_agency,
+                        poc_contact, poc_email, poc_force, poc_only],
+                outputs=[poc_dl, poc_log],
+            )
+
+
         with gr.Tab("📖 Glossary"):
             gr.Markdown(
                 "**Standardised Terminology Glossary — KB Tender Final Deliverable**  \n"
