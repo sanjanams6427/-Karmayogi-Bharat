@@ -1329,7 +1329,468 @@ def build_ui():
             gl_export_btn.click(_gl_export, inputs=[gl_state], outputs=[gl_dl, gl_log])
             gl_import_btn.click(_gl_import, inputs=[gl_import_file, gl_state], outputs=[gl_state, gl_table, gl_log])
 
-        # ── Tab 8: Live Logs ──────────────────────────────────
+        # ── Tab: Segment Edit Suite ───────────────────────────
+        with gr.Tab("✂️ Segment Edit Suite"):
+            gr.Markdown(
+                "**Interactive Dubbing Workflow — Full Control Per Segment**\n\n"
+                "Instead of one-shotting the entire video, this gives you control:\n"
+                "1. **Extract** — ASR the video, see all segments with timestamps\n"
+                "2. **Edit** — Skip segments (music), keep original (don't translate)\n"
+                "3. **Translate** — Translate segment by segment, see estimated duration\n"
+                "4. **TTS** — Generate audio per segment, hear each one\n"
+                "5. **Adjust** — Edit translations, change speed limits, re-generate\n"
+                "6. **Stitch** — Assemble final video from approved segments only"
+            )
+            
+            # Session state
+            _ses_state = gr.State(None)  # EditSession object or None
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 1️⃣ Create Session")
+                    ses_video = gr.File(
+                        label="Video / Audio File",
+                        file_types=[".mp4", ".mp3", ".wav", ".webm"]
+                    )
+                    ses_src = gr.Dropdown(src_choices, value="eng", label="Source Language")
+                    ses_tgt = gr.Dropdown(tgt_choices, value="hin", label="Target Language")
+                    ses_id  = gr.Textbox(label="Course ID", value="EDIT_SESSION", 
+                                         placeholder="e.g. KB_COURSE_001")
+                    ses_create_btn = gr.Button("🎬 Create Session (Extract + ASR)", variant="primary")
+                    ses_load_btn   = gr.Button("📂 Load Existing Session")
+                    ses_status = gr.Textbox(label="Session Status", lines=4, interactive=False)
+                
+                with gr.Column(scale=3):
+                    gr.Markdown("### 2️⃣ Segment Table")
+                    ses_table = gr.Dataframe(
+                        headers=["ID", "Time", "Orig Dur", "Source Text", "Action", 
+                                 "Translation", "TTS Dur", "Score", "Status"],
+                        datatype=["number", "str", "str", "str", "str", "str", "str", "str", "str"],
+                        interactive=False,
+                        wrap=True,
+                        label="Segments (click row to select)"
+                    )
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    gr.Markdown("### 3️⃣ Segment Actions")
+                    ses_seg_id = gr.Number(label="Selected Segment ID", value=0, precision=0)
+                    ses_thumbnail = gr.Image(label="Segment Preview", height=150, visible=True)
+                    with gr.Row():
+                        ses_translate_btn = gr.Button("🌐 Translate")
+                        ses_skip_btn = gr.Button("⏭️ Skip")
+                        ses_keep_btn = gr.Button("🔊 Keep Original")
+                    ses_edit_trans = gr.Textbox(label="Edit Translation", lines=2)
+                    ses_save_edit_btn = gr.Button("💾 Save Edit")
+                    ses_tts_btn = gr.Button("🔊 Generate TTS")
+                    ses_audio_preview = gr.Audio(label="Audio Preview", type="filepath")
+                    
+                    gr.Markdown("**Fit Strategy (when audio > original):**")
+                    ses_fit_strategy = gr.Dropdown(
+                        choices=[
+                            ("⏩ Speed Up Audio", "speed_up"),
+                            ("📹+ Extend Video", "extend_video"),
+                            ("✂️ Trim Audio", "trim_audio"),
+                            ("🔄 Auto", "auto"),
+                        ],
+                        value="auto",
+                        label="Fit Strategy"
+                    )
+                    ses_max_speed = gr.Slider(1.0, 2.0, value=1.35, step=0.05, 
+                                              label="Max Speed (for Speed Up)")
+                    with gr.Row():
+                        ses_approve_btn = gr.Button("✅ Approve Segment")
+                        ses_reject_btn = gr.Button("❌ Reject Segment")
+                
+                with gr.Column(scale=1):
+                    gr.Markdown("### 4️⃣ Batch Operations")
+                    ses_auto_skip_btn = gr.Button("🔍 Auto-Detect Skip (music, empty)")
+                    ses_translate_all_btn = gr.Button("🌐 Translate All Pending", variant="primary")
+                    ses_tts_all_btn = gr.Button("🔊 Generate All TTS", variant="primary")
+                    ses_approve_all_btn = gr.Button("✅ Auto-Approve Non-Overflow")
+                    ses_auto_fit_btn = gr.Button("🔄 Auto-Assign Fit Strategies")
+                    ses_extract_thumbs_btn = gr.Button("🖼️ Extract All Thumbnails")
+                    gr.Markdown("---")
+                    gr.Markdown("### 5️⃣ Final Assembly")
+                    ses_use_extended = gr.Checkbox(
+                        label="Use Extended Stitch (supports video extension)",
+                        value=True
+                    )
+                    ses_mix_bgm = gr.Checkbox(label="Mix Original BGM", value=True)
+                    ses_bgm_vol = gr.Slider(0.0, 0.5, value=0.15, step=0.05, label="BGM Volume")
+                    ses_stitch_btn = gr.Button("🎬 Stitch Final Video", variant="primary", size="lg")
+                    ses_dl = gr.File(label="⬇️ Download Output")
+                    ses_final_info = gr.Textbox(label="Final Duration Info", lines=2, interactive=False)
+            
+            ses_log = gr.Textbox(label="Log", lines=5, interactive=False)
+            
+            # ── Handler functions ─────────────────────────────
+            def _ses_create(video_file, src_lang, tgt_lang, course_id):
+                if video_file is None:
+                    return None, [], "❌ Upload a video file first.", ""
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    session = editor.create_session(
+                        video_file.name, src_lang, tgt_lang,
+                        _get_output_dir(), course_id or "EDIT_SESSION"
+                    )
+                    stats = session.stats()
+                    status = (
+                        f"✅ Session created: {session.session_id}\n"
+                        f"Segments: {stats['total_segments']}\n"
+                        f"Duration: {session.video_duration:.1f}s\n"
+                        f"Step: {session.step}"
+                    )
+                    return session, segments_to_table(session), status, ""
+                except Exception as e:
+                    return None, [], f"❌ {e}", ""
+            
+            def _ses_refresh_table(session):
+                if session is None:
+                    return []
+                from pipeline.segment_editor import segments_to_table
+                return segments_to_table(session)
+            
+            def _ses_set_action(session, seg_id, action_str):
+                if session is None:
+                    return session, [], f"❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, SegmentAction, segments_to_table
+                    editor = SegmentEditor()
+                    editor.set_segment_action(session, int(seg_id), SegmentAction(action_str))
+                    return session, segments_to_table(session), f"✅ Segment {int(seg_id)} → {action_str}"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_translate_one(session, seg_id):
+                if session is None:
+                    return session, [], "", "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    seg = editor.translate_segment(session, int(seg_id))
+                    return (session, segments_to_table(session), seg.translated_text,
+                            f"✅ Translated seg {int(seg_id)}: score={seg.translation_score:.2f}")
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], "", f"❌ {e}"
+            
+            def _ses_save_edit(session, seg_id, new_text):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    editor.edit_translation(session, int(seg_id), new_text)
+                    return session, segments_to_table(session), f"✅ Saved edit for segment {int(seg_id)}"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_tts_one(session, seg_id):
+                if session is None:
+                    return session, [], None, "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    seg = editor.synthesize_segment(session, int(seg_id))
+                    audio_path = seg.tts_audio_path if Path(seg.tts_audio_path).exists() else None
+                    return (session, segments_to_table(session), audio_path,
+                            f"✅ TTS seg {int(seg_id)}: {seg.tts_duration:.2f}s ({seg.duration_ratio:.2f}x)")
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], None, f"❌ {e}"
+            
+            def _ses_set_speed(session, seg_id, max_speed):
+                if session is None:
+                    return session, "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor
+                    editor = SegmentEditor()
+                    editor.set_segment_max_speed(session, int(seg_id), max_speed)
+                    return session, f"✅ Segment {int(seg_id)} max speed → {max_speed:.2f}x"
+                except Exception as e:
+                    return session, f"❌ {e}"
+            
+            def _ses_approve(session, seg_id):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    editor.approve_segment(session, int(seg_id))
+                    return session, segments_to_table(session), f"✅ Segment {int(seg_id)} approved"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_reject(session, seg_id):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    editor.reject_segment(session, int(seg_id))
+                    return session, segments_to_table(session), f"✅ Segment {int(seg_id)} rejected"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_auto_skip(session):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    count = editor.auto_detect_skip(session)
+                    return session, segments_to_table(session), f"✅ Auto-marked {count} segments for skip"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_translate_all(session, progress=gr.Progress()):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    
+                    # Mark all pending as translate first
+                    editor.set_all_translate(session)
+                    
+                    def _prog(i, total):
+                        progress(i / total, desc=f"Translating {i}/{total}...")
+                    
+                    translated = editor.translate_all(session, progress_callback=_prog)
+                    return session, segments_to_table(session), f"✅ Translated {len(translated)} segments"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_tts_all(session, progress=gr.Progress()):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    
+                    def _prog(i, total):
+                        progress(i / total, desc=f"TTS {i}/{total}...")
+                    
+                    synthesized = editor.synthesize_all(session, progress_callback=_prog)
+                    return session, segments_to_table(session), f"✅ Generated TTS for {len(synthesized)} segments"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_approve_all(session):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    count = editor.approve_all_non_overflow(session)
+                    return session, segments_to_table(session), f"✅ Auto-approved {count} segments"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_stitch(session, use_extended, mix_bgm, bgm_vol):
+                if session is None:
+                    return session, [], None, "❌ No session loaded.", ""
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    
+                    if use_extended:
+                        result = editor.stitch_with_extensions(
+                            session,
+                            mix_original_bgm=mix_bgm,
+                            bgm_volume=bgm_vol,
+                        )
+                        duration_info = (
+                            f"Original: {result['original_duration']:.1f}s | "
+                            f"Final: {result['final_duration']:.1f}s | "
+                            f"Extended by: {result['total_extension']:.1f}s"
+                        )
+                    else:
+                        result = editor.stitch(session)
+                        duration_info = f"Duration: {session.video_duration:.1f}s"
+                    
+                    return (session, segments_to_table(session), result["output_video"],
+                            f"✅ Stitched! Output: {Path(result['output_video']).name}",
+                            duration_info)
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], None, f"❌ {e}", ""
+            
+            def _ses_set_fit_strategy(session, seg_id, fit_strategy):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    editor.set_fit_strategy(session, int(seg_id), fit_strategy)
+                    return session, segments_to_table(session), f"✅ Segment {int(seg_id)} fit strategy → {fit_strategy}"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_auto_fit_strategies(session):
+                if session is None:
+                    return session, [], "❌ No session loaded.", ""
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    editor.auto_assign_fit_strategies(session)
+                    total_ext = editor.get_total_extension(session)
+                    final_dur = editor.get_final_duration(session)
+                    info = f"Total extension: +{total_ext:.1f}s → Final: {final_dur:.1f}s"
+                    return session, segments_to_table(session), f"✅ Auto-assigned fit strategies", info
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}", ""
+            
+            def _ses_extract_thumbnails(session, progress=gr.Progress()):
+                if session is None:
+                    return session, [], "❌ No session loaded."
+                try:
+                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    editor = SegmentEditor()
+                    
+                    def _prog(i, total):
+                        progress(i / total, desc=f"Extracting thumbnails {i}/{total}...")
+                    
+                    editor.extract_all_thumbnails(session, progress_callback=_prog)
+                    return session, segments_to_table(session), f"✅ Extracted {len(session.segments)} thumbnails"
+                except Exception as e:
+                    return session, segments_to_table(session) if session else [], f"❌ {e}"
+            
+            def _ses_get_thumbnail(session, seg_id):
+                if session is None:
+                    return None
+                try:
+                    from pipeline.segment_editor import SegmentEditor
+                    editor = SegmentEditor()
+                    seg = editor._get_segment(session, int(seg_id))
+                    if seg.thumbnail_path and Path(seg.thumbnail_path).exists():
+                        return seg.thumbnail_path
+                    # Try to extract on-demand
+                    thumb_path = editor.extract_thumbnail(session, int(seg_id))
+                    return thumb_path if thumb_path else None
+                except Exception:
+                    return None
+            
+            def _ses_get_segment_info(session, seg_id):
+                """Get segment info for UI display when segment is selected."""
+                if session is None:
+                    return "", "auto", None
+                try:
+                    from pipeline.segment_editor import SegmentEditor
+                    editor = SegmentEditor()
+                    seg = editor._get_segment(session, int(seg_id))
+                    
+                    # Get translation text
+                    trans = seg.translated_text
+                    
+                    # Get fit strategy
+                    fit = seg.fit_strategy.value
+                    
+                    # Get thumbnail
+                    thumb = seg.thumbnail_path if seg.thumbnail_path and Path(seg.thumbnail_path).exists() else None
+                    
+                    return trans, fit, thumb
+                except Exception:
+                    return "", "auto", None
+            
+            # ── Wire up handlers ──────────────────────────────
+            ses_create_btn.click(
+                _ses_create,
+                inputs=[ses_video, ses_src, ses_tgt, ses_id],
+                outputs=[_ses_state, ses_table, ses_status, ses_log]
+            )
+            
+            ses_skip_btn.click(
+                lambda s, i: _ses_set_action(s, i, "skip"),
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_keep_btn.click(
+                lambda s, i: _ses_set_action(s, i, "keep_orig"),
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_translate_btn.click(
+                _ses_translate_one,
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_edit_trans, ses_log]
+            )
+            ses_save_edit_btn.click(
+                _ses_save_edit,
+                inputs=[_ses_state, ses_seg_id, ses_edit_trans],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_tts_btn.click(
+                _ses_tts_one,
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_audio_preview, ses_log]
+            )
+            ses_max_speed.change(
+                _ses_set_speed,
+                inputs=[_ses_state, ses_seg_id, ses_max_speed],
+                outputs=[_ses_state, ses_log]
+            )
+            ses_approve_btn.click(
+                _ses_approve,
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_reject_btn.click(
+                _ses_reject,
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            
+            ses_auto_skip_btn.click(
+                _ses_auto_skip,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_translate_all_btn.click(
+                _ses_translate_all,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_tts_all_btn.click(
+                _ses_tts_all,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_approve_all_btn.click(
+                _ses_approve_all,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_stitch_btn.click(
+                _ses_stitch,
+                inputs=[_ses_state, ses_use_extended, ses_mix_bgm, ses_bgm_vol],
+                outputs=[_ses_state, ses_table, ses_dl, ses_log, ses_final_info]
+            )
+            
+            # Fit strategy handlers
+            ses_fit_strategy.change(
+                _ses_set_fit_strategy,
+                inputs=[_ses_state, ses_seg_id, ses_fit_strategy],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            ses_auto_fit_btn.click(
+                _ses_auto_fit_strategies,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log, ses_final_info]
+            )
+            ses_extract_thumbs_btn.click(
+                _ses_extract_thumbnails,
+                inputs=[_ses_state],
+                outputs=[_ses_state, ses_table, ses_log]
+            )
+            
+            # Update segment info when segment ID changes
+            ses_seg_id.change(
+                _ses_get_segment_info,
+                inputs=[_ses_state, ses_seg_id],
+                outputs=[ses_edit_trans, ses_fit_strategy, ses_thumbnail]
+            )
+
+        # ── Tab 9: Live Logs ──────────────────────────────────
         with gr.Tab("📊 Live Logs"):
             gr.Markdown("Real-time pipeline logs. Auto-refreshes every 3 s.")
             log_box = gr.Textbox(value=_get_log, every=3,

@@ -969,6 +969,58 @@ class TTSEngine:
         self._write_silence(2.0, output_path)
         return output_path
 
+    def synthesize_single(self, text: str, lang: str, output_path: str) -> dict:
+        """
+        Synthesize a single segment and return metadata.
+        
+        Used by SegmentEditor for per-segment TTS with full info.
+        Returns: {"audio_path": str, "duration": float, "engine": str}
+        """
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        engine_used = "unknown"
+        
+        # Primary: Parler-TTS Indic Large
+        parler_text = self._normalize_text_for_tts(text, lang, for_mms=False)
+        if lang not in _PARLER_SKIP_LANGS:
+            for attempt in range(2):
+                if self._synthesize_parler(parler_text, lang, output_path):
+                    engine_used = "parler"
+                    break
+                log.warning(f"Parler attempt {attempt+1}/2 failed [{LANG_NAMES.get(lang, lang)}]")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        
+        # Fallback: MMS standalone VITS
+        if engine_used == "unknown":
+            mms_text = self._normalize_text_for_tts(text, lang, for_mms=True)
+            if self._synthesize_standalone_vits(mms_text, lang, output_path):
+                engine_used = "mms_vits"
+            else:
+                ok_list = self._synthesize_mms_batch([mms_text], lang, [output_path])
+                if ok_list and ok_list[0]:
+                    engine_used = "mms_adapter"
+        
+        # Final fallback: silence
+        if engine_used == "unknown" or not Path(output_path).exists():
+            log.error(f"All TTS engines failed [{LANG_NAMES.get(lang, lang)}] — writing silence")
+            self._write_silence(2.0, output_path)
+            engine_used = "silence"
+        
+        # Get duration
+        duration = 0.0
+        if Path(output_path).exists():
+            try:
+                info = sf.info(output_path)
+                duration = info.duration
+            except Exception:
+                pass
+        
+        return {
+            "audio_path": output_path,
+            "duration": duration,
+            "engine": engine_used,
+        }
+
     def synthesize_segments(self, segments: list[dict], lang: str,
                             output_dir: str) -> list[dict]:
         out_dir = Path(output_dir)
