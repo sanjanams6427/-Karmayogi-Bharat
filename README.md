@@ -8,21 +8,62 @@ All models run locally — no internet, no API keys, no data leaves the system.
 
 ## Quick Start
 
+### 1. Clone and Setup Environment
 ```bash
-pip install -r requirements.txt
+git clone <repo-url>
+cd -Karmayogi-Bharat
 
+# Create virtual environment
+python -m venv venv
+venv\Scripts\activate      # Windows
+# source venv/bin/activate  # Linux/Mac
+
+# Install PyTorch with CUDA first (required)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# Install remaining dependencies
+pip install -r requirements.txt
+```
+
+### 2. Configure Environment
+```bash
+# Copy example env file
+cp .env.example .env
+
+# Edit .env and add your HuggingFace token
+# Get token at: https://huggingface.co/settings/tokens
+```
+
+### 3. Download Models (~25GB)
+```bash
+python scripts/download_models.py
+```
+
+### 4. Run
+```bash
 # Run the UI
 python ui/app.py
 
 # CLI — dub a single language
-python scripts/dub.py --video course.mp4 --src eng --tgt kan --course-id MyCourse --output output
+python scripts/dub.py --video course.mp4 --src eng --tgt kan --course-id MyCourse
 
 # CLI — dub all 22 languages
-python scripts/dub.py --video course.mp4 --src eng --tgt all --course-id MyCourse --output output
+python scripts/dub.py --video course.mp4 --src eng --tgt all --course-id MyCourse
 
 # Force re-run (clears checkpoint + output)
 python scripts/dub.py --video course.mp4 --src eng --tgt kan --force
 ```
+
+---
+
+## System Requirements
+
+- **OS**: Windows 10/11, Linux (Ubuntu 20.04+), macOS
+- **GPU**: NVIDIA GPU with 8GB+ VRAM (12GB+ recommended for faster processing)
+- **RAM**: 16GB minimum, 32GB recommended
+- **Storage**: 50GB+ free space (25GB for models, rest for outputs)
+- **Python**: 3.10 or 3.11
+- **CUDA**: 12.1 (for GPU acceleration)
 
 ---
 
@@ -38,6 +79,7 @@ project/
 │   ├── dubbing_pipeline.py        # End-to-end orchestration, 6-step pipeline, multi-GPU
 │   ├── video_processor.py         # ffmpeg audio extraction, assembly, video muxing
 │   ├── glossary.py                # Per-language glossary injection (22 × JSON files)
+│   ├── segment_editor.py          # ★ NEW: Per-segment editing workflow
 │   ├── lang_config.py             # Language codes for all 3 engines + S2ST langs
 │   ├── quality.py                 # Heuristic + ChrF + back-translation quality scoring
 │   ├── subtitles.py               # SRT + VTT subtitle generation

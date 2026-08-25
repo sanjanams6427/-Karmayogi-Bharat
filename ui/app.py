@@ -1810,15 +1810,15 @@ if __name__ == "__main__":
     def _free_port(start: int = 7860, end: int = 7870) -> int:
         for port in range(start, end + 1):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                if s.connect_ex(("172.23.198.15", port)) != 0:
+                if s.connect_ex(("127.0.0.1", port)) != 0:
                     return port
         return start  # fallback — let Gradio raise the error
 
     PORT = _free_port()
     app  = build_ui()
-    print(f"UI running at http://172.23.198.15:{PORT}  (keep this tab open, just refresh on code changes)")
+    print(f"UI running at http://127.0.0.1:{PORT}")
     app.launch(
-        server_name="172.23.198.15",
+        server_name="0.0.0.0",
         server_port=PORT,
         share=False,
         inbrowser=False,
