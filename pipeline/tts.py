@@ -600,18 +600,16 @@ class TTSEngine:
         kwargs = dict(
             prompt_input_ids=prompt_ids.input_ids,
             prompt_attention_mask=prompt_ids.attention_mask,
+            attention_mask=desc_ids.attention_mask,
             do_sample=True,
             temperature=temperature,
+            repetition_penalty=1.3,
             max_new_tokens=max_tok,
         )
         if encoder_outputs is not None:
-            # Pass pre-computed encoder hidden states — skips text encoder entirely.
-            # attention_mask must match the encoder_outputs sequence length.
             kwargs["encoder_outputs"] = encoder_outputs
-            kwargs["attention_mask"] = desc_ids.attention_mask
         else:
             kwargs["input_ids"] = desc_ids.input_ids
-            kwargs["attention_mask"] = desc_ids.attention_mask
         return self._parler_model.generate(**kwargs)
 
     # Dravidian scripts need a lower silence threshold — Parler outputs lower amplitude
@@ -645,24 +643,22 @@ class TTSEngine:
             # No seed reset here — seed is pinned once before primer warmup.
             # Resetting per-batch causes voice drift between segments.
             temperature = 0.75  # higher = more natural Indian prosody, less robotic monotone
+            from transformers.modeling_outputs import BaseModelOutput
+            attn_b = desc_ids.attention_mask.expand(n, -1).contiguous()
             kwargs = dict(
                 prompt_input_ids=enc.input_ids,
                 prompt_attention_mask=enc.attention_mask,
+                attention_mask=attn_b,
                 do_sample=True,
                 temperature=temperature,
+                repetition_penalty=1.3,
                 max_new_tokens=max_tok,
             )
             if encoder_outputs is not None:
-                # Expand encoder_outputs to match batch size
-                from transformers.modeling_outputs import BaseModelOutput
-                hidden = encoder_outputs.last_hidden_state  # [1, seq, dim]
-                hidden_b = hidden.expand(n, -1, -1).contiguous()  # [n, seq, dim]
-                attn_b   = desc_ids.attention_mask.expand(n, -1).contiguous()
+                hidden_b = encoder_outputs.last_hidden_state.expand(n, -1, -1).contiguous()
                 kwargs["encoder_outputs"] = BaseModelOutput(last_hidden_state=hidden_b)
-                kwargs["attention_mask"]  = attn_b
             else:
-                kwargs["input_ids"]      = desc_ids.input_ids.expand(n, -1)
-                kwargs["attention_mask"] = desc_ids.attention_mask.expand(n, -1)
+                kwargs["input_ids"] = desc_ids.input_ids.expand(n, -1)
             import concurrent.futures
             def _run():
                 with torch.no_grad():
@@ -672,12 +668,15 @@ class TTSEngine:
             batch_timeout = ((self._PARLER_TIMEOUT_TEL if (len(sample_text) > 0 and sum(1 for c in sample_text if '\u0C00'<=c<='\u0C7F')/max(len(sample_text),1)>0.4)
                              else self._PARLER_TIMEOUT_DEVA if (len(sample_text) > 0 and deva_count / max(len(sample_text),1) > 0.4)
                              else self._PARLER_TIMEOUT_S))
+            # Batch timeout: base + 60s per extra item (not multiplicative — batching
+            # is faster than n sequential singles due to parallel decoding).
+            effective_timeout = batch_timeout + 60 * max(0, n - 1)
             # Always create a fresh executor — never reuse one whose thread may
             # still be running a timed-out generation (causes CUDA state corruption).
             _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             _fut = _ex.submit(_run)
             try:
-                gen = _fut.result(timeout=batch_timeout * n)
+                gen = _fut.result(timeout=effective_timeout)
             except concurrent.futures.TimeoutError:
                 log.error(f"Parler batch TIMEOUT [{lang}] {n} segs")
                 _ex.shutdown(wait=False)
@@ -804,18 +803,14 @@ class TTSEngine:
         tel_count = sum(1 for c in text if '\u0C00' <= c <= '\u0C7F')
         is_telugu = len(text) > 0 and (tel_count / max(len(text), 1)) > 0.4
         if is_devanagari or is_telugu:
-            # Hindi/Devanagari formal speech rate: ~3.0 words/sec (not 2.5).
-            # 2.5 over-allocated tokens and wasted GPU time on every segment.
-            # Telugu keeps 2.5 — longer akshara clusters need more tokens per word.
             words = max(len(text.split()), 1)
             rate  = 2.5 if is_telugu else 3.0
             tokens = int((words / rate) * 86 * 1.5)
-            # Telugu cap raised to 1200 (~14s) — 900 was cutting long sentences.
-            cap = 2000
+            cap = 1400  # ~16s max — ASR segments never exceed this in practice
         else:
             graphemes = self._count_graphemes(text)
             tokens = int(graphemes * 43 * 1.6)
-            cap = 2000
+            cap = 1400
         return min(max(tokens, 250), cap)
 
     # Per-segment generation timeout.
