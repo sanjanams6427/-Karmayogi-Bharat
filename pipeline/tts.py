@@ -848,6 +848,7 @@ class TTSEngine:
                 # a timed-out generation (causes CUDA state corruption on next call).
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 _fut = _ex.submit(_gen_no_grad_synth)
+                _timeout = self._PARLER_TIMEOUT_S  # Use class timeout
                 try:
                     gen = _fut.result(timeout=_timeout)
                 except concurrent.futures.TimeoutError:

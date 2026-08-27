@@ -41,7 +41,11 @@ python scripts/download_models.py
 
 ### 4. Run
 ```bash
-# Run the UI
+# ★ Web UI (FastAPI backend + interactive segment editor) — recommended
+python run_web.py
+# → opens http://localhost:8000 automatically
+
+# Run the Gradio UI (8-tab admin console)
 python ui/app.py
 
 # CLI — dub a single language
@@ -53,6 +57,56 @@ python scripts/dub.py --video course.mp4 --src eng --tgt all --course-id MyCours
 # Force re-run (clears checkpoint + output)
 python scripts/dub.py --video course.mp4 --src eng --tgt kan --force
 ```
+
+---
+
+## Web UI — Interactive Segment Editor (`run_web.py`)
+
+A browser-based dubbing studio backed by a FastAPI server. It exposes the
+per-segment editing workflow (ASR → translate → TTS → review → stitch) with
+live progress and audio/video preview — all served from a single command.
+
+```bash
+python run_web.py
+# → serves http://localhost:8000 and opens it in your browser
+
+# Options
+python run_web.py --host 0.0.0.0 --port 8000   # bind for LAN access
+python run_web.py --reload                       # dev auto-reload
+python run_web.py --no-browser                   # don't auto-open browser
+```
+
+**What it does**
+- `run_web.py` boots the FastAPI app in `api/server.py` via uvicorn.
+- The server serves the REST/SSE API **and** the static frontend in `web/`
+  (`index.html`, `app.js`, `style.css`) from the same origin — no separate
+  web server or CORS setup needed.
+- CORS middleware is enabled, so the API can also be called from other origins.
+
+**Workflow in the UI**
+1. Drag-and-drop a video/audio file, pick source + target language, create a session
+   (uploads the file, extracts audio, runs ASR — segments appear in a table).
+2. Translate All / Generate All TTS / Auto-Approve in batch, with a live progress bar.
+3. Click any segment to edit its translation, preview TTS audio + a frame thumbnail,
+   set a fit strategy (Auto / Speed Up / Extend Video / Trim), and Approve/Reject.
+4. Stitch the final video and download the dubbed MP4, with an original→final
+   duration-ratio check (warns if >120%).
+
+**Architecture**
+- `api/server.py` — core REST + **SSE** API under `/api/session/...`.
+- `api/web_routes.py` — a thin adapter router exposing the poll-based
+  `/api/sessions/...` + `/api/jobs/{id}` endpoints the frontend uses; long
+  operations run as background jobs and report progress via job polling.
+  Both routers share **one** editor instance and session registry.
+- `web/` — the static single-page frontend (vanilla JS, no build step).
+
+Long-running batch operations (Translate All, Generate TTS, Stitch) return a
+`job_id`; the UI polls `GET /api/jobs/{job_id}` for progress until completion.
+Uploaded videos are stored under `input/uploads/`; sessions are persisted to
+`output/sessions/<id>/session_state.json` so the server survives restarts.
+
+> **Dependencies:** the web UI needs `fastapi`, `uvicorn[standard]`, and
+> `python-multipart` (all in `requirements.txt`).
 
 ---
 
@@ -91,6 +145,18 @@ project/
 │   ├── sovereign_guard.py         # ★ Sovereign AI guard — blocks foreign APIs (KB_SOVEREIGN_MODE=1)
 │   ├── logger.py                  # Structured JSON logging (pipeline.log + audit.log)
 │   └── retry.py                   # Retry decorator + JobCheckpoint (crash-safe resume)
+│
+├── api/
+│   ├── __init__.py                # Package marker
+│   ├── server.py                  # ★ FastAPI backend — REST + SSE (/api/session/...)
+│   └── web_routes.py              # Adapter router — poll-based /api/sessions/... + /api/jobs/{id}
+│
+├── web/                           # ★ Static single-page web UI (vanilla JS, no build)
+│   ├── index.html                 # KB Dubbing Studio markup
+│   ├── app.js                     # Frontend logic (upload → edit → stitch)
+│   └── style.css                  # Dark theme
+│
+├── run_web.py                     # ★ Web UI launcher → http://localhost:8000
 │
 ├── ui/
 │   ├── app.py                     # ★ Gradio web UI — 8 tabs

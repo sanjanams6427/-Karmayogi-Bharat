@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KB Dubbing Studio</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ===== HEADER ===== -->
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-logo">🎬</span>
+      <div>
+        <h1>KB Dubbing Studio</h1>
+        <p class="brand-sub">iGOT Karmayogi · 22-Language Offline Dubbing</p>
+      </div>
+    </div>
+    <div class="header-status">
+      <span id="sovereign-badge" class="badge badge-sovereign">🇮🇳 Sovereign Mode</span>
+      <span id="session-badge" class="badge badge-muted">No Session</span>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- ===== LEFT / CENTER COLUMN ===== -->
+    <section class="main-col">
+
+      <!-- UPLOAD SECTION -->
+      <div class="card" id="upload-card">
+        <h2 class="card-title">1 · Create Session</h2>
+        <div class="upload-grid">
+          <div id="dropzone" class="dropzone" tabindex="0">
+            <input type="file" id="video-input" accept="video/*,audio/*" hidden />
+            <div class="dropzone-inner">
+              <span class="dz-icon">⬆️</span>
+              <p class="dz-title">Drag &amp; drop video / audio here</p>
+              <p class="dz-hint">or <button type="button" id="browse-btn" class="link-btn">browse files</button></p>
+              <p id="file-name" class="dz-file"></p>
+            </div>
+          </div>
+
+          <div class="upload-controls">
+            <label class="field">
+              <span>Source Language</span>
+              <select id="src-lang"></select>
+            </label>
+            <label class="field">
+              <span>Target Language</span>
+              <select id="tgt-lang"></select>
+            </label>
+            <button id="create-session-btn" class="btn btn-primary" disabled>Create Session</button>
+            <div class="progress-wrap" id="upload-progress-wrap" hidden>
+              <div class="progress"><div class="progress-bar" id="upload-progress"></div></div>
+              <span class="progress-label" id="upload-progress-label">Uploading…</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BATCH OPERATIONS BAR -->
+      <div class="card batch-bar" id="batch-card">
+        <h2 class="card-title">2 · Batch Operations</h2>
+        <div class="batch-controls">
+          <button id="translate-all-btn" class="btn btn-ghost" disabled>🌐 Translate All</button>
+          <button id="tts-all-btn" class="btn btn-ghost" disabled>🔊 Generate All TTS</button>
+          <button id="auto-approve-btn" class="btn btn-ghost" disabled>✅ Auto-Approve</button>
+          <div class="progress-wrap batch-progress">
+            <div class="progress"><div class="progress-bar" id="batch-progress"></div></div>
+            <span class="progress-label" id="batch-progress-label">Idle</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- SEGMENT TABLE -->
+      <div class="card table-card">
+        <div class="table-head-row">
+          <h2 class="card-title">3 · Segments</h2>
+          <span id="segment-count" class="muted">0 segments</span>
+        </div>
+        <div class="table-scroll">
+          <table class="seg-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Time</th>
+                <th>Dur</th>
+                <th class="col-text">Original</th>
+                <th>Action</th>
+                <th class="col-text">Translation</th>
+                <th>TTS Dur</th>
+                <th>Fit</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="seg-tbody">
+              <tr class="empty-row"><td colspan="9">No segments yet — create a session to begin.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- FINAL OUTPUT SECTION -->
+      <div class="card" id="output-card">
+        <h2 class="card-title">4 · Final Output</h2>
+        <div class="output-grid">
+          <button id="stitch-btn" class="btn btn-primary" disabled>🎞️ Stitch Video</button>
+          <div class="duration-compare">
+            <div class="dur-box">
+              <span class="dur-label">Original</span>
+              <span id="orig-duration" class="dur-value">—</span>
+            </div>
+            <span class="dur-arrow">→</span>
+            <div class="dur-box">
+              <span class="dur-label">Final</span>
+              <span id="final-duration" class="dur-value">—</span>
+            </div>
+            <div class="dur-box">
+              <span class="dur-label">Ratio</span>
+              <span id="dur-ratio" class="dur-value">—</span>
+            </div>
+          </div>
+          <a id="download-link" class="btn btn-success" href="#" hidden download>⬇️ Download Dubbed Video</a>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== RIGHT SIDEBAR: SEGMENT DETAIL ===== -->
+    <aside class="detail-panel" id="detail-panel">
+      <div class="detail-empty" id="detail-empty">
+        <span class="detail-empty-icon">🎯</span>
+        <p>Select a segment to edit</p>
+      </div>
+
+      <div class="detail-content" id="detail-content" hidden>
+        <div class="detail-head">
+          <h3>Segment <span id="d-id">—</span></h3>
+          <span id="d-status-badge" class="badge">⏳</span>
+        </div>
+
+        <div class="thumb-wrap">
+          <img id="d-thumb" class="thumb" alt="Segment thumbnail" />
+          <div id="d-thumb-fallback" class="thumb-fallback">No preview</div>
+        </div>
+
+        <div class="detail-meta">
+          <span id="d-time" class="chip">00:00 → 00:00</span>
+          <span id="d-dur" class="chip">0.0s</span>
+        </div>
+
+        <label class="field">
+          <span>Original Text</span>
+          <textarea id="d-original" class="ta ta-readonly" rows="2" readonly></textarea>
+        </label>
+
+        <label class="field">
+          <span>Translation</span>
+          <textarea id="d-translation" class="ta" rows="3" placeholder="Edit translation…"></textarea>
+        </label>
+
+        <div class="audio-wrap">
+          <span class="field-label">TTS Preview</span>
+          <audio id="d-audio" controls preload="none"></audio>
+        </div>
+
+        <label class="field">
+          <span>Fit Strategy</span>
+          <select id="d-fit">
+            <option value="auto">Auto</option>
+            <option value="speedup">Speed Up</option>
+            <option value="extend">Extend Video</option>
+            <option value="trim">Trim</option>
+          </select>
+        </label>
+
+        <div class="action-row">
+          <button id="d-translate-btn" class="btn btn-ghost sm">🌐 Translate</button>
+          <button id="d-tts-btn" class="btn btn-ghost sm">🔊 Generate TTS</button>
+          <button id="d-skip-btn" class="btn btn-ghost sm">⏭️ Skip</button>
+          <button id="d-keep-btn" class="btn btn-ghost sm">📌 Keep Original</button>
+        </div>
+
+        <div class="action-row decision">
+          <button id="d-approve-btn" class="btn btn-success">✅ Approve</button>
+          <button id="d-reject-btn" class="btn btn-danger">✖ Reject</button>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

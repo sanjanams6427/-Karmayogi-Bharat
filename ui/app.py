@@ -1467,8 +1467,10 @@ def build_ui():
                 if session is None:
                     return session, [], "", "❌ No session loaded."
                 try:
-                    from pipeline.segment_editor import SegmentEditor, segments_to_table
+                    from pipeline.segment_editor import SegmentEditor, SegmentAction, segments_to_table
                     editor = SegmentEditor()
+                    # Mark segment for translation first
+                    editor.set_segment_action(session, int(seg_id), SegmentAction.TRANSLATE)
                     seg = editor.translate_segment(session, int(seg_id))
                     return (session, segments_to_table(session), seg.translated_text,
                             f"✅ Translated seg {int(seg_id)}: score={seg.translation_score:.2f}")
