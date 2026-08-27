@@ -9,56 +9,58 @@
 # ============================================================
 
 # ── UI ───────────────────────────────────────────────────────
-gradio>=4.0.0
+gradio>=4.44.0
 
 # ── Deep Learning ────────────────────────────────────────────
-transformers>=4.40.0
-accelerate>=0.26.0
-safetensors>=0.4.0
-sentencepiece>=0.1.99
-sacremoses>=0.0.53
+transformers>=4.46.0
+accelerate>=0.34.0
+safetensors>=0.4.5
+sentencepiece>=0.2.0
+sacremoses>=0.1.1
 
 # ── ASR ──────────────────────────────────────────────────────
-faster-whisper>=1.0.0
+faster-whisper>=1.1.0
 
 # ── Translation ──────────────────────────────────────────────
+# IndicTransToolkit: install from source (not on PyPI stable):
+#   pip install git+https://github.com/AI4Bharat/IndicTransToolkit.git
 IndicTransToolkit>=0.1.0
 
 # ── TTS ──────────────────────────────────────────────────────
-parler-tts>=0.2.2
+parler-tts>=1.0.0
 # Coqui XTTS-v2 (voice cloning — install separately to avoid conflicts):
 #   pip install coqui-tts --no-deps
 
 # ── Audio ────────────────────────────────────────────────────
 soundfile>=0.12.1
-librosa>=0.10.0
-scipy>=1.11.0
-numpy>=1.24.0
-resampy>=0.4.2
+librosa>=0.10.2
+scipy>=1.13.0
+numpy>=1.26.0,<2.0
+resampy>=0.4.3
 
 # ── Video ────────────────────────────────────────────────────
-imageio-ffmpeg>=0.4.9
+imageio-ffmpeg>=0.5.1
 
 # ── Language Detection ───────────────────────────────────────
-lingua-language-detector>=2.0.0
+lingua-language-detector>=2.0.2
 
 # ── Document Processing ──────────────────────────────────────
-python-docx>=1.1.0
-openpyxl>=3.1.0
-pdfplumber>=0.10.0
+python-docx>=1.1.2
+openpyxl>=3.1.5
+pdfplumber>=0.11.0
 
 # ── CBP Portal Upload ────────────────────────────────────────
-requests>=2.31.0
+requests>=2.32.0
 
 # ── HuggingFace Hub ──────────────────────────────────────────
-huggingface_hub>=0.20.0
+huggingface_hub>=0.25.0
 
 # ── Utilities ────────────────────────────────────────────────
-python-dotenv>=1.0.0
+python-dotenv>=1.0.1
 
 # ── Datasets (download + finetune scripts only) ──────────────
-datasets>=2.18.0
+datasets>=3.0.0
 
 # ── Fine-tuning (optional — finetune/ scripts only) ──────────
-# deepspeed>=0.14.0       # ZeRO-3 multi-GPU (ds_zero3.json)
-# bitsandbytes>=0.43.0    # 8-bit optimiser for single-GPU fine-tuning
+# deepspeed>=0.15.0       # ZeRO-3 multi-GPU (ds_zero3.json)
+# bitsandbytes>=0.44.0    # 8-bit optimiser for single-GPU fine-tuning

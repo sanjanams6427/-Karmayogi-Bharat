@@ -312,7 +312,7 @@ def main():
         if not videos:
             print(f"ERROR: No mp4/mp3 files found in {video_dir}")
             sys.exit(1)
-        gpu_count = 4
+        gpu_count = num_gpus
         print(f"Distributing {len(videos)} videos across {gpu_count} GPUs")
         procs = []
         for i, vpath in enumerate(videos):

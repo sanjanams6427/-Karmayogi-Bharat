@@ -67,16 +67,6 @@ NLLB_CODES = {
     "bod": "brx_Deva",  # Bodo — NLLB uses brx_Deva (Bodo/Boro in Devanagari), NOT bod_Tibt (Tibetan)
 }
 
-# IndicWhisper language codes
-INDIC_WHISPER_CODES = {
-    "asm": "as", "ben": "bn", "guj": "gu", "hin": "hi",
-    "kan": "kn", "mal": "ml", "mar": "mr", "ory": "or",
-    "pan": "pa", "tam": "ta", "tel": "te", "urd": "ur",
-    "nep": "ne", "mai": "mai", "snd": "sd", "kas": "ks",
-    "kok": "kok", "mni": "mni", "san": "sa", "bod": "bo",
-    "sat": "sat", "doi": "doi",
-}
-
 # Human-readable names
 LANG_NAMES = {
     "asm": "Assamese",  "ben": "Bengali",   "guj": "Gujarati",

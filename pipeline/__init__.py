@@ -25,10 +25,6 @@ except Exception:
 from .quality import score_segment, score_batch, review_summary
 from .ocr_sync import verify_voiceover_sync, extract_onscreen_text
 try:
-    from .voice_clone import VoiceCloner
-except Exception:
-    pass
-try:
     from .cbp_uploader import CBPUploader
 except Exception:
     pass

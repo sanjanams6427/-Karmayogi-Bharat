@@ -109,24 +109,6 @@ def _worker_dub_langs(args: tuple) -> dict:
     return results
 
 
-def _worker_tts_split(args: tuple) -> dict:
-    """
-    TTS-only worker for spare-GPU acceleration.
-    Synthesises a subset of translated segments for one language on a dedicated GPU.
-    args = (gpu_id, lang, seg_indices, translated_segments, tts_dir)
-    Returns {original_index: audio_path} for the assigned subset.
-    """
-    import os, sys
-    from pathlib import Path
-    gpu_id, lang, seg_indices, translated_segments, tts_dir = args
-    os.environ["PIPELINE_GPU"] = str(gpu_id)
-    sys.path.insert(0, str(Path(__file__).parent.parent))
-    from pipeline.tts import TTSEngine
-    engine  = TTSEngine()
-    subset  = [translated_segments[i] for i in seg_indices]
-    results = engine.synthesize_segments(subset, lang, tts_dir)
-    return {seg_indices[i]: r["audio_path"] for i, r in enumerate(results)}
-
 try:
     import sys
     sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -291,12 +273,12 @@ def _repair_asr_segments(segments: list[dict]) -> list[dict]:
                 and not prev_ends_sentence
             )
             # 4. Short gap + no sentence-ending punctuation = Whisper mid-breath split
-            # 200ms threshold for English source — English natural sentence pauses
-            # are typically 300-500ms, so 200ms safely catches only mid-sentence splits.
-            # 400ms was merging adjacent sentences in English educational content.
+            # 400ms threshold — English natural sentence pauses are 500ms+.
+            # 400ms catches mid-sentence splits ("Loans\nmay also") without
+            # merging true adjacent sentences which have 500ms+ gaps.
             or (
                 not prev_ends_sentence
-                and 0 < gap_s < 0.20
+                and 0 < gap_s < 0.40
                 and prev_text  # don't merge into empty
             )
         )
@@ -480,23 +462,25 @@ class DubbingPipeline:
 
         out_dir = Path(output_dir) / tgt_lang
 
-        # Always wipe previous output files so the user never gets a stale result.
-        # ASR + translation are still checkpointed (expensive) — only TTS/assembly re-run.
+        # Always wipe previous output files AND translation checkpoint so the user
+        # never gets stale subtitles/audio from a previous run.
+        # ASR is still cached (cheap to reuse); translation always re-runs.
+        out_dir.mkdir(parents=True, exist_ok=True)  # ensure dir exists before glob
         for p in out_dir.glob(f"{course_id}_{tgt_lang}.*"):
             if p.suffix in (".mp4", ".mp3", ".srt", ".vtt", ".json"):
                 try:
                     p.unlink()
                 except Exception:
                     pass
+        # Always clear translation checkpoint — ensures code fixes apply immediately
+        try:
+            JobCheckpoint(job_id).clear()
+        except Exception:
+            pass
         if force:
-            # force=True: also wipe ASR+translation checkpoint so everything re-runs
-            try:
-                JobCheckpoint(job_id).clear()
-            except Exception:
-                pass
             log.info(f"[{job_id}] force=True — cleared outputs + checkpoint for {tgt_lang}")
         else:
-            log.info(f"[{job_id}] Cleared previous output for {tgt_lang} — re-running TTS/assembly")
+            log.info(f"[{job_id}] Cleared previous output + translation checkpoint for {tgt_lang} — re-running fresh")
         tmp_dir = out_dir / "tmp" / job_id
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -809,55 +793,6 @@ class DubbingPipeline:
 
         return result
 
-    def _synthesize_tts_split(
-        self, translated_segments: list, tgt_lang: str, tts_dir: str,
-        primary_gpu: int, spare_gpus: list, job_id: str
-    ) -> list:
-        """
-        Split TTS synthesis across primary GPU + spare GPUs.
-        Odd-indexed segments go to spare GPU(s), even to primary.
-        Results are merged back in original order.
-        Gives ~2x speedup when one spare GPU is available.
-        """
-        import multiprocessing as mp
-        ctx = mp.get_context("spawn")
-
-        n = len(translated_segments)
-        all_indices = list(range(n))
-        all_gpus = [primary_gpu] + spare_gpus
-        n_gpus = len(all_gpus)
-
-        # Round-robin distribute segment indices across all GPUs
-        gpu_segs = {g: [] for g in all_gpus}
-        for idx in all_indices:
-            gpu_segs[all_gpus[idx % n_gpus]].append(idx)
-
-        log.info(
-            f"[{job_id}] TTS split across {n_gpus} GPUs "
-            + ", ".join(f"GPU{g}:{len(gpu_segs[g])}segs" for g in all_gpus)
-        )
-
-        worker_args = [
-            (g, tgt_lang, gpu_segs[g], translated_segments,
-             tts_dir + f"_gpu{g}")
-            for g in all_gpus if gpu_segs[g]
-        ]
-
-        with ctx.Pool(processes=len(worker_args)) as pool:
-            split_results = pool.map(_worker_tts_split, worker_args)
-
-        # Merge: build index -> audio_path map
-        idx_to_path = {}
-        for chunk in split_results:
-            idx_to_path.update(chunk)
-
-        # Reconstruct results list in original segment order
-        results = []
-        for i, seg in enumerate(translated_segments):
-            audio_path = idx_to_path.get(i, "")
-            results.append({**seg, "audio_path": audio_path})
-        return results
-
     def dub_course(
         self,
         video_path:      str,
@@ -906,7 +841,6 @@ class DubbingPipeline:
         self._validate_input(video_path)
         input_path = Path(video_path)
         is_audio   = input_path.suffix.lower() in (".mp3", ".wav", ".flac", ".ogg")
-        is_webm    = input_path.suffix.lower() == ".webm"
 
         # Shared tmp dir for ASR cache
         asr_tmp = Path(output_dir) / "_asr_shared"
@@ -1109,15 +1043,28 @@ class DubbingPipeline:
                 except Exception as retry_e:
                     log.error(f"[{job_id}] Retry failed for seg {seg['id']}: {retry_e}")
                 # If still empty after retries, use source text as absolute last resort
-                # (better to speak English than silence for a Hindi dub)
+                # EXCEPTION: for non-Latin-script target languages (Tamil, Hindi, etc.),
+                # passing English source text to TTS causes near-silent output because
+                # the VITS/Parler model cannot render Latin script in those languages.
+                # For these langs, keep text empty — silence is better than garbled audio.
                 if not translated_text.strip():
-                    log.error(f"[{job_id}] All retries failed for seg {seg['id']} — using source text")
-                    translated_text = pending_texts[local_i]
-                    r = {**r, "text": translated_text,
-                         "score": {**r.get("score", {}),
-                                   "flags": r.get("score", {}).get("flags", []) + ["translation_failed_source_fallback"],
-                                   "needs_review": True, "failed": True}}
-            done = {**seg, "text": translated_text, "engine": r["engine"],
+                    _LATIN_SCRIPT_LANGS = {"eng"}
+                    if tgt_lang in _LATIN_SCRIPT_LANGS:
+                        log.error(f"[{job_id}] All retries failed for seg {seg['id']} — using source text")
+                        translated_text = pending_texts[local_i]
+                        r = {**r, "text": translated_text,
+                             "score": {**r.get("score", {}),
+                                       "flags": r.get("score", {}).get("flags", []) + ["translation_failed_source_fallback"],
+                                       "needs_review": True, "failed": True}}
+                    else:
+                        log.error(f"[{job_id}] All retries failed for seg {seg['id']} [{tgt_lang}] — writing silence (not English passthrough)")
+                        translated_text = ""
+                        r = {**r, "text": "",
+                             "score": {**r.get("score", {}),
+                                       "flags": r.get("score", {}).get("flags", []) + ["translation_failed_silence"],
+                                       "needs_review": True, "failed": True}}
+            done = {**seg, "text": translated_text, "src_text": pending_texts[local_i],
+                    "engine": r["engine"],
                     "enhanced": False, "quality": r["score"]}
             results[pending_idxs[local_i]] = done
             if ckpt:
@@ -2581,7 +2528,7 @@ class DubbingPipeline:
         self, video_path: str, src_lang: str, tgt_langs: list[str],
         output_dir: str, course_id: str, metadata: dict = None,
         quiz: list[dict] = None, upload_to_cbp: bool = False,
-        num_gpus: int = 1,
+        num_gpus: int = 1, force: bool = False,
     ) -> dict:
         summary = {"course_id": course_id, "source_lang": src_lang,
                    "target_langs": tgt_langs, "dubbing": {},
@@ -2590,7 +2537,7 @@ class DubbingPipeline:
         out_dir = Path(output_dir)
         dub_results = self.dub_course(
             video_path, src_lang, tgt_langs, output_dir, course_id,
-            num_gpus=num_gpus)
+            num_gpus=num_gpus, force=force)
         summary["dubbing"] = {
             lang: {"success": r.success,
                    "output":  r.output_video_path or r.output_audio_path,

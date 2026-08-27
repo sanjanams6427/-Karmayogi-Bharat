@@ -339,10 +339,10 @@ class VideoProcessor:
         _vp_log = _log.getLogger(__name__)
 
         FADE_IN_MS  = int(0.005 * sample_rate)   # 5ms click-kill fade-in
-        FADE_OUT_MS = int(0.005 * sample_rate)   # 5ms click-kill fade-out
+        FADE_OUT_MS = int(0.020 * sample_rate)   # 20ms fade-out — VITS endings are abrupt
         MAX_SPEED   = 1.35                        # max atempo speed-up
         TAIL_FADE   = int(0.250 * sample_rate)   # 250ms fade-out on forced trim
-        GAP_GUARD   = int(0.020 * sample_rate)   # 20ms guard before next speech (click prevention only)
+        GAP_GUARD   = int(0.040 * sample_rate)   # 40ms guard — absorbs VITS inter-seg silence
 
         # ── Pre-load all segment audio ────────────────────────────────────────
         loaded: list = []

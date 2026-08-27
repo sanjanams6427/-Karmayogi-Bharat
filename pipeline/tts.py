@@ -5,8 +5,6 @@
 # ============================================================
 
 import os, subprocess, json
-import os as _os_numba
-_os_numba.environ.setdefault("NUMBA_DISABLE_JIT", "1")  # prevent NumPy version crash in Numba
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -25,6 +23,7 @@ except ImportError:
     log.warning("resampy not installed — librosa pitch_shift will use soxr_hq backend")
 
 import os as _os
+_os.environ.setdefault("NUMBA_DISABLE_JIT", "1")  # prevent NumPy version crash in Numba
 _gpu = _os.environ.get("PIPELINE_GPU", "0")
 DEVICE = (
     _os.environ.get("TTS_DEVICE")
@@ -105,9 +104,24 @@ _PARLER_SKIP_LANGS: set = {
     # Parler-TTS Indic Large is trained on these and produces natural human dubbing.
 }
 
-# Tamil-specific: inter-segment silence gap (ms) added between VITS chunks
-# to give natural breathing room between sentences.
-_TAM_INTER_SEG_SILENCE_MS = 60  # 60ms — natural pause, not robotic gap
+
+# These have very short original gaps (40ms) and VITS output tends to be longer
+# than the slot — without a small silence the transitions sound abrupt.
+_VITS_INTER_SEG_SILENCE_MS: dict[str, int] = {
+    "tam": 60,
+    "kas": 80,   # Nastaliq RTL — slightly longer breath between sentences
+    "bod": 60,   # Bodo Devanagari
+    "mni": 70,   # Meitei Bengali-script
+    "tel": 50,
+    "kan": 50,
+    "mal": 50,
+    "ben": 50,
+    "asm": 50,
+    "pan": 50,
+    "ory": 50,
+    "guj": 50,
+    "urd": 70,   # Nastaliq — same as kas
+}
 
 
 # Per-language descriptions for ai4bharat Indic Parler-TTS.
@@ -218,10 +232,9 @@ def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False,
         # Blend: 70% filtered + 30% original — keeps consonant crispness and naturalness
         audio = (0.70 * audio_hf + 0.30 * audio).astype(np.float32)
     if is_mms:
-        # Low-pass at 9500Hz for all MMS VITS langs.
-        # Indic VITS models have significant consonant energy at 8-10kHz
-        # (retroflex stops, nasals, fricatives). 7500Hz was muffling these.
-        sos_lp = butter(3, 9500.0 / (sr / 2), btype="low", output="sos")
+        # Low-pass at 7000Hz: removes VITS high-freq buzz above 7kHz,
+        # preserves retroflex consonant energy (peaks at 5-6kHz for Tamil/Dravidian).
+        sos_lp = butter(3, 7000.0 / (sr / 2), btype="low", output="sos")
         audio  = sosfilt(sos_lp, audio).astype(np.float32)
         # Trim trailing near-silence — threshold 0.001 for all MMS langs.
         # 0.003 was cutting into final consonants of retroflex stops in
@@ -317,27 +330,24 @@ class TTSEngine:
                 except RuntimeError as _cuda_err:
                     log.warning(f"Standalone VITS [{lang}] CUDA move failed ({_cuda_err}) — using CPU")
                     model = model.to("cpu")
-            # Pin noise_scale to 0.0 — eliminates stochastic voice variation between
-            # segments. Default 0.667 causes different timbre on every call.
-            # noise_scale_duration=0.0 locks duration predictor too (consistent pacing).
-            # noise_scale: per-lang tuning for natural prosody
-            # Hindi/Devanagari: 0.45 — enough variance for natural intonation
-            # Dravidian/Bengali: 0.3 — tighter control for complex akshara clusters
-            _DEVA_LANGS_NS = {"hin", "mar", "mai", "nep", "san", "doi", "kok"}
-            _ns = 0.45 if lang in _DEVA_LANGS_NS else 0.3
+            # noise_scale: per-lang tuning for voice consistency vs naturalness.
+            # Dravidian langs (tam/tel/kan/mal) MUST use 0.667 (model default) —
+            # lowering it causes near-zero amplitude (silent) output for these scripts.
+            # Devanagari/Bengali/other langs: 0.0 = fully deterministic, identical
+            # timbre every segment (no stochastic voice drift across the video).
+            # noise_scale_duration=0.0: locks duration predictor for consistent pacing.
+            _DRAVIDIAN = {"tam", "tel", "kan", "mal"}
+            _ns = 0.667 if lang in _DRAVIDIAN else 0.0
             model.config.noise_scale          = _ns
-            # 0.6 locks duration predictor tightly — consistent pacing for dubbing
-            # where TTS audio must fit original timestamp slots.
-            # 0.8 caused pacing drift between chunks, making fit-to-slot harder.
-            model.config.noise_scale_duration  = 0.6
+            model.config.noise_scale_duration  = 0.0
             for _attr in ("inference_noise_scale",):
                 if hasattr(model.config, _attr):
                     setattr(model.config, _attr, _ns)
             if hasattr(model.config, "inference_noise_scale_dp"):
-                setattr(model.config, "inference_noise_scale_dp", 0.6)
+                setattr(model.config, "inference_noise_scale_dp", 0.0)
             self._standalone_vits[lang] = {"model": model, "tokenizer": tokenizer,
                                            "seed": 42}
-            log.info(f"Standalone VITS [{lang}] loaded (noise_scale=0.3 natural prosody)")
+            log.info(f"Standalone VITS [{lang}] loaded (noise_scale={_ns} natural prosody)")
             # Warm up once with a short text to advance past any init RNG state,
             # then capture the RNG state — this becomes the pinned state for all inference.
             # Use a real word in the target script — VITS phonemiser produces 0 tokens
@@ -484,7 +494,8 @@ class TTSEngine:
                     prev_chunk = chunks[ci]
                     at_sentence_boundary = prev_chunk.rstrip()[-1:] in '.!?\u0964\u0965'
                     if at_sentence_boundary:
-                        silence_samp = int(80 * 0.001 * native)  # 80ms natural breath
+                        inter_ms = _VITS_INTER_SEG_SILENCE_MS.get(lang, 60)
+                        silence_samp = int(inter_ms * 0.001 * native)
                         wavs.append(np.zeros(silence_samp, dtype=np.float32))
             if not wavs:
                 return False
@@ -556,14 +567,8 @@ class TTSEngine:
     # ----------------------------------------------------------
     # Parler-TTS synthesis (single)
     # ----------------------------------------------------------
-    # Single fixed seed 42 for ALL languages — same seed every segment = identical voice throughout.
+    # Single fixed seed 42 for ALL languages.
     # Do NOT change this — it is the voice identity anchor for the entire video.
-    _LANG_SEEDS = {lang: 42 for lang in [
-        "hin", "ben", "tam", "tel", "kan", "mal", "mar", "guj", "pan", "ory",
-        "asm", "urd", "nep", "bod", "doi", "kok", "mni", "mai", "san", "sat",
-        "snd", "kas", "eng",
-    ]}
-
     def _parler_encode_description(self, desc_ids):
         """Run the text encoder ONCE and cache the result.
         All segments reuse the same encoder_outputs — identical voice embedding
@@ -848,6 +853,10 @@ class TTSEngine:
                 # a timed-out generation (causes CUDA state corruption on next call).
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 _fut = _ex.submit(_gen_no_grad_synth)
+                deva_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+                _timeout = (self._PARLER_TIMEOUT_TEL if (len(text) > 0 and sum(1 for c in text if '\u0C00'<=c<='\u0C7F')/max(len(text),1)>0.4)
+                            else self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
+                            else self._PARLER_TIMEOUT_S)
                 try:
                     gen = _fut.result(timeout=_timeout)
                 except concurrent.futures.TimeoutError:
@@ -1029,8 +1038,8 @@ class TTSEngine:
                 _PRIMER_MAP = {
                     "hin": "नमस्ते, आज हम एक महत्वपूर्ण विषय पर चर्चा करेंगे।",
                     "mar": "नमस्कार, आज आपण एका महत्त्वाच्या विषयावर चर्चा करणार आहोत।",
-                    "nep": "नमस्ते, आज हामी एउटा महत्त्वपूर्ण विषयमा छलफल गर्नेछौं।",
-                    "mai": "प्रणाम, आइ हम एकटा महत्वपूर्ण विषय पर चर्चा करब।",
+                    "nep": "नमस्ते, आज हामी पानी चक्रको बारेमा जानकारी लिनेछौं।",
+                    "mai": "प्रणाम, आइ हम जल चक्रक बारे मे जानकारी लेब।",
                     "san": "नमस्ते, अद्य वयं एकस्मिन् महत्त्वपूर्णे विषये विचारं करिष्यामः।",
                 }
                 _primer_text = _PRIMER_MAP.get(lang, "नमस्ते, आज हम एक महत्वपूर्ण विषय पर चर्चा करेंगे।")
@@ -1065,11 +1074,7 @@ class TTSEngine:
             while batch_start < len(sorted_idxs):
                 bs = _batch_size_for(sorted_idxs[batch_start:batch_start + self._PARLER_BATCH_SIZE])
                 batch_idxs = sorted_idxs[batch_start: batch_start + bs]
-                total_batches = None  # dynamic — log without total
-                batch_texts = [
-                    self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=False)
-                    for i in batch_idxs
-                ]
+                batch_texts = [self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=False) for i in batch_idxs]
                 batch_paths = [results[i]["audio_path"] for i in batch_idxs]
                 log.info(f"Parler batch {b+1} [{lang}] — {len(batch_idxs)} segs")
                 batch_ok = self._parler_generate_batch(
