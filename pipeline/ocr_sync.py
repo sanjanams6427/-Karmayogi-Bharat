@@ -167,32 +167,7 @@ def verify_sync(
         # Still record timestamp-based sync check (no OCR)
         for seg in segments:
             orig_start  = float(seg.get("start", 0))
-            audio_start = float(seg.get("start", 0))  # pipeline places at original ts
-            delta = abs(audio_start - orig_start)
-            report["segments"].append({
-                "id":           str(seg.get("id", "")),
-                "start":        round(orig_start, 3),
-                "audio_start":  round(audio_start, 3),
-                "sync_delta_s": round(delta, 3),
-                "has_text":     None,   # unknown without OCR
-                "text_preview": "",
-                "flag":         delta > SYNC_THRESHOLD_S,
-            })
-            if delta > SYNC_THRESHOLD_S:
-                report["sync_violations"] += 1
-        if report["sync_violations"] > 0:
-            report["status"] = "warnings"
-        return report
-
-    # OCR path
-    with tempfile.TemporaryDirectory(prefix="kb_ocr_") as tmpdir:
-        deltas = []
-        for i, seg in enumerate(segments):
-            if i % sample_every_n != 0:
-                continue
-
-            orig_start  = float(seg.get("start", 0))
-            audio_start = float(seg.get("start", 0))
+            audio_start = float(seg.get("audio_start", seg.get("start", 0)))
             delta       = abs(audio_start - orig_start)
 
             # Extract frame at segment start

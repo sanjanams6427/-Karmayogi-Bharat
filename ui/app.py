@@ -381,7 +381,7 @@ def _format_quality_summary(summary: dict) -> str:
 
 
 def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
-                   course_id, upload_cbp, progress=gr.Progress()):
+                   course_id, upload_cbp, force=False, progress=gr.Progress()):
     if video_file is None:
         return None, [], "❌ Please upload a video/audio file."
     if not tgt_langs:
@@ -436,6 +436,7 @@ def process_course(video_file, meta_file, quiz_file, src_lang, tgt_langs,
                     metadata=metadata, quiz=quiz,
                     upload_to_cbp=upload_cbp,
                     num_gpus=_num_gpus,
+                    force=force,
                 )
             except Exception as e:
                 _exc_box[0] = e
@@ -573,6 +574,7 @@ def build_ui():
                             lambda: [], outputs=[t1_tgt])
                     with gr.Row():
                         t1_cbp   = gr.Checkbox(label="📤 Upload to CBP Portal", value=False)
+                        t1_force = gr.Checkbox(label="🔄 Force Re-run (clear ASR cache too)", value=False)
                     t1_btn = gr.Button("🚀 Start Dubbing", variant="primary", size="lg")
 
                 with gr.Column(scale=2):
@@ -593,7 +595,7 @@ def build_ui():
             t1_btn.click(
                 process_course,
                 inputs=[t1_file, t1_meta, t1_quiz, t1_src, t1_tgt,
-                        t1_id, t1_cbp],
+                        t1_id, t1_cbp, t1_force],
                 outputs=[t1_dl, t1_scores, t1_quality],
             )
 

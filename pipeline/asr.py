@@ -4,7 +4,7 @@
 # ============================================================
 
 import re, subprocess, tempfile, os
-import torch, numpy as np
+import torch
 torch.backends.cudnn.benchmark = True
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
