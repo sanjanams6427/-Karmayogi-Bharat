@@ -28,3 +28,10 @@ try:
     from .cbp_uploader import CBPUploader
 except Exception:
     pass
+
+# Segment Editor — interactive per-segment dubbing workflow
+from .segment_editor import (
+    SegmentEditor, EditSession, Segment, SegmentAction, FitStrategy,
+    segments_to_table, segments_to_table_extended,
+    table_headers, table_headers_extended,
+)
