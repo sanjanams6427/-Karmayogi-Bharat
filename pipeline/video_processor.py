@@ -9,9 +9,12 @@ import os
 import json
 import tempfile
 import subprocess
+import logging
 import numpy as np
 import soundfile as sf
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 # Use bundled ffmpeg from imageio_ffmpeg if system ffmpeg not on PATH
 try:
@@ -506,8 +509,10 @@ class VideoProcessor:
                 if bgm.ndim > 1:
                     bgm = bgm.mean(axis=1)
                 if bgm_sr != sample_rate:
-                    import librosa
-                    bgm = librosa.resample(bgm, orig_sr=bgm_sr, target_sr=sample_rate)
+                    # Use scipy for resampling to avoid librosa numba issues
+                    from scipy import signal
+                    num_samples = int(len(bgm) * sample_rate / bgm_sr)
+                    bgm = signal.resample(bgm, num_samples).astype(np.float32)
                 if len(bgm) < final_samp:
                     bgm = np.concatenate(
                         [bgm, np.zeros(final_samp - len(bgm), dtype=np.float32)])
@@ -585,6 +590,24 @@ class VideoProcessor:
             ).returncode
             if ret == 0 and Path(trimmed_audio).exists():
                 work_audio = trimmed_audio
+        elif audio_dur > video_dur + 0.1:
+            # Audio is 0.1–30s longer than video — pad video with freeze-frame tail.
+            # This fixes the 8-language drift (kan +10.6s, kas +9.2s, etc.).
+            # tpad filter: add silence-padded frames at the end to match audio duration.
+            pad_dur = audio_dur - video_dur
+            padded_video = str(Path(output_path).parent / "_padded_video.mp4")
+            ret = subprocess.run(
+                [_FFMPEG, "-y", "-i", str(video_path),
+                 "-vf", f"tpad=stop_mode=clone:stop_duration={pad_dur:.3f}",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                 "-an", padded_video, "-loglevel", "error"],
+                capture_output=True, timeout=300,
+            ).returncode
+            if ret == 0 and Path(padded_video).exists():
+                work_video = padded_video
+                is_webm = False  # already re-encoded
+            else:
+                log.warning(f"[VP] freeze-frame pad failed for {Path(video_path).name} — using original video")
 
         # Mux video + dubbed audio.
         # WebM must re-encode video (VP8/VP9 cannot be stream-copied into MP4).
@@ -593,12 +616,16 @@ class VideoProcessor:
         work_audio_dur = self.get_audio_duration(work_audio)
         output_dur = max(video_dur, work_audio_dur)
         v_codec = ["libx264", "-preset", "fast", "-crf", "23"] if is_webm else ["copy"]
+        # -t output_dur: set explicit output duration to whichever is longer
+        # (video or dubbed audio). Without this ffmpeg defaults to the shorter
+        # stream, silently cutting off the final sentence when audio > video.
         cmd = [_FFMPEG, "-y",
-               "-i", str(video_path),
+               "-i", str(work_video),
                "-i", str(work_audio),
                "-map", "0:v:0", "-map", "1:a:0",
                "-c:v"] + v_codec + [
                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+               "-t", f"{output_dur:.3f}",
                "-movflags", "+faststart",
                "-profile:a", "aac_low",
                "-avoid_negative_ts", "make_zero",
@@ -609,18 +636,23 @@ class VideoProcessor:
         if ret != 0:
             # Fallback: re-encode input video first
             tmp = str(Path(output_path).parent / "_reenc_input.mp4")
-            self._reencode_input(video_path, tmp)
-            cmd[cmd.index(str(video_path))] = tmp
+            self._reencode_input(work_video, tmp)
+            cmd[cmd.index(str(work_video))] = tmp
             ret2 = subprocess.run(cmd, capture_output=True, timeout=600).returncode
             if ret2 != 0:
                 raise RuntimeError(
                     f"replace_audio_in_video failed for {Path(video_path).name}"
                 )
 
-        # Clean up trimmed audio temp file
+        # Clean up temp files
         if work_audio != audio_path:
             try:
                 Path(work_audio).unlink(missing_ok=True)
+            except Exception:
+                pass
+        if work_video != video_path:
+            try:
+                Path(work_video).unlink(missing_ok=True)
             except Exception:
                 pass
 

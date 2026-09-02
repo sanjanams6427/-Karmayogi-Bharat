@@ -1,497 +1,432 @@
-/* ===== KB Dubbing Studio — Frontend Logic ===== */
+/* ===== KB Dubbing Studio — Segment Editor ===== */
 "use strict";
+
+window.onerror = (msg, url, line) => { console.error("JS Error:", msg, url, line); };
 
 const API = "/api/";
 
-/* 22 scheduled Indian languages (KB tender). */
 const LANGUAGES = [
-  { code: "eng", name: "English" },
-  { code: "hin", name: "Hindi" },
-  { code: "ben", name: "Bengali" },
-  { code: "tam", name: "Tamil" },
-  { code: "tel", name: "Telugu" },
-  { code: "kan", name: "Kannada" },
-  { code: "mal", name: "Malayalam" },
-  { code: "mar", name: "Marathi" },
-  { code: "guj", name: "Gujarati" },
-  { code: "pan", name: "Punjabi" },
-  { code: "ory", name: "Odia" },
-  { code: "asm", name: "Assamese" },
-  { code: "urd", name: "Urdu" },
-  { code: "nep", name: "Nepali" },
-  { code: "mai", name: "Maithili" },
-  { code: "doi", name: "Dogri" },
-  { code: "bod", name: "Bodo" },
-  { code: "mni", name: "Manipuri" },
-  { code: "sat", name: "Santali" },
-  { code: "san", name: "Sanskrit" },
-  { code: "kok", name: "Konkani" },
-  { code: "snd", name: "Sindhi" },
+  { code: "eng", name: "English" }, { code: "hin", name: "Hindi" },
+  { code: "ben", name: "Bengali" }, { code: "tam", name: "Tamil" },
+  { code: "tel", name: "Telugu" }, { code: "kan", name: "Kannada" },
+  { code: "mal", name: "Malayalam" }, { code: "mar", name: "Marathi" },
+  { code: "guj", name: "Gujarati" }, { code: "pan", name: "Punjabi" },
+  { code: "ory", name: "Odia" }, { code: "asm", name: "Assamese" },
+  { code: "urd", name: "Urdu" }, { code: "nep", name: "Nepali" },
+  { code: "mai", name: "Maithili" }, { code: "doi", name: "Dogri" },
+  { code: "bod", name: "Bodo" }, { code: "mni", name: "Manipuri" },
+  { code: "sat", name: "Santali" }, { code: "san", name: "Sanskrit" },
+  { code: "kok", name: "Konkani" }, { code: "snd", name: "Sindhi" },
   { code: "kas", name: "Kashmiri" },
 ];
 
 const STATUS = {
-  pending:  { icon: "⏳", label: "Pending",  cls: "st-pending" },
+  pending:  { icon: "⏳", label: "Pending", cls: "st-pending" },
   approved: { icon: "✅", label: "Approved", cls: "st-approved" },
   overflow: { icon: "⚠️", label: "Overflow", cls: "st-overflow" },
-  skip:     { icon: "⏭️", label: "Skipped",  cls: "st-skip" },
-  rejected: { icon: "✖",  label: "Rejected", cls: "st-rejected" },
+  skip:     { icon: "⏭️", label: "Skipped", cls: "st-skip" },
+  rejected: { icon: "✖", label: "Rejected", cls: "st-rejected" },
 };
 
-/* ---- App state ---- */
-const state = {
-  sessionId: null,
-  file: null,
-  segments: [],
-  selectedId: null,
-  origDuration: 0,
-};
+const state = { sessionId: null, file: null, segments: [], selectedId: null };
 
-/* ---- Element cache ---- */
-const $ = (id) => document.getElementById(id);
-const el = {};
+const $ = id => document.getElementById(id);
 
-document.addEventListener("DOMContentLoaded", init);
-
-function init() {
-  [
-    "dropzone", "video-input", "browse-btn", "file-name",
-    "src-lang", "tgt-lang", "create-session-btn",
-    "upload-progress-wrap", "upload-progress", "upload-progress-label",
-    "translate-all-btn", "tts-all-btn", "auto-approve-btn",
-    "batch-progress", "batch-progress-label",
-    "seg-tbody", "segment-count", "session-badge",
-    "detail-empty", "detail-content",
-    "d-id", "d-status-badge", "d-thumb", "d-thumb-fallback",
-    "d-time", "d-dur", "d-original", "d-translation", "d-audio", "d-fit",
-    "d-translate-btn", "d-tts-btn", "d-skip-btn", "d-keep-btn", "d-approve-btn", "d-reject-btn",
-    "stitch-btn", "orig-duration", "final-duration", "dur-ratio", "download-link",
-    "toast",
-  ].forEach((id) => { el[id] = $(id); });
-
-  populateLanguages();
-  bindUpload();
-  bindBatch();
-  bindDetail();
-  el["stitch-btn"].addEventListener("click", stitchVideo);
-}
-
-/* ============ Language dropdowns ============ */
-function populateLanguages() {
-  LANGUAGES.forEach((l) => {
-    el["src-lang"].add(new Option(`${l.name} (${l.code})`, l.code));
-  });
-  LANGUAGES.filter((l) => l.code !== "eng").forEach((l) => {
-    el["tgt-lang"].add(new Option(`${l.name} (${l.code})`, l.code));
-  });
-  el["src-lang"].value = "eng";
-  el["tgt-lang"].value = "hin";
-}
-
-/* ============ Upload / Create Session ============ */
-function bindUpload() {
-  const dz = el["dropzone"];
-  el["browse-btn"].addEventListener("click", () => el["video-input"].click());
-  dz.addEventListener("click", (e) => { if (e.target.tagName !== "BUTTON") el["video-input"].click(); });
-  dz.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") el["video-input"].click(); });
-
-  ["dragenter", "dragover"].forEach((ev) =>
-    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add("dragover"); }));
-  ["dragleave", "drop"].forEach((ev) =>
-    dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove("dragover"); }));
-  dz.addEventListener("drop", (e) => {
-    if (e.dataTransfer.files.length) setFile(e.dataTransfer.files[0]);
-  });
-  el["video-input"].addEventListener("change", (e) => {
-    if (e.target.files.length) setFile(e.target.files[0]);
-  });
-
-  el["create-session-btn"].addEventListener("click", createSession);
-}
-
-function setFile(file) {
-  state.file = file;
-  el["file-name"].textContent = `📎 ${file.name} (${(file.size / 1048576).toFixed(1)} MB)`;
-  el["create-session-btn"].disabled = false;
-}
+document.addEventListener("DOMContentLoaded", () => {
+  console.log("[SegmentEditor] Initializing...");
+  
+  try {
+    // Language dropdowns
+    const srcLang = $("src-lang");
+    const tgtLang = $("tgt-lang");
+    if (srcLang) LANGUAGES.forEach(l => srcLang.add(new Option(l.name, l.code)));
+    if (tgtLang) LANGUAGES.filter(l => l.code !== "eng").forEach(l => tgtLang.add(new Option(l.name, l.code)));
+    if (srcLang) srcLang.value = "eng";
+    if (tgtLang) tgtLang.value = "hin";
+    
+    // File upload handlers
+    $("browse-btn")?.addEventListener("click", () => $("video-input")?.click());
+    $("dropzone")?.addEventListener("click", e => { if (e.target.tagName !== "BUTTON") $("video-input")?.click(); });
+    $("video-input")?.addEventListener("change", e => {
+      if (e.target.files.length) {
+        state.file = e.target.files[0];
+        const fn = $("file-name");
+        if (fn) fn.textContent = "📎 " + state.file.name;
+        const btn = $("create-session-btn");
+        if (btn) btn.disabled = false;
+      }
+    });
+    
+    // Button handlers
+    $("create-session-btn")?.addEventListener("click", createSession);
+    $("translate-all-btn")?.addEventListener("click", () => batchOp("translate"));
+    $("tts-all-btn")?.addEventListener("click", () => batchOp("tts"));
+    $("auto-approve-btn")?.addEventListener("click", () => batchOp("auto-approve"));
+    $("d-translate-btn")?.addEventListener("click", translateOne);
+    $("d-tts-btn")?.addEventListener("click", ttsOne);
+    $("d-approve-btn")?.addEventListener("click", () => setSegStatus("approved"));
+    $("d-reject-btn")?.addEventListener("click", () => setSegStatus("rejected"));
+    $("d-skip-btn")?.addEventListener("click", () => setSegStatus("skip"));
+    $("stitch-btn")?.addEventListener("click", stitchVideo);
+    
+    console.log("[SegmentEditor] Ready!");
+  } catch (e) {
+    console.error("[SegmentEditor] Init error:", e);
+  }
+});
 
 async function createSession() {
   if (!state.file) return toast("Select a file first", "err");
-  const btn = el["create-session-btn"];
-  btn.disabled = true;
-  showUploadProgress(true, 0, "Uploading…");
-
+  
+  const btn = $("create-session-btn");
+  const prog = $("upload-progress-wrap");
+  const lbl = $("upload-progress-label");
+  
+  if (btn) btn.disabled = true;
+  if (prog) prog.hidden = false;
+  if (lbl) lbl.textContent = "Uploading & running ASR...";
+  
   const form = new FormData();
   form.append("video", state.file);
-  form.append("src_lang", el["src-lang"].value);
-  form.append("tgt_lang", el["tgt-lang"].value);
-
+  form.append("src_lang", $("src-lang")?.value || "eng");
+  form.append("tgt_lang", $("tgt-lang")?.value || "hin");
+  
   try {
-    const xhr = new XMLHttpRequest();
-    const data = await new Promise((resolve, reject) => {
-      xhr.open("POST", API + "sessions");
-      xhr.upload.onprogress = (e) => {
-        if (e.lengthComputable) {
-          const pct = Math.round((e.loaded / e.total) * 100);
-          showUploadProgress(true, pct, `Uploading… ${pct}%`);
-        }
-      };
-      xhr.onload = () => {
-        if (xhr.status >= 200 && xhr.status < 300) {
-          try { resolve(JSON.parse(xhr.responseText || "{}")); }
-          catch { resolve({}); }
-        } else reject(new Error(`HTTP ${xhr.status}`));
-      };
-      xhr.onerror = () => reject(new Error("Network error"));
-      xhr.send(form);
-    });
-
-    state.sessionId = data.session_id || data.id || `sess-${Date.now()}`;
-    showUploadProgress(true, 100, "Processing audio & running ASR…");
-    el["session-badge"].textContent = `Session: ${state.sessionId}`;
-    el["session-badge"].className = "badge badge-active";
-
+    const resp = await fetch(API + "sessions", { method: "POST", body: form });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    
+    state.sessionId = data.session_id;
+    console.log("[createSession] Session:", state.sessionId);
+    
+    const badge = $("session-badge");
+    if (badge) { badge.textContent = "Session: " + state.sessionId; badge.className = "badge badge-active"; }
+    
+    if (lbl) lbl.textContent = "Loading segments...";
     await loadSegments();
-    enableBatch(true);
-    toast("Session created — segments loaded", "ok");
-  } catch (err) {
-    toast(`Upload failed: ${err.message}`, "err");
-    btn.disabled = false;
+    
+    // Enable buttons
+    ["translate-all-btn", "tts-all-btn", "auto-approve-btn", "stitch-btn"].forEach(id => {
+      const b = $(id); if (b) b.disabled = false;
+    });
+    
+    toast("Session created! " + state.segments.length + " segments. Click a row to edit.", "ok");
+  } catch (e) {
+    console.error("[createSession]", e);
+    toast("Error: " + e.message, "err");
   } finally {
-    setTimeout(() => showUploadProgress(false), 800);
+    if (btn) btn.disabled = false;
+    if (prog) prog.hidden = true;
   }
 }
 
-function showUploadProgress(show, pct = 0, label = "") {
-  el["upload-progress-wrap"].hidden = !show;
-  el["upload-progress"].style.width = `${pct}%`;
-  if (label) el["upload-progress-label"].textContent = label;
-}
-
-/* ============ Load segments ============ */
 async function loadSegments() {
-  try {
-    const res = await fetch(`${API}sessions/${state.sessionId}/segments`);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    state.segments = normalizeSegments(data.segments || data || []);
-  } catch (err) {
-    toast(`Could not load segments: ${err.message}`, "err");
-    state.segments = [];
-  }
-  state.origDuration = state.segments.reduce((m, s) => Math.max(m, s.end || 0), 0);
-  el["orig-duration"].textContent = fmtTime(state.origDuration);
-  renderTable();
-  el["stitch-btn"].disabled = state.segments.length === 0;
-}
-
-function normalizeSegments(arr) {
-  return arr.map((s, i) => ({
-    id: s.id != null ? s.id : i + 1,
-    start: s.start ?? 0,
-    end: s.end ?? 0,
-    duration: s.duration ?? ((s.end ?? 0) - (s.start ?? 0)),
-    original: s.original ?? s.text ?? "",
-    translation: s.translation ?? "",
-    action: s.action ?? "translate",
-    tts_duration: s.tts_duration ?? null,
-    fit: s.fit ?? "auto",
-    status: s.status ?? "pending",
-    audio_url: s.audio_url ?? null,
-    thumb_url: s.thumb_url ?? null,
-  }));
-}
-
-/* ============ Render segment table ============ */
-function renderTable() {
-  const tb = el["seg-tbody"];
-  tb.innerHTML = "";
-  el["segment-count"].textContent = `${state.segments.length} segments`;
-
-  if (!state.segments.length) {
-    tb.innerHTML = `<tr class="empty-row"><td colspan="9">No segments yet — create a session to begin.</td></tr>`;
-    return;
-  }
-
-  state.segments.forEach((s) => {
-    const st = STATUS[s.status] || STATUS.pending;
-    const tr = document.createElement("tr");
-    tr.className = st.cls + (s.id === state.selectedId ? " selected" : "");
-    tr.dataset.id = s.id;
-    tr.innerHTML = `
-      <td>${s.id}</td>
-      <td>${fmtTime(s.start)}</td>
-      <td>${(s.duration || 0).toFixed(1)}s</td>
-      <td class="col-text"><span class="cell-clip" title="${esc(s.original)}">${esc(s.original) || "—"}</span></td>
-      <td>${s.action}</td>
-      <td class="col-text"><span class="cell-clip" title="${esc(s.translation)}">${esc(s.translation) || "—"}</span></td>
-      <td>${s.tts_duration != null ? s.tts_duration.toFixed(1) + "s" : "—"}</td>
-      <td>${s.fit}</td>
-      <td class="status-cell">${st.icon} ${st.label}</td>`;
-    tr.addEventListener("click", () => selectSegment(s.id));
-    tb.appendChild(tr);
-  });
-}
-
-/* ============ Segment detail panel ============ */
-function selectSegment(id) {
-  state.selectedId = id;
-  const s = state.segments.find((x) => x.id === id);
-  if (!s) return;
-  renderTable();
-
-  el["detail-empty"].hidden = true;
-  el["detail-content"].hidden = false;
-
-  el["d-id"].textContent = s.id;
-  const st = STATUS[s.status] || STATUS.pending;
-  el["d-status-badge"].textContent = `${st.icon} ${st.label}`;
-  el["d-time"].textContent = `${fmtTime(s.start)} → ${fmtTime(s.end)}`;
-  el["d-dur"].textContent = `${(s.duration || 0).toFixed(1)}s`;
-  el["d-original"].value = s.original || "";
-  el["d-translation"].value = s.translation || "";
-  el["d-fit"].value = s.fit || "auto";
-
-  // thumbnail
-  if (s.thumb_url) {
-    el["d-thumb"].src = s.thumb_url;
-    el["d-thumb"].style.display = "block";
-    el["d-thumb-fallback"].style.display = "none";
-  } else {
-    el["d-thumb"].style.display = "none";
-    el["d-thumb-fallback"].style.display = "flex";
-  }
-
-  // audio
-  if (s.audio_url) { 
-    el["d-audio"].src = s.audio_url; 
-    el["d-audio"].load();  // Force reload
-  }
-  else { el["d-audio"].removeAttribute("src"); el["d-audio"].load(); }
-}
-
-function currentSeg() {
-  return state.segments.find((x) => x.id === state.selectedId);
-}
-
-function bindDetail() {
-  el["d-translation"].addEventListener("input", (e) => {
-    const s = currentSeg(); if (s) s.translation = e.target.value;
-  });
-  el["d-fit"].addEventListener("change", (e) => {
-    const s = currentSeg(); if (s) { s.fit = e.target.value; renderTable(); }
-  });
-
-  el["d-translate-btn"].addEventListener("click", translateSegment);
-  el["d-tts-btn"].addEventListener("click", ttsSegment);
-  el["d-skip-btn"].addEventListener("click", () => setStatus("skip", "translate"));
-  el["d-keep-btn"].addEventListener("click", () => {
-    const s = currentSeg();
-    if (s) { s.translation = s.original; s.action = "keep"; el["d-translation"].value = s.original; }
-    updateSegment();
-  });
-  el["d-approve-btn"].addEventListener("click", () => setStatus("approved"));
-  el["d-reject-btn"].addEventListener("click", () => setStatus("rejected"));
-}
-
-async function translateSegment() {
-  const s = currentSeg(); if (!s) return;
-  el["d-translate-btn"].disabled = true;
-  try {
-    const res = await fetch(`${API}sessions/${state.sessionId}/segments/${s.id}/translate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tgt_lang: el["tgt-lang"].value }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    s.translation = data.translation ?? s.translation;
-    s.tts_duration = data.tts_duration ?? s.tts_duration;
-    s.status = data.status ?? "pending";
-    el["d-translation"].value = s.translation;
-    selectSegment(s.id);
-    renderTable();
-    toast("Segment translated", "ok");
-  } catch (err) {
-    toast(`Translate failed: ${err.message}`, "err");
-  } finally {
-    el["d-translate-btn"].disabled = false;
-  }
-}
-
-async function ttsSegment() {
-  const s = currentSeg(); if (!s) return;
-  if (!s.translation) {
-    toast("Translate the segment first", "err");
-    return;
-  }
-  el["d-tts-btn"].disabled = true;
-  try {
-    const res = await fetch(`${API}sessions/${state.sessionId}/segments/${s.id}/tts`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json();
-    s.tts_duration = data.tts_duration ?? s.tts_duration;
-    s.audio_url = data.audio_url ?? s.audio_url;
-    s.status = data.status ?? s.status;
-    selectSegment(s.id);
-    renderTable();
-    toast("TTS generated", "ok");
-  } catch (err) {
-    toast(`TTS failed: ${err.message}`, "err");
-  } finally {
-    el["d-tts-btn"].disabled = false;
-  }
-}
-
-function setStatus(status, action) {
-  const s = currentSeg(); if (!s) return;
-  s.status = status;
-  if (action) s.action = action;
-  updateSegment();
-}
-
-async function updateSegment() {
-  const s = currentSeg(); if (!s) return;
-  selectSegment(s.id);
-  renderTable();
-  try {
-    await fetch(`${API}sessions/${state.sessionId}/segments/${s.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        translation: s.translation, action: s.action,
-        fit: s.fit, status: s.status,
-      }),
-    });
-  } catch (err) {
-    toast(`Save failed: ${err.message}`, "err");
-  }
-}
-
-/* ============ Batch operations ============ */
-function bindBatch() {
-  el["translate-all-btn"].addEventListener("click", () => batchOp("translate", "🌐 Translating all…"));
-  el["tts-all-btn"].addEventListener("click", () => batchOp("tts", "🔊 Generating TTS…"));
-  el["auto-approve-btn"].addEventListener("click", () => batchOp("auto-approve", "✅ Auto-approving…"));
-}
-
-function enableBatch(on) {
-  ["translate-all-btn", "tts-all-btn", "auto-approve-btn"].forEach((id) => { el[id].disabled = !on; });
-}
-
-async function batchOp(op, label) {
   if (!state.sessionId) return;
-  setBatchProgress(5, label);
-  enableBatch(false);
   try {
-    const res = await fetch(`${API}sessions/${state.sessionId}/batch/${op}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tgt_lang: el["tgt-lang"].value }),
+    const resp = await fetch(API + "sessions/" + state.sessionId + "/segments");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    state.segments = data.segments || [];
+    console.log("[loadSegments]", state.segments.length, "segments");
+    renderTable();
+    updateDurationPreview();
+  } catch (e) {
+    console.error("[loadSegments]", e);
+  }
+}
+
+function renderTable() {
+  const tbody = $("seg-tbody");
+  if (!tbody) return console.error("seg-tbody not found");
+  
+  const cnt = $("segment-count");
+  if (cnt) cnt.textContent = state.segments.length + " segments";
+  
+  if (!state.segments.length) {
+    tbody.innerHTML = '<tr><td colspan="9">No segments yet</td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = state.segments.map(s => {
+    const st = STATUS[s.status] || STATUS.pending;
+    const sel = s.id === state.selectedId ? "selected" : "";
+    return '<tr class="' + st.cls + ' ' + sel + '" onclick="selectSeg(' + s.id + ')">' +
+      '<td>' + s.id + '</td>' +
+      '<td>' + fmtTime(s.start) + '</td>' +
+      '<td>' + (s.duration||0).toFixed(1) + 's</td>' +
+      '<td class="col-text">' + esc(s.original||"").substring(0,50) + '</td>' +
+      '<td>' + (s.action||"pending") + '</td>' +
+      '<td class="col-text">' + esc(s.translation||"—").substring(0,50) + '</td>' +
+      '<td>' + (s.tts_duration ? "✓"+s.tts_duration.toFixed(1)+"s" : "—") + '</td>' +
+      '<td>' + (s.fit||"auto") + '</td>' +
+      '<td>' + st.icon + " " + st.label + '</td></tr>';
+  }).join("");
+}
+
+window.selectSeg = function(id) {
+  state.selectedId = id;
+  const s = state.segments.find(x => x.id === id);
+  if (!s) return;
+  
+  renderTable();
+  
+  const empty = $("detail-empty");
+  const content = $("detail-content");
+  if (empty) empty.hidden = true;
+  if (content) content.hidden = false;
+  
+  const setVal = (id, val) => { const e = $(id); if (e) e.value = val; };
+  const setTxt = (id, val) => { const e = $(id); if (e) e.textContent = val; };
+  
+  setTxt("d-id", s.id);
+  setTxt("d-time", fmtTime(s.start) + " → " + fmtTime(s.end));
+  setTxt("d-dur", (s.duration||0).toFixed(1) + "s");
+  setVal("d-original", s.original || "");
+  setVal("d-translation", s.translation || "");
+  setVal("d-fit", s.fit || "auto");
+  
+  if (s.thumb_url) { const t = $("d-thumb"); if (t) { t.src = s.thumb_url; t.hidden = false; } }
+  if (s.audio_url) { const a = $("d-audio"); if (a) a.src = s.audio_url; }
+  
+  console.log("[selectSeg]", id, s);
+};
+
+async function translateOne() {
+  const s = state.segments.find(x => x.id === state.selectedId);
+  if (!s) return toast("Select a segment", "err");
+  
+  const btn = $("d-translate-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "..."; }
+  
+  try {
+    const resp = await fetch(API + "sessions/" + state.sessionId + "/segments/" + s.id + "/translate", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-    // Poll job progress if the API returns a job id, else reload directly.
-    const data = await res.json();
-    if (data.job_id) await pollJob(data.job_id, label);
-    else setBatchProgress(100, "Done");
-
-    await loadSegments();
-    setBatchProgress(100, "Complete");
-    toast(`Batch ${op} complete`, "ok");
-  } catch (err) {
-    toast(`Batch ${op} failed: ${err.message}`, "err");
-    setBatchProgress(0, "Failed");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    s.translation = data.translation;
+    const tf = $("d-translation"); if (tf) tf.value = s.translation || "";
+    renderTable();
+    toast("Translated!", "ok");
+  } catch (e) {
+    toast("Error: " + e.message, "err");
   } finally {
-    enableBatch(true);
-    setTimeout(() => setBatchProgress(0, "Idle"), 1500);
+    if (btn) { btn.disabled = false; btn.textContent = "🌐 Translate"; }
   }
 }
 
-async function pollJob(jobId, label) {
-  for (let i = 0; i < 600; i++) {
-    await sleep(1000);
-    try {
-      const res = await fetch(`${API}jobs/${jobId}`);
-      if (!res.ok) continue;
-      const j = await res.json();
-      const pct = Math.round(j.progress ?? 0);
-      setBatchProgress(pct, `${label} ${pct}%`);
-      if (j.status === "done" || j.status === "complete") return j;
-      if (j.status === "failed" || j.status === "error") throw new Error(j.error || "job failed");
-    } catch (err) {
-      throw err;
+async function ttsOne() {
+  const s = state.segments.find(x => x.id === state.selectedId);
+  if (!s) return toast("Select a segment", "err");
+  if (!s.translation) return toast("Translate first", "err");
+  
+  const btn = $("d-tts-btn");
+  if (btn) { btn.disabled = true; btn.textContent = "..."; }
+  
+  try {
+    const resp = await fetch(API + "sessions/" + state.sessionId + "/segments/" + s.id + "/tts", {
+      method: "POST", headers: {"Content-Type": "application/json"}, body: "{}"
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    s.tts_duration = data.tts_duration;
+    s.audio_url = data.audio_url;
+    if (s.audio_url) { const a = $("d-audio"); if (a) a.src = s.audio_url; }
+    renderTable();
+    updateDurationPreview();
+    toast("TTS done!", "ok");
+  } catch (e) {
+    toast("Error: " + e.message, "err");
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "🔊 Generate TTS"; }
+  }
+}
+
+async function setSegStatus(status) {
+  const s = state.segments.find(x => x.id === state.selectedId);
+  if (!s) return;
+  try {
+    await fetch(API + "sessions/" + state.sessionId + "/segments/" + s.id, {
+      method: "PATCH", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ status: status })
+    });
+    s.status = status;
+    renderTable();
+  } catch (e) {
+    toast("Error", "err");
+  }
+}
+
+async function batchOp(op) {
+  if (!state.sessionId) return;
+  
+  const btnId = op === "translate" ? "translate-all-btn" : op === "tts" ? "tts-all-btn" : "auto-approve-btn";
+  const btn = $(btnId);
+  const lbl = $("batch-progress-label");
+  const bar = $("batch-progress");
+  
+  if (btn) btn.disabled = true;
+  if (lbl) lbl.textContent = "Running " + op + "...";
+  
+  try {
+    const resp = await fetch(API + "sessions/" + state.sessionId + "/batch/" + op, {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ tgt_lang: $("tgt-lang")?.value || "hin" })
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    
+    if (data.job_id) {
+      for (let i = 0; i < 300; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const jr = await fetch(API + "jobs/" + data.job_id);
+        const job = await jr.json();
+        if (bar) bar.style.width = (job.progress||0) + "%";
+        if (lbl) lbl.textContent = Math.round(job.progress||0) + "%";
+        if (job.status === "done" || job.status === "complete") break;
+        if (job.status === "failed") throw new Error(job.error || "Failed");
+      }
     }
+    
+    await loadSegments();
+    if (lbl) lbl.textContent = "Done!";
+    toast(op + " complete!", "ok");
+  } catch (e) {
+    toast("Error: " + e.message, "err");
+    if (lbl) lbl.textContent = "Error";
+  } finally {
+    if (btn) btn.disabled = false;
   }
-  throw new Error("job timed out");
 }
 
-function setBatchProgress(pct, label) {
-  el["batch-progress"].style.width = `${pct}%`;
-  el["batch-progress-label"].textContent = label;
-}
-
-/* ============ Stitch / final output ============ */
 async function stitchVideo() {
   if (!state.sessionId) return;
-  el["stitch-btn"].disabled = true;
-  el["stitch-btn"].textContent = "🎞️ Stitching…";
+  const btn = $("stitch-btn");
+  const lbl = $("batch-progress-label");
+  const bar = $("batch-progress");
+  
+  if (btn) { btn.disabled = true; btn.textContent = "⏳ Stitching..."; }
+  if (lbl) lbl.textContent = "Stitching video...";
+  
   try {
-    const res = await fetch(`${API}sessions/${state.sessionId}/stitch`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ fit_default: "auto" }),
+    const resp = await fetch(API + "sessions/" + state.sessionId + "/stitch", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ use_extensions: $("use-extensions")?.checked, mix_original_bgm: $("mix-bgm")?.checked })
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    let data = await res.json();
-
+    if (!resp.ok) {
+      const errText = await resp.text();
+      throw new Error("HTTP " + resp.status + ": " + errText);
+    }
+    const data = await resp.json();
+    console.log("[stitch] Job started:", data);
+    
     if (data.job_id) {
-      const job = await pollJob(data.job_id, "🎞️ Stitching…");
-      // stitch result lives on the completed job object
-      data = (job && job.result) ? job.result : data;
+      for (let i = 0; i < 300; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        const jr = await fetch(API + "jobs/" + data.job_id);
+        const job = await jr.json();
+        console.log("[stitch] Job poll:", job.status, job.progress);
+        if (bar) bar.style.width = (job.progress||0) + "%";
+        if (lbl) lbl.textContent = "Stitching... " + Math.round(job.progress||0) + "%";
+        
+        if (job.status === "done" || job.status === "complete") { 
+          console.log("[stitch] Job complete, result:", job.result);
+          if (job.result?.download_url) data.download_url = job.result.download_url;
+          break; 
+        }
+        if (job.status === "failed") throw new Error(job.error || "Failed");
+      }
     }
-
-    const finalDur = data.final_duration ?? state.origDuration;
-    el["final-duration"].textContent = fmtTime(finalDur);
-    const ratio = state.origDuration ? finalDur / state.origDuration : 1;
-    el["dur-ratio"].textContent = `${(ratio * 100).toFixed(0)}%`;
-    el["dur-ratio"].style.color = ratio > 1.2 ? "var(--warn)" : "var(--success)";
-
-    const url = data.download_url || data.output_url;
-    if (url) {
-      el["download-link"].href = url;
-      el["download-link"].hidden = false;
+    
+    const dl = $("download-link");
+    console.log("[stitch] Download URL:", data.download_url, "Element:", dl);
+    if (dl && data.download_url) { 
+      dl.href = data.download_url; 
+      dl.hidden = false;
+      dl.style.display = "block";  // Force display
+      console.log("[stitch] Download link shown");
     }
-    toast("Video stitched successfully", "ok");
-  } catch (err) {
-    toast(`Stitch failed: ${err.message}`, "err");
+    if (lbl) lbl.textContent = "✅ Stitch complete!";
+    toast("✅ Video stitched! Click Download below.", "ok");
+  } catch (e) {
+    console.error("[stitch] Error:", e);
+    toast("Error: " + e.message, "err");
+    if (lbl) lbl.textContent = "Error";
   } finally {
-    el["stitch-btn"].disabled = false;
-    el["stitch-btn"].textContent = "🎞️ Stitch Video";
+    if (btn) { btn.disabled = false; btn.textContent = "🎞️ Stitch Video"; }
   }
 }
 
-/* ============ Helpers ============ */
-function fmtTime(sec) {
-  sec = Math.max(0, Math.round(sec || 0));
-  const m = Math.floor(sec / 60), s = sec % 60;
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-function esc(str) {
-  return String(str ?? "").replace(/[&<>"']/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-}
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function fmtTime(s) { s = Math.round(s||0); return Math.floor(s/60) + ":" + String(s%60).padStart(2,"0"); }
+function fmtDur(s) { return (s||0).toFixed(1) + "s"; }
+function esc(s) { return String(s||"").replace(/[<>&]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;"})[c]); }
 
-let toastTimer;
-function toast(msg, type = "") {
-  clearTimeout(toastTimer);
-  el["toast"].textContent = msg;
-  el["toast"].className = "toast" + (type ? " " + type : "");
-  el["toast"].hidden = false;
-  toastTimer = setTimeout(() => { el["toast"].hidden = true; }, 3200);
+function updateDurationPreview() {
+  if (!state.segments.length) return;
+  
+  // Calculate original duration (from segments)
+  const origDur = state.segments.reduce((max, s) => Math.max(max, s.end || 0), 0);
+  
+  // Calculate extended duration based on TTS durations and fit strategies
+  let totalExtension = 0;
+  let extendCount = 0;
+  
+  state.segments.forEach(s => {
+    if (s.tts_duration && s.duration) {
+      const overflow = s.tts_duration - s.duration;
+      if (overflow > 0) {
+        // If fit is 'extend' or auto with overflow, count as extension
+        if (s.fit === 'extend' || (s.fit === 'auto' && overflow > s.duration * 0.35)) {
+          totalExtension += overflow;
+          extendCount++;
+        }
+      }
+    }
+  });
+  
+  const finalDur = origDur + totalExtension;
+  const ratio = origDur > 0 ? (finalDur / origDur * 100) : 100;
+  
+  // Update UI elements
+  const origEl = $("orig-duration");
+  const finalEl = $("final-duration");
+  const infoEl = $("timeline-info");
+  const summaryEl = $("extension-summary");
+  const ratioEl = $("dur-ratio");
+  const origBar = $("timeline-original");
+  const extBar = $("timeline-extended");
+  
+  if (origEl) origEl.textContent = fmtDur(origDur);
+  if (finalEl) finalEl.textContent = fmtDur(finalDur);
+  
+  // Update bars width (original = 100%, extended = ratio%)
+  if (origBar) origBar.style.width = "100%";
+  if (extBar) extBar.style.width = Math.min(ratio, 150) + "%";
+  
+  // Update info text
+  if (infoEl) {
+    const segsWithTts = state.segments.filter(s => s.tts_duration).length;
+    infoEl.textContent = `${segsWithTts}/${state.segments.length} segments have TTS`;
+  }
+  
+  // Update extension summary
+  if (summaryEl) {
+    if (totalExtension > 0.1) {
+      summaryEl.innerHTML = `<span class="ext-warn">⚠️ ${extendCount} segment(s) will extend video by +${fmtDur(totalExtension)}</span>`;
+    } else {
+      summaryEl.innerHTML = `<span class="ext-ok">✅ No video extensions needed</span>`;
+    }
+  }
+  
+  // Update duration ratio badge
+  if (ratioEl) {
+    ratioEl.textContent = ratio.toFixed(0) + "%";
+    ratioEl.className = "dur-ratio-badge " + (ratio > 120 ? "ratio-warn" : "ratio-ok");
+  }
+}
+
+function toast(msg, type) {
+  const t = $("toast");
+  if (t) { t.textContent = msg; t.className = "toast " + (type||""); t.hidden = false; setTimeout(() => t.hidden = true, 4000); }
+  console.log("[toast]", type, msg);
 }

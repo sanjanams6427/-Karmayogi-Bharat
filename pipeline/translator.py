@@ -518,13 +518,21 @@ def _naturalise(text: str, tgt_lang: str = "") -> str:
     # Strip Dogri फोरन/फोर/ऐम्म prefix artifacts
     text = re.sub(r'^\u092b\u094b\u0930(?:\u0928)?\s+', '', text)
     text = re.sub(r'^\u0910\u092e\u094d\u092e\s+', '', text)
+    # Strip Maithili बाय* prefix artifacts from Hindi pivot (बायपास/बायस/बायला/बायोटर्क etc.)
+    if tgt_lang.split('_')[0] == 'mai':
+        text = re.sub(r'^\u092c\u093e\u092f[\u0900-\u097F]{0,8}\s+', '', text)
     # Fix Maithili postposition spacing: NLLB inserts space before क/मे/सं postpositions
     # e.g. वायुमंडल क → वायुमंडलक, हवा मे → हवामे
     if tgt_lang.split('_')[0] == 'mai':
-        text = re.sub(r'([\u0900-\u097F]) \u0915(?=[\s\u0964\u0965,;]|$)', r'\1\u0915', text)
-        text = re.sub(r'([\u0900-\u097F]) \u092e\u0947(?=[\s\u0964\u0965,;]|$)', r'\1\u092e\u0947', text)
+        text = re.sub('([\u0900-\u097F]) \u0915(?=[\s\u0964\u0965,;]|$)', lambda m: m.group(1) + '\u0915', text)
+        text = re.sub('([\u0900-\u097F]) \u092e\u0947(?=[\s\u0964\u0965,;]|$)', lambda m: m.group(1) + '\u092e\u0947', text)
+    # Strip mni IndicTrans2 hallucination prefix ঵িশ্঵ (corrupted বিশ্ব)
+    if tgt_lang.split('_')[0] == 'mni':
+        text = re.sub(r'^঵িশ্঵[দপ্রসিদ্ধশং]?\s*', '', text)
     # Strip Urdu کا / کہ sentence-initial artifacts (bare prepositions)
     text = re.sub(r'^(?:\u06a9\u0627|\u06a9\u06c1)\s+', '', text)
+    # Strip Maithili छे. / छे sentence-initial copula artifact leaking into Hindi
+    text = re.sub(r'^\u091b\u0947\.?\s+', '', text)
     # Strip Bodo stray single-quote artifacts around technical terms (IndicTrans2 artifact)
     # e.g. खफ 'खालामनाय बुंनाय जायो । लाइफांफोराबो खफ' खौ → remove the stray quotes
     if tgt_lang.split('_')[0] == 'bod':
@@ -533,6 +541,18 @@ def _naturalise(text: str, tgt_lang: str = "") -> str:
     # Hindi question sentences ending with danda → replace with ?
     if _HIN_QUESTION_RE.search(text):
         text = text.rstrip('\u0964\u0965').rstrip() + '?'
+    # Strip OCR page-reference artifacts that ASR picks up from slide images.
+    # These appear as translated versions of "picture on page N" in various scripts.
+    # mar: "१५ पानांवरील चित्र" / pan: "ਸਫ਼ਾ 3 ਉੱਤੇ ਤਸਵੀਰ"
+    text = re.sub(r'[\u0966-\u096f\d]+\s+\u092a\u093e\u0928\u093e\u0902\u0935\u0930\u0940\u0932\s+\u091a\u093f\u0924\u094d\u0930\.?\s*', '', text)
+    text = re.sub(r'\u0a38\u0a2b\u0a3c\u0a3e\s+\d+\s+\u0a09\u0a71\u0a24\u0a47\s+\u0a24\u0a38\u0a35\u0a40\u0a30\.?\s*', '', text)
+    # Strip Maithili morphemes that survived the drift guard in Hindi output
+    if tgt_lang.split('_')[0] == 'hin':
+        text = re.sub(r'\u0938\u092e\u092f\u092e\u0947(?=[\s\u0964\u0965]|$)', '\u0938\u092e\u092f \u092e\u0947\u0902', text)
+        text = re.sub(r'\u0915\u093f\u091b\u0941(?=[\s\u0964\u0965]|$)', '\u0915\u0941\u091b', text)
+        text = re.sub(r'\u0913\s+\u092b\u094b\u091f\u094b\s+\u0916\u093f\u091a\u092f\u092c\u093e\u0915[^\u0964\u0965.!?]*', '\u092b\u093c\u094b\u091f\u094b \u0916\u093f\u0902\u091a\u0935\u093e\u0928\u0947 \u0915\u0947 \u0905\u0935\u0938\u0930 \u0915\u0947 \u0932\u093f\u090f', text)
+        text = re.sub(r'\u0915\u0915\u094d\u0937\u092e\u0947(?=[\s\u0964\u0965]|$)', '\u092c\u0948\u0920\u0915 \u0915\u0915\u094d\u0937 \u092e\u0947\u0902', text)
+        text = re.sub(r'\u0906\u092c\s+\u092e\u093e\u0928\u0928\u0940\u092f(?=[\s\u0964\u0965]|$)', '\u0905\u092c \u092e\u093e\u0928\u0928\u0940\u092f', text)
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
 
@@ -622,6 +642,15 @@ def _final_quality_check(
     #    (≤15 chars) for all scripts, strips untranslated English sentences.
     translated = _clean_mixed_lang(translated, tgt_lang)
 
+    # 8b. Santhali (sat) Ol Chiki validator — flag for review if no Ol Chiki,
+    #     but do NOT discard: SeamlessM4T produces Bengali-script Santhali which
+    #     is better than silence. MMS-TTS sat handles Bengali-script input.
+    if tgt_lang == "sat":
+        ol_chiki_chars = sum(1 for c in translated if '\u1C50' <= c <= '\u1C7F')
+        if ol_chiki_chars == 0 and translated.strip():
+            flags.append("fqc:sat_no_ol_chiki")
+            # keep output — do not discard to empty
+
     # 9. Formatting — normalise whitespace
     translated = re.sub(r" {2,}", " ", translated).strip()
 
@@ -638,6 +667,12 @@ try:
     _gpu = int(_os.environ.get("PIPELINE_GPU", "0"))
 except ValueError:
     _gpu = 0
+
+# IndicTrans2 mni_Beng hallucination detector.
+# IndicTrans2 en_indic generates training-data-like Bengali text prefixed with
+# a corrupted বিশ্ব ("world") rendered as \u09b5\u09bf\u09b6\u09cd\u09b5 — never appears in real Manipuri output.
+# Any occurrence = hallucination → discard and retry via NLLB.
+_MNI_HALLUCINATION_RE = re.compile(r'\u09b5\u09bf\u09b6\u09cd\u09b5')
 
 # Module-level drift-detection regexes (shared by single and batch paths)
 _MAITHILI_DRIFT_RE = re.compile(
@@ -688,6 +723,43 @@ _HINDI_IN_BOD_RE = re.compile(
     r'|\u0939\u094b\u0924\u0940(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'
     r'|\u0939\u094b\u0924\u0947(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'
 )
+# Bodo morphemes that must never appear in Hindi output.
+# Bodo (brx_Deva) shares Devanagari script with Hindi — script-level stripping
+# cannot catch it. These are high-frequency Bodo-only morphemes.
+_BODO_IN_HIN_RE = re.compile(
+    r'\u0916\u093e\u0932\u093e\u092e\u094b(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # खालामो
+    r'|\u0913\u0902\u0916\u093e\u0930(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # ओंखार
+    r'|\u0917\u0941\u0926\u0941\u0902(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # गुदुं
+    r'|\u0906\u0930\u094b(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'                    # आरो (Bodo "and")
+    r'|\u0928\u093f\u092b\u094d\u0930\u093e\u092f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # निफ्राय
+    r'|\u0938\u094b\u0932\u093e\u092f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # सोलाय
+    r'|\u092c\u093f\u0925\u093f\u0902(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # बिथिं
+    r'|\u092b\u093e\u0930\u093f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'              # फारि
+    r'|\u0917\u0947\u091c\u0947\u0930(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # गेजेर
+    r'|\u0932\u093e\u0902\u0913(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'              # लांओ
+    r'|\u0926\u0948\u0916\u094c(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'              # दैखौ
+    r'|\u091c\u093e\u092f\u0928\u093f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # जायनि
+    r'|\u092e\u094b\u0928\u0938\u0947(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # मोनसे
+    r'|\u0917\u094b\u0928\u093e\u0902(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # गोनां
+)
+# Maithili morphemes that must never appear in Hindi output (threshold=1).
+_MAITHILI_IN_HIN_RE = re.compile(
+    r'\u091b\u0948\u0915(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'   # छैक
+    r'|\u0939\u094b\u092f\u0924(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # होयत
+    r'|\u091c\u093e\u0928\u093f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # जानि
+    r'|\u0932\u093f\u0905(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # लिअ
+    r'|\u092c\u0930\u0916\u093e\u0915(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # बरखाक
+    r'|\u0935\u0930\u094d\u0937\u093e\u0915\u0940(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # वर्षाकी
+    # Additional Maithili morphemes found in KB_COURSE_001 Hindi output
+    r'|\u0938\u092e\u092f\u092e\u0947(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # समयमे (Maithili locative)
+    r'|\u0915\u093f\u091b\u0941(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'        # किछु (Maithili "something")
+    r'|\u0913(?=\s+\u092b\u094b\u091f\u094b)'                                   # ओ फोटो (Maithili 3rd person)
+    r'|\u0916\u093f\u091a\u092f\u092c\u093e\u0915(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # खिचयबाक
+    r'|\u0915\u0915\u094d\u0937\u092e\u0947(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # कक्षमे
+    r'|\u0906\u092c\s+\u092e\u093e\u0928\u0928\u0940\u092f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # आब माननीय
+    r'|\u091b\u0947\.(?=[\s]|$)'  # छे. (Maithili copula artifact prefix)
+    r'|^\u091b\u0947\s'           # छे at sentence start
+)
 _HIN_SUBJ_NOUNS_RE = re.compile(
     r'(?:^|\s)(?:'
     r'\u0938\u0942\u0930\u094d\u092f|\u092f\u0939|\u0935\u0939|\u0935\u0947|\u0939\u092e'
@@ -707,6 +779,18 @@ _HIN_TRANS_VERB_RE = re.compile(
     r'|\u0917\u0930\u094d\u092e\s+\u0915\u0930\u0924\u0940'
 )
 _SENT_SPLIT_RE = re.compile(r'(?<=[.!?\u0964])\s+')
+
+# Sub-language detection regexes for indic_indic rerouting
+_DEVA_RE = re.compile(r'[\u0900-\u097F]')
+_BODO_MORPHEME_RE = re.compile(
+    r'\u0916\u093e\u0932\u093e\u092e\u094b|\u0917\u0941\u0926\u0941\u0902'
+    r'|\u0932\u093e\u0902\u0913|\u0928\u093f\u092b\u094d\u0930\u093e\u092f'
+    r'|\u0917\u0947\u091c\u0947\u0930|\u092c\u093f\u0925\u093f\u0902'
+)
+_MAITHILI_MORPHEME_RE = re.compile(
+    r'\u091b\u0948\u0915|\u0905\u091b\u093f|\u091b\u0925\u093f'
+    r'|\u0915\u0930\u0948\u0924|\u091c\u093e\u0928\u093f|\u0915\u093f\u091b\u0941'
+)
 DEVICE       = f"cuda:{_gpu}" if torch.cuda.is_available() else "cpu"
 SEAMLESS_DEV = DEVICE
 NLLB_DEV     = DEVICE
@@ -715,21 +799,27 @@ MODELS_DIR  = Path(__file__).parent.parent / "models"
 
 class Translator:
     # Langs routed via Hindi pivot through IndicTrans2 indic_indic
-    # sat: low-resource — pivot via Hindi, then SeamlessM4T as score-based fallback
-    _PIVOT_LANGS = {"sat"}
+    # sat: low-resource Ol Chiki — SeamlessM4T primary (supports sat natively),
+    #      then IndicTrans2 pivot via Hindi as fallback
+    # doi: doi_Deva works via Hindi pivot (IndicTrans2 en_indic→hin, then hin→doi_Deva)
+    # kok: gom_Deva works via Hindi pivot (IndicTrans2 en_indic→hin, then hin→gom_Deva)
+    # mai: mai_Deva — NLLB produces English passthrough; SeamlessM4T via pivot is better
+    _PIVOT_LANGS = {"sat", "doi", "kok", "mai"}
+
+    # Langs where SeamlessM4T is tried FIRST before pivot (better quality for these)
+    _SEAMLESS_FIRST = {"sat"}  # SeamlessM4T has native sat support
 
     # Force NLLB as primary — IndicTrans2 outputs Hindi/garbage for these
     # After NLLB, try SeamlessM4T as a score-based second opinion
-    # kok (Konkani): IndicTrans2 produces English passthrough + emoji garbage — NLLB is only working option
     # ben: IndicTrans2 en_indic outputs Hindi transliterated into Bengali script — NLLB gives real Bengali
-    # mni: both IndicTrans2 and Seamless produce repeated garbage — NLLB has mni_Mtei support
-    # mar: IndicTrans2 prepends किवा/किवी/किडे artifacts — NLLB is cleaner
     # ory: IndicTrans2 prepends ମରିଯୁ artifact on every segment — NLLB is cleaner
     # asm: IndicTrans2 prepends টাৰ/টা artifact on every segment — NLLB is cleaner
     # pan: IndicTrans2 prepends ਨਾ ਸਿਰਫ ("not only") on every segment — NLLB is cleaner
-    # san: IndicTrans2 prepends ਪਾਲ੍ਯ/ਪਾਲਕ artifacts — NLLB is cleaner
-    # doi: IndicTrans2 prepends ਫੋਰਨ/ਫੋਰ artifacts — NLLB is cleaner
-    _NLLB_FIRST = {"snd", "kas", "kok", "ben", "mni", "mar", "ory", "asm", "pan", "san", "doi", "mai", "kan", "mal"}
+    # NOTE: doi/kok/mai removed from _NLLB_FIRST — they are now routed via _PIVOT_LANGS
+    # NOTE: kan/mal/mar/san removed — IndicTrans2 is primary for these (NLLB was causing regressions)
+    # mni: IndicTrans2 en_indic hallucinates for mni_Beng (঵িশ্঵ prefix pattern) — NLLB+Seamless primary
+    # snd/kas: NLLB primary — IndicTrans2 has no snd support; kas_Arab is better in NLLB
+    _NLLB_FIRST = {"snd", "kas", "ben", "ory", "asm", "pan", "mni"}
 
     def __init__(self):
         self._indic_trans2: dict = {}
@@ -787,8 +877,8 @@ class Translator:
                 # torch.compile gives ~20% speedup on repeated forward passes
                 try:
                     model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-                except Exception:
-                    pass  # compile unavailable (torch < 2.0 or Windows dynamo issue)
+                except Exception as _compile_err:
+                    log.info(f"torch.compile unavailable ({_compile_err}) — running eager mode")
             processor = IndicProcessor(inference=True)
             self._indic_trans2[direction] = {
                 "tokenizer": tokenizer, "model": model, "processor": processor,
@@ -839,7 +929,7 @@ class Translator:
             ).to(SEAMLESS_DEV)
             inputs = {k: v.to(torch.float16) if v.is_floating_point() else v
                       for k, v in inputs.items()}
-            with torch.no_grad():
+            with torch.inference_mode():
                 out = model.generate(
                     **inputs,
                     tgt_lang=SEAMLESS_CODES[tgt_lang],
@@ -971,7 +1061,7 @@ class Translator:
         length_pen = 1.2 if tgt_short in _DEVA_LANGS_TR else 1.0
         # Run model only if there are active (non-rerouted) texts
         if inputs is not None:
-            with torch.no_grad():
+            with torch.inference_mode():
                 output = model.generate(
                     **inputs, forced_bos_token_id=tgt_id,
                     max_new_tokens=max_new_tok, num_beams=num_beams,
@@ -986,19 +1076,23 @@ class Translator:
 
         # Fix multi-sentence truncation: IndicTrans2 drops the first sentence when
         # the input contains two sentences (e.g. "A. B.") — it only translates B.
-        # Detect: source has 2+ sentences (split on '. ') but output is suspiciously
-        # short relative to the first sentence alone. Re-translate sentence by sentence
-        # and concatenate.
+        # Detect: source has 2+ sentences but output is suspiciously short relative
+        # to the FULL source length (not just the first sentence — that check is
+        # fooled when the short Tamil output happens to be ≥80% of sentence[0]).
         for _si, _ai in enumerate(_active_indices):
             _src = texts[_ai]
             _out = active_results[_si] if _si < len(active_results) else ""
             _src_sents = [s.strip() for s in _SENT_SPLIT_RE.split(_src) if s.strip()]
             if len(_src_sents) < 2:
                 continue
-            # If output is shorter than 50% of what the first sentence alone would produce
-            # (rough estimate: target chars ≈ source chars * 1.3 for Indic scripts),
-            # the first sentence was likely dropped — re-translate sentence by sentence.
-            _expected_min = len(_src_sents[0]) * 0.8
+            # Fire when output is shorter than 40% of the full source length.
+            # 40% accounts for agglutinative scripts (Tamil/Telugu/Malayalam) that
+            # are naturally more compact than English, while still catching severe
+            # truncation (seg 41: 60 Tamil chars vs 400 English chars = 15%).
+            # For Tamil specifically use 30% — Tamil is highly agglutinative and
+            # legitimate translations can be 35-40% of English source length.
+            _tgt_short_for_thresh = _flores_to_short.get(tgt_lang, "")
+            _expected_min = len(_src) * (0.30 if _tgt_short_for_thresh == "tam" else 0.40)
             if len(_out) >= _expected_min:
                 continue
             try:
@@ -1010,7 +1104,7 @@ class Translator:
                     _si2 = {k: v.to(DEVICE) for k, v in _si2.items()}
                     _si2 = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
                             for k, v in _si2.items()}
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         _so = model.generate(
                             **_si2, forced_bos_token_id=tgt_id,
                             max_new_tokens=max_new_tok, num_beams=num_beams,
@@ -1032,6 +1126,7 @@ class Translator:
             r'^(?:'
             r'[\u0900-\u097F]{2,3}\s+'                    # 2-3 Devanagari chars + SPACE
             r'|\u091b\u0947[\u0900-\u097F]{1,4}\s*'       # छे + 1-4 more Devanagari chars (fused artifact)
+            r'|\u091b\u0947\.\s*'                           # छे. standalone Maithili copula artifact
             r'|\u091a\u0947[\u0900-\u097F]{1,4}\s*'       # चे + 1-4 more Devanagari chars
             # Nepali hallucination prefixes: ते/तेता/तेपनि/तेखार्ने/तेन्जेल/तेपास/तेहिलो etc.
             r'|\u0924\u0947(?:\u0924\u093e|\u0938\u0948|\u0916\u093e\u0915\u094b|\u092a\u0928\u093f|\u0916\u093e\u0930\u094d\u0928\u0947|\u0928\u094d\u091c\u0947\u0932|\u092a\u093e\u0938|\u0939\u093f\u0932\u094b|\u0928\u0940|\u0924\u094d\u0930\u0948)?\s+'
@@ -1059,6 +1154,8 @@ class Translator:
             # Dogri: फोरन/फोर/ऐम्म/गी prefix artifacts
             r'|\u092b\u094b\u0930(?:\u0928)?\s+'
             r'|\u0910\u092e\u094d\u092e\s+'
+            # Maithili: बाय* pivot artifacts (बायपास/बायस/बायला/बायोटर्क etc.)
+            r'|\u092c\u093e\u092f[\u0900-\u097F]{0,8}\s+'
             # Urdu: کا / کہ sentence-initial bare preposition artifacts
             r'|(?:\u06a9\u0627|\u06a9\u06c1)\s+'
             r'|[)\]}>]+\s*'
@@ -1091,7 +1188,7 @@ class Translator:
                     _solo_inp   = {k: v.to(DEVICE) for k, v in _solo_inp.items()}
                     _solo_inp   = {k: v.to(dtype=model_dtype) if v.is_floating_point() else v
                                    for k, v in _solo_inp.items()}
-                    with torch.no_grad():
+                    with torch.inference_mode():
                         _solo_out = model.generate(
                             **_solo_inp, forced_bos_token_id=tgt_id,
                             max_new_tokens=max_new_tok, num_beams=num_beams,
@@ -1102,8 +1199,8 @@ class Translator:
                     _solo_res = processor.postprocess_batch(_solo_dec, lang=tgt_lang)
                     if _solo_res and len(_solo_res[0]) > len(_res):
                         results[_ai] = _solo_res[0]
-                except Exception:
-                    pass  # keep original batch result
+                except Exception as _solo_err:
+                    log.debug(f"Solo retry failed for idx={_ai}: {_solo_err}")  # keep original batch result
         # Restore + verify per result: non-translatable first, then factual, then format
         final = []
         for t, nt_map, fmap, fmt_map, orig in zip(results, nt_maps, factual_maps, fmt_maps, texts):
@@ -1134,9 +1231,27 @@ class Translator:
                             t = _clean_unk(nllb_t)
                     except Exception as _nd:
                         log.warning(f"NLLB drift-retry failed: {_nd}")
+                # Maithili-in-Hindi: threshold=1 — any single Maithili morpheme = wrong lang
+                if _MAITHILI_IN_HIN_RE.search(t):
+                    log.warning(f"[hin] Maithili morpheme (single path) — retrying via NLLB")
+                    try:
+                        nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                        if nllb_t.strip():
+                            t = _clean_unk(nllb_t)
+                    except Exception as _nd:
+                        log.warning(f"NLLB mai-in-hin single retry failed: {_nd}")
+                # Bodo-in-Hindi: threshold=1
+                if _BODO_IN_HIN_RE.search(t):
+                    log.warning(f"[hin] Bodo drift (single path) — retrying via NLLB")
+                    try:
+                        nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                        if nllb_t.strip():
+                            t = _clean_unk(nllb_t)
+                    except Exception as _nd:
+                        log.warning(f"NLLB bodo-in-hin single retry failed: {_nd}")
             if tgt_short == "mai":
                 _hin_hits = _HINDI_IN_MAI_RE.findall(t)
-                if len(_hin_hits) >= 3:
+                if len(_hin_hits) >= 1:
                     log.warning(f"[mai] Hindi drift detected ({len(_hin_hits)} markers) — retrying via NLLB")
                     try:
                         nllb_t = self._translate_nllb(orig, NLLB_CODES.get("eng", "eng_Latn"), NLLB_CODES["mai"])
@@ -1191,7 +1306,7 @@ class Translator:
                               return_tensors="pt").to(SEAMLESS_DEV)
         inputs    = {k: v.to(torch.float16) if v.is_floating_point() else v
                      for k, v in inputs.items()}
-        with torch.no_grad():
+        with torch.inference_mode():
             output = model.generate(**inputs, tgt_lang=tgt_code,
                                     generate_speech=False, num_beams=4,
                                     no_repeat_ngram_size=4, repetition_penalty=1.3)
@@ -1206,7 +1321,7 @@ class Translator:
         inputs = tokenizer(text, return_tensors="pt",
                            truncation=True, max_length=512).to(NLLB_DEV)
         tgt_id = tokenizer.convert_tokens_to_ids(tgt_code)
-        with torch.no_grad():
+        with torch.inference_mode():
             output = model.generate(**inputs, forced_bos_token_id=tgt_id,
                                     max_new_tokens=512, num_beams=4,
                                     no_repeat_ngram_size=4, repetition_penalty=1.3)
@@ -1257,7 +1372,21 @@ class Translator:
             (src_lang in self._PIVOT_LANGS or tgt_lang in self._PIVOT_LANGS)
             and src_lang != "hin" and tgt_lang != "hin"
         )
-        force_nllb = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
+        force_nllb     = src_lang in self._NLLB_FIRST or tgt_lang in self._NLLB_FIRST
+        seamless_first = src_lang in self._SEAMLESS_FIRST or tgt_lang in self._SEAMLESS_FIRST
+
+        # 1a. SeamlessM4T-first langs (sat) — try Seamless before pivot/NLLB
+        if translated is None and seamless_first and not force_nllb and \
+                src_lang in SEAMLESS_CODES and tgt_lang in SEAMLESS_CODES:
+            try:
+                translated  = self._translate_seamless(
+                    work_text, SEAMLESS_CODES[src_lang], SEAMLESS_CODES[tgt_lang])
+                engine_used = "seamless"
+                # sat: SeamlessM4T rarely produces Ol Chiki — accept non-Ol-Chiki output
+                # rather than discarding (NLLB returns empty, silence is worse).
+                # fqc:sat_no_ol_chiki flag in _final_quality_check marks it for review.
+            except Exception as e:
+                log.warning(f"SeamlessM4T-first failed {src_name}\u2192{tgt_name}: {e}")
 
         # 1b. NLLB-first langs (kas, snd) — NLLB primary, then SeamlessM4T score-based fallback
         if translated is None and force_nllb and \
@@ -1332,8 +1461,24 @@ class Translator:
                 translated  = self._translate_nllb(
                     work_text, NLLB_CODES[src_lang], NLLB_CODES[tgt_lang])
                 engine_used = "nllb"
+                # sat: NLLB returns empty for sat_Olck — treat empty as None so
+                # Seamless output from step 1a is used instead
+                if tgt_lang == "sat" and not (translated or "").strip():
+                    translated = None
+                    engine_used = None
             except Exception as e:
                 log.warning(f"NLLB failed {src_name}\u2192{tgt_name}: {e}")
+
+        # mni hallucination guard: IndicTrans2 en_indic generates corrupted Bengali
+        # text prefixed with \u09b5\u09bf\u09b6\u09cd\u09b5 for mni_Beng — discard and use NLLB
+        if tgt_lang == "mni" and translated and _MNI_HALLUCINATION_RE.search(translated):
+            log.warning(f"[mni] IndicTrans2 hallucination detected — retrying via NLLB")
+            try:
+                translated = self._translate_nllb(
+                    work_text, NLLB_CODES["eng"], NLLB_CODES["mni"])
+                engine_used = "nllb"
+            except Exception as _mni_e:
+                log.warning(f"NLLB mni hallucination-retry failed: {_mni_e}")
 
         if translated is None:
             raise RuntimeError(
@@ -1406,7 +1551,7 @@ class Translator:
                 _DEVA_DOC = {"hin", "mar", "nep", "mai", "san", "doi", "kok", "bod"}
                 _doc_beams = 5 if _tgt_short in _DEVA_DOC else (4 if _tgt_short in {"tam", "tel", "kan", "mal"} else 3)
                 _doc_rep   = 1.3 if _tgt_short in _DEVA_DOC else 1.1
-                with torch.no_grad():
+                with torch.inference_mode():
                     output = engine["model"].generate(
                         **inputs, forced_bos_token_id=tgt_id,
                         max_new_tokens=_max_tok, num_beams=_doc_beams,
@@ -1477,6 +1622,15 @@ class Translator:
                     t = _clean_unk(trans)
                     t = _clean_mixed_lang(t, tgt_lang)
                     t = _naturalise(t, tgt_lang)
+                    # mni hallucination guard (batch path)
+                    if tgt_lang == "mni" and _MNI_HALLUCINATION_RE.search(t):
+                        log.warning(f"[mni] Hallucination in batch idx={i} — retrying via NLLB")
+                        try:
+                            nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["mni"])
+                            if nllb_t.strip():
+                                t = _clean_unk(nllb_t)
+                        except Exception as _mni_b:
+                            log.warning(f"NLLB mni batch hallucination-retry failed: {_mni_b}")
                     # Wrong-language drift guard for Hindi — threshold=2
                     # Hindi subject-drop guard (batch path)
                     if tgt_lang == "hin" and _SUBJ_DROP_RE.match(t):
@@ -1496,6 +1650,24 @@ class Translator:
                                 t = _clean_unk(nllb_t)
                         except Exception as _nd:
                             log.warning(f"NLLB drift-retry failed: {_nd}")
+                    # Maithili-in-Hindi: threshold=1 — any single Maithili morpheme = wrong lang
+                    if tgt_lang == "hin" and _MAITHILI_IN_HIN_RE.search(t):
+                        log.warning(f"[hin] Maithili morpheme in batch idx={i} — retrying via NLLB")
+                        try:
+                            nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                            if nllb_t.strip():
+                                t = _clean_unk(nllb_t)
+                        except Exception as _nd:
+                            log.warning(f"NLLB mai-in-hin batch retry failed: {_nd}")
+                    # Bodo-in-Hindi: threshold=1
+                    if tgt_lang == "hin" and _BODO_IN_HIN_RE.search(t):
+                        log.warning(f"[hin] Bodo drift in batch idx={i} — retrying via NLLB")
+                        try:
+                            nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                            if nllb_t.strip():
+                                t = _clean_unk(nllb_t)
+                        except Exception as _nd:
+                            log.warning(f"NLLB bodo-in-hin batch retry failed: {_nd}")
                     if tgt_lang == "bod":
                         _hin_in_bod_batch = _HINDI_IN_BOD_RE.findall(t)
                         if len(_hin_in_bod_batch) >= 2:
@@ -1508,7 +1680,7 @@ class Translator:
                                 log.warning(f"NLLB bod batch drift-retry failed: {_bd}")
                     if tgt_lang == "mai":
                         _hin_batch_hits = _HINDI_IN_MAI_RE.findall(t)
-                        if len(_hin_batch_hits) >= 3:
+                        if len(_hin_batch_hits) >= 1:
                             log.warning(f"[mai] Hindi drift in batch idx={i} ({len(_hin_batch_hits)} markers) — retrying via NLLB")
                             try:
                                 nllb_t = self._translate_nllb(orig, NLLB_CODES.get("eng", "eng_Latn"), NLLB_CODES["mai"])
@@ -1538,7 +1710,7 @@ class Translator:
                                     t = _clean_unk(_nllb_2nd)
                                     log.info(f"[hin] Subject-drop structural — NLLB preferred")
                             except Exception as _n2:
-                                pass
+                                log.debug(f"[hin] NLLB subject-drop structural batch retry failed: {_n2}")
 
                     # Rule 20: final quality gate — all 10 checks
                     t, fqc_flags = _final_quality_check(orig, t, tgt_lang, {}, {}, {})
@@ -1553,6 +1725,15 @@ class Translator:
                                 log.warning(f"[hin] Short batch output — NLLB retry gave longer result")
                         except Exception as _sq:
                             log.warning(f"NLLB short-output batch retry failed: {_sq}")
+                    # For Tamil/Kashmiri: if suspiciously short, retry via NLLB
+                    if tgt_lang in ("tam", "kas") and "fqc:suspiciously_short" in fqc_flags:
+                        try:
+                            nllb_t = self._translate_nllb(orig, NLLB_CODES["eng"], NLLB_CODES[tgt_lang])
+                            if nllb_t.strip() and len(nllb_t) > len(t):
+                                t = _clean_unk(nllb_t)
+                                log.warning(f"[{tgt_lang}] Short batch output — NLLB retry gave longer result")
+                        except Exception as _sq:
+                            log.warning(f"NLLB short-output {tgt_lang} batch retry failed: {_sq}")
                     # Rule 12: glossary applied last so it is never overwritten
                     if glossary:
                         t = glossary.apply(orig, src_lang, tgt_lang, t)

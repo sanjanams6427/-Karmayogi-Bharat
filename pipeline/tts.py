@@ -5,6 +5,7 @@
 # ============================================================
 
 import os, subprocess, json
+os.environ["NUMBA_DISABLE_JIT"] = "1"  # must be set before any numba/librosa import
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -59,7 +60,14 @@ _MMS_STANDALONE_LANGS = {
     "doi": "dgo",  "bod": "bod",  "mni": "mni",
     "kok": "kok",  "kas": "kas",
     "urd": "urd",  "mai": "mai",
-    # sat/snd: no standalone model downloaded — fall through to Parler
+    # sat: facebook/mms-tts-sat (Ol Chiki script — native support)
+    "sat": "sat",
+    # snd: no dedicated MMS-TTS model exists for Sindhi on HuggingFace.
+    # Urdu (urd) uses the same Nastaliq Arabic script and shares ~70% phoneme overlap.
+    # It is the closest available proxy for Sindhi TTS.
+    "snd": "urd",
+    # san: facebook/mms-tts-san (Sanskrit Devanagari — dedicated model)
+    "san": "san",
 }
 
 SR = 44100  # target sample rate
@@ -186,24 +194,30 @@ _PARLER_DESC_DEFAULT = (
 # MMS-TTS adapter codes for all 22 languages (shared-base adapter model)
 # Langs with standalone VITS (doi/san/kas/snd/kok/mni) are excluded —
 # they use _MMS_STANDALONE_LANGS and only fall through to adapter if standalone missing.
+# NOTE: hin is in _MMS_STANDALONE_LANGS (standalone VITS primary fallback for hin)
+# but also kept here so the shared adapter path works if standalone fails.
 MMS_LANG_CODES = {
     "asm": "asm", "ben": "ben", "guj": "guj", "hin": "hin",
     "kan": "kan", "mal": "mal", "mar": "mar", "ory": "ory",
     "pan": "pan", "tam": "tam", "tel": "tel",
     "urd": "urd-script_arabic", "nep": "npi", "bod": "bod",
     "mai": "mai", "sat": "sat", "snd": "snd",
-    "san": "hin",               # no san adapter - hin shares Devanagari
-    "kas": "urd-script_arabic",  # no kas adapter - urd Nastaliq is closest
-    "kok": "mar",                # no kok adapter - mar shares Devanagari
-    "mni": "ben",                # no mni adapter - ben shares Bengali script
+    # san: dedicated Sanskrit adapter (san_Deva) — preferred over hin proxy
+    "san": "san",
+    # kas: no kas adapter — urd Nastaliq is closest proxy (logged as warning)
+    "kas": "urd-script_arabic",
+    # kok: no kok adapter — mar Devanagari is closest proxy (logged as warning)
+    "kok": "mar",
+    # mni: no mni adapter — ben Bengali-script is closest proxy (logged as warning)
+    "mni": "ben",
 }
 
 
-def _trim_leading_silence(audio: np.ndarray, sr: int, threshold: float = 0.015) -> np.ndarray:
+def _trim_leading_silence(audio: np.ndarray, sr: int, threshold: float = 0.008) -> np.ndarray:
     """Trim silent/noisy preamble from Parler output.
     Parler-TTS often generates 100-300ms of near-silent noise before actual speech.
-    Threshold 0.015 — catches low-level buzz without cutting the soft onset of
-    Hindi breathy consonants (ह, भ, घ) which start at ~0.02 amplitude.
+    Threshold 0.008 — catches low-level buzz without cutting the soft onset of
+    Hindi breathy consonants (ह, भ, घ) which start at ~0.015 amplitude.
     Scans in 10ms frames, returns audio starting from first frame above threshold.
     """
     frame = int(0.010 * sr)  # 10ms frames
@@ -276,8 +290,98 @@ class TTSEngine:
         self._ai4bharat        = {}
         self._standalone_vits: dict = {}
         self._mms_load_failed  = False
-        self._mms_adapter_failed: set = set()  # per-lang adapter failures
+        # Pre-mark langs that have standalone VITS models AND no shared adapter —
+        # skip the shared adapter path entirely for these.
+        # hin has both standalone VITS AND a shared adapter (adapter.hin.safetensors)
+        # so it is NOT pre-marked — shared adapter is available as last resort.
+        _standalone_only = {k for k in _MMS_STANDALONE_LANGS if k not in MMS_LANG_CODES}
+        # snd: models/mms is a wav2vec2 ASR model — VITS adapter keys will never match.
+        # Mark failed at init so we skip straight to standalone VITS without per-segment errors.
+        # hin: same issue — models/mms has no TTS adapter for hin that matches the wav2vec2 base.
+        # hin standalone VITS (mms_standalone/hin) is the correct fallback after Parler.
+        _standalone_only.add("snd")
+        _standalone_only.add("hin")
+        self._mms_adapter_failed: set = set(_standalone_only)
         self._vits_rng_pinned: bool = False    # True while a segment batch is running
+        
+        # Voice consistency for single-segment synthesis (used by web UI)
+        self._voice_pinned: bool = False
+        self._pinned_lang: str = None
+        self._pinned_encoder_out = None  # Cached encoder output for consistent voice
+        self._pinned_desc_ids = None     # Cached description token IDs
+        self._primer_done: bool = False  # Whether primer warmup has been done
+
+    # ----------------------------------------------------------
+    # Voice pinning for consistent voice across multiple synthesize_single calls
+    # ----------------------------------------------------------
+    def pin_voice_for_session(self, lang: str):
+        """Pin voice for a session - call before synthesize_single loop.
+        
+        This ensures consistent voice across all segments by:
+        - Seeding RNG once
+        - Pre-computing encoder output once
+        - Running primer warmup
+        """
+        if self._voice_pinned and self._pinned_lang == lang:
+            return  # Already pinned for this language
+        
+        self._voice_pinned = True
+        self._pinned_lang = lang
+        self._primer_done = False
+        self._pinned_encoder_out = None
+        self._pinned_desc_ids = None
+        
+        # Seed RNG for consistent voice
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+        
+        # Pre-load Parler and cache encoder output
+        if lang not in _PARLER_SKIP_LANGS and self._load_parler():
+            desc = self._build_description(lang)
+            self._pinned_desc_ids = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
+            model_dtype = next(self._parler_model.parameters()).dtype
+            self._pinned_desc_ids = type(self._pinned_desc_ids)({
+                k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+                for k, v in self._pinned_desc_ids.items()
+            })
+            self._pinned_encoder_out = self._parler_encode_description(self._pinned_desc_ids)
+            log.info(f"[{lang}] Voice pinned — encoder cached, RNG seeded")
+            
+            # Run primer warmup
+            try:
+                _PRIMER_MAP = {
+                    "hin": "नमस्ते, आज हम एक महत्वपूर्ण विषय पर चर्चा करेंगे।",
+                    "mar": "नमस्कार, आज आपण एका महत्त्वाच्या विषयावर चर्चा करणार आहोत।",
+                    "ben": "নমস্কার, আজ আমরা একটি গুরুত্বপূর্ণ বিষয়ে আলোচনা করব।",
+                    "tam": "வணக்கம், இன்று நாம் ஒரு முக்கியமான தலைப்பைப் பற்றி விவாதிப்போம்.",
+                    "tel": "నమస్కారం, ఈ రోజు మనం ఒక ముఖ్యమైన అంశం గురించి చర్చిస్తాము.",
+                    "kan": "ನಮಸ್ಕಾರ, ಇಂದು ನಾವು ಒಂದು ಪ್ರಮುಖ ವಿಷಯದ ಬಗ್ಗೆ ಚರ್ಚಿಸುತ್ತೇವೆ.",
+                    "mal": "നമസ്കാരം, ഇന്ന് നമ്മൾ ഒരു പ്രധാന വിഷയത്തെക്കുറിച്ച് ചർച്ച ചെയ്യും.",
+                    "guj": "નમસ્તે, આજે આપણે એક મહત્વપૂર્ण વિષય પર ચર્ચા કરીશું.",
+                    "pan": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ, ਅੱਜ ਅਸੀਂ ਇੱਕ ਮਹੱਤਵਪੂਰਨ ਵਿਸ਼ੇ ਬਾਰੇ ਚਰਚਾ ਕਰਾਂਗੇ।",
+                    "ory": "ନମସ୍କାର, ଆଜି ଆମେ ଏକ ଗୁରୁତ୍ୱପୂର୍ଣ୍ଣ ବିଷୟ ଉପରେ ଆଲୋଚନା କରିବା।",
+                }
+                _primer = _PRIMER_MAP.get(lang, "नमस्ते, आज हम एक महत्वपूर्ण विषय पर चर्चा करेंगे।")
+                _primer_ids = self._parler_tokenizer(_primer, return_tensors="pt").to(DEVICE)
+                with torch.no_grad():
+                    self._parler_generate(self._pinned_desc_ids, _primer_ids, 100, 
+                                         lang=lang, encoder_outputs=self._pinned_encoder_out)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                self._primer_done = True
+                log.info(f"[{lang}] Primer warmup done — voice identity locked")
+            except Exception as e:
+                log.warning(f"[{lang}] Primer warmup failed: {e}")
+    
+    def unpin_voice(self):
+        """Release voice pinning after session synthesis is complete."""
+        self._voice_pinned = False
+        self._pinned_lang = None
+        self._pinned_encoder_out = None
+        self._pinned_desc_ids = None
+        self._primer_done = False
+        log.info("Voice unpinned")
 
     # ----------------------------------------------------------
     # Helpers
@@ -301,7 +405,14 @@ class TTSEngine:
     # ----------------------------------------------------------
     def _load_standalone_vits(self, lang: str) -> bool:
         if lang in self._standalone_vits:
-            return True
+            # Validate cached entry — reject if tokenizer is a class (bad AutoTokenizer load)
+            entry = self._standalone_vits[lang]
+            tok = entry.get("tokenizer")
+            if tok is None or isinstance(tok, type):
+                log.warning(f"Standalone VITS [{lang}] cached tokenizer is invalid — reloading")
+                del self._standalone_vits[lang]
+            else:
+                return True
         subfolder = _MMS_STANDALONE_LANGS.get(lang)
         if not subfolder:
             return False
@@ -320,6 +431,9 @@ class TTSEngine:
                 from transformers import VitsModel, AutoTokenizer
                 log.info(f"Loading standalone VITS [{lang}] from {model_path}")
                 tokenizer = AutoTokenizer.from_pretrained(str(model_path))
+                # Guard: if transformers returned the class instead of an instance, fail fast
+                if isinstance(tokenizer, type):
+                    raise RuntimeError(f"VitsTokenizer.from_pretrained returned class not instance for {lang}")
                 # Load on CPU first to avoid CUDA illegal memory access on some
                 # VITS checkpoints — move to DEVICE only after successful load.
                 model = VitsModel.from_pretrained(
@@ -348,6 +462,15 @@ class TTSEngine:
             self._standalone_vits[lang] = {"model": model, "tokenizer": tokenizer,
                                            "seed": 42}
             log.info(f"Standalone VITS [{lang}] loaded (noise_scale={_ns} natural prosody)")
+            # Warn when using a proxy model for a language with no dedicated TTS
+            _VITS_PROXY = {
+                "snd": ("urd", "Urdu", "Nastaliq Arabic script — closest available proxy; no facebook/mms-tts-snd exists"),
+            }
+            if lang in _VITS_PROXY:
+                _proxy_subfolder, _proxy_name, _reason = _VITS_PROXY[lang]
+                log.warning(
+                    f"Standalone VITS [{lang}] using proxy model '{_proxy_subfolder}' ({_proxy_name}) — {_reason}."
+                )
             # Warm up once with a short text to advance past any init RNG state,
             # then capture the RNG state — this becomes the pinned state for all inference.
             # Use a real word in the target script — VITS phonemiser produces 0 tokens
@@ -358,9 +481,9 @@ class TTSEngine:
                 "mar": "नमस्कार", "guj": "નમસ્તે",   "pan": "ਸਤਿ ਸ੍ਰੀ ਅਕਾਲ",
                 "ory": "ନମସ୍କାର", "asm": "নমস্কাৰ",  "urd": "سلام",
                 "nep": "नमस्ते",  "mai": "प्रणाम",   "doi": "नमस्ते",
-                "kok": "नमस्कार", "mni": "ꯍꯥꯌ",      "san": "नमस्ते",
+                "kok": "नमस्कार", "mni": "নমস্কার",   "san": "नमस्ते",
                 "bod": "བཀྲ་ཤིས", "sat": "ᱡᱚᱦᱟᱨ",   "kas": "سلام",
-                "snd": "سلام",
+                "snd": "سلام",  # uses urd proxy model (Nastaliq script)
             }
             _warm_text = _WARMUP_TEXT.get(lang, "नमस्ते")  # Devanagari fallback — never Latin
             try:
@@ -501,8 +624,8 @@ class TTSEngine:
                 return False
             combined = np.concatenate(wavs)
             if native != SR:
-                import librosa
-                combined = librosa.resample(combined, orig_sr=native, target_sr=SR)
+                from scipy.signal import resample as _scipy_resample
+                combined = _scipy_resample(combined, int(len(combined) * SR / native)).astype(np.float32)
             combined = _post_process(combined, SR, is_mms=True, lang=lang)
             if len(combined) / SR < 0.1:
                 log.warning(f"Standalone VITS [{lang}] output too short ({len(combined)/SR:.3f}s) — skipping")
@@ -596,7 +719,7 @@ class TTSEngine:
         Resetting seed per-segment causes different noise draws → voice drift across video.
         do_sample=True with temperature=0.6 + fixed seed = consistent Indian accent.
         """
-        temperature = 0.75  # higher = more natural Indian prosody, less robotic monotone
+        temperature = 0.6  # 0.6 = best balance of naturalness vs consistency for Hindi Devanagari
         kwargs = dict(
             prompt_input_ids=prompt_ids.input_ids,
             prompt_attention_mask=prompt_ids.attention_mask,
@@ -642,7 +765,7 @@ class TTSEngine:
             max_tok = max(self._calc_max_tokens(t) for t in texts)
             # No seed reset here — seed is pinned once before primer warmup.
             # Resetting per-batch causes voice drift between segments.
-            temperature = 0.75  # higher = more natural Indian prosody, less robotic monotone
+            temperature = 0.6  # 0.6 = best balance of naturalness vs consistency for Hindi Devanagari
             from transformers.modeling_outputs import BaseModelOutput
             attn_b = desc_ids.attention_mask.expand(n, -1).contiguous()
             kwargs = dict(
@@ -806,11 +929,11 @@ class TTSEngine:
             words = max(len(text.split()), 1)
             rate  = 2.5 if is_telugu else 3.0
             tokens = int((words / rate) * 86 * 1.5)
-            cap = 1400  # ~16s max — ASR segments never exceed this in practice
+            cap = 1800  # ~21s max — long Hindi segments need headroom
         else:
             graphemes = self._count_graphemes(text)
             tokens = int(graphemes * 43 * 1.6)
-            cap = 1400
+            cap = 1800
         return min(max(tokens, 250), cap)
 
     # Per-segment generation timeout.
@@ -831,14 +954,31 @@ class TTSEngine:
         model_dtype = next(self._parler_model.parameters()).dtype
         for _oom_attempt in range(2):
             try:
-                desc       = self._build_description(lang)
-                desc_ids   = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
-                # Cast floating-point inputs to model dtype to avoid NaN from mixed precision
-                desc_ids   = type(desc_ids)({k: v.to(dtype=model_dtype) if v.is_floating_point() else v
-                                             for k, v in desc_ids.items()})
-                enc_out    = self._parler_encode_description(desc_ids)
+                # Use cached encoder output if voice is pinned (synthesize_segments / web UI session)
+                if self._voice_pinned and self._pinned_lang == lang and self._pinned_encoder_out is not None:
+                    desc_ids = self._pinned_desc_ids
+                    enc_out  = self._pinned_encoder_out
+                    # RNG already advancing from pinned state — do NOT re-seed
+                else:
+                    # Standalone call (synthesize / synthesize_single):
+                    # seed once so every standalone call produces the same voice.
+                    # Never reset inside the retry loop — only on first attempt.
+                    if _oom_attempt == 0:
+                        torch.manual_seed(42)
+                        if torch.cuda.is_available():
+                            torch.cuda.manual_seed_all(42)
+                    desc       = self._build_description(lang)
+                    desc_ids   = self._parler_desc_tok(desc, return_tensors="pt").to(DEVICE)
+                    desc_ids   = type(desc_ids)({k: v.to(dtype=model_dtype) if v.is_floating_point() else v
+                                                 for k, v in desc_ids.items()})
+                    enc_out    = self._parler_encode_description(desc_ids)
+                
                 prompt_ids = self._parler_tokenizer(text, return_tensors="pt").to(DEVICE)
                 max_tok    = self._calc_max_tokens(text)
+                deva_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
+                _timeout = (self._PARLER_TIMEOUT_TEL if (len(text) > 0 and sum(1 for c in text if '\u0C00'<=c<='\u0C7F')/max(len(text),1)>0.4)
+                            else self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
+                            else self._PARLER_TIMEOUT_S)
                 def _gen_no_grad_synth():
                     with torch.no_grad():
                         return self._parler_generate(desc_ids, prompt_ids, max_tok,
@@ -848,10 +988,6 @@ class TTSEngine:
                 # a timed-out generation (causes CUDA state corruption on next call).
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 _fut = _ex.submit(_gen_no_grad_synth)
-                deva_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
-                _timeout = (self._PARLER_TIMEOUT_TEL if (len(text) > 0 and sum(1 for c in text if '\u0C00'<=c<='\u0C7F')/max(len(text),1)>0.4)
-                            else self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
-                            else self._PARLER_TIMEOUT_S)
                 try:
                     gen = _fut.result(timeout=_timeout)
                 except concurrent.futures.TimeoutError:
@@ -1186,6 +1322,19 @@ class TTSEngine:
                             failed_idxs.append(i)
                 batch_start += bs
                 b += 1
+            # MMS fallback for Parler-failed segments.
+            # Restore VITS pinned RNG state before the first MMS call so the
+            # fallback segments share the same voice baseline as the VITS path.
+            _vits_eng = self._standalone_vits.get(lang)
+            if _vits_eng and _vits_eng.get("pinned_cpu_rng") is not None:
+                torch.set_rng_state(_vits_eng["pinned_cpu_rng"])
+                if _vits_eng.get("pinned_cuda_rng") is not None and torch.cuda.is_available():
+                    torch.cuda.set_rng_state_all(_vits_eng["pinned_cuda_rng"])
+            else:
+                torch.manual_seed(42)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(42)
+            self._vits_rng_pinned = True  # keep pinned for MMS batch calls below
             for i in failed_idxs:
                 text_f = self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=True)
                 path_f = results[i]["audio_path"]
@@ -1214,7 +1363,15 @@ class TTSEngine:
             if not ok:
                 slot = max(0.1, segments[i].get("end", 0) - segments[i].get("start", 0))
                 self._write_silence(slot, path)
-                log.warning(f"No TTS for [{lang}] seg {i} — silence written")
+                # ERROR-level so silent failures are visible in pipeline.log
+                log.error(
+                    f"[{LANG_NAMES.get(lang, lang)}] seg {i} SILENT FAILURE — "
+                    f"all TTS engines failed (standalone_vits={lang in _MMS_STANDALONE_LANGS}, "
+                    f"mms_adapter={lang in MMS_LANG_CODES}). "
+                    f"Silence written for {slot:.2f}s slot."
+                )
+                # Mark the segment result so metadata reflects the failure
+                results[i]["tts_silent_failure"] = True
 
         self._vits_rng_pinned = False  # reset for next language
         return results
@@ -1283,6 +1440,15 @@ class TTSEngine:
                     )
                 # Only set _mms_current_lang AFTER successful adapter load
                 self._mms_current_lang = lang
+                # Warn when using a proxy adapter (wrong-language voice)
+                _PROXY_ADAPTERS = {"kas": "urd-script_arabic", "kok": "mar", "mni": "ben"}
+                if lang in _PROXY_ADAPTERS:
+                    log.warning(
+                        f"MMS-TTS [{lang}] using proxy adapter '{_PROXY_ADAPTERS[lang]}' — "
+                        f"no native {lang} adapter exists. Voice will sound like "
+                        f"{'Urdu' if lang == 'kas' else 'Marathi' if lang == 'kok' else 'Bengali'}. "
+                        f"Download facebook/mms-tts-{lang} to models/mms_standalone/{lang} for native voice."
+                    )
                 log.info(f"MMS-TTS adapter loaded: {lang} ({adapter_code})")
             return True
         except Exception as e:
@@ -1303,6 +1469,13 @@ class TTSEngine:
         if not self._load_mms(lang):
             return [False] * len(texts)
         results = [False] * len(texts)
+        # Seed once before the batch so every adapter call produces the same voice.
+        # _vits_rng_pinned=True means synthesize_segments already set the state —
+        # don't override it, let it advance naturally for voice continuity.
+        if not getattr(self, "_vits_rng_pinned", False):
+            torch.manual_seed(42)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(42)
         # Process one-at-a-time: avoids padding artifacts (Tamil underscores)
         # and silent truncation of long sequences (Malayalam)
         for i, (text, path) in enumerate(zip(texts, paths)):

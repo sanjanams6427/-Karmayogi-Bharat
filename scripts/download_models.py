@@ -82,7 +82,10 @@ MODELS = [
     ("facebook/mms-tts-mai", "mms_standalone/mai", "MMS-TTS Maithili", ["config.json"]),
     ("facebook/mms-tts-san", "mms_standalone/san", "MMS-TTS Sanskrit", ["config.json"]),
     ("facebook/mms-tts-sat", "mms_standalone/sat", "MMS-TTS Santhali", ["config.json"]),
-    ("facebook/mms-tts-snd-script_devanagari", "mms_standalone/snd", "MMS-TTS Sindhi", ["config.json"]),
+    ("facebook/mms-tts-kas", "mms_standalone/kas", "MMS-TTS Kashmiri", ["config.json"]),
+    # snd: facebook/mms-tts-snd does NOT exist on HuggingFace.
+    # Pipeline uses mms_standalone/urd (Urdu Nastaliq) as proxy for Sindhi TTS.
+    # No download needed — urd is already in the list above.
 ]
 
 

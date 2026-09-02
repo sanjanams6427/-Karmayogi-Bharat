@@ -18,178 +18,484 @@
     </div>
     <div class="header-status">
       <span id="sovereign-badge" class="badge badge-sovereign">🇮🇳 Sovereign Mode</span>
-      <span id="session-badge" class="badge badge-muted">No Session</span>
+      <span id="pipeline-status" class="badge badge-muted">Loading...</span>
     </div>
   </header>
 
-  <main class="layout">
-    <!-- ===== LEFT / CENTER COLUMN ===== -->
-    <section class="main-col">
+  <!-- ===== TAB NAVIGATION ===== -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="segment-editor">✂️ Segment Editor</button>
+    <button class="tab-btn" data-tab="batch-dubbing">🎬 Batch Dubbing</button>
+    <button class="tab-btn" data-tab="translate-doc">📄 Translate Doc</button>
+    <button class="tab-btn" data-tab="qa-cert">📋 QA Certificate</button>
+    <button class="tab-btn" data-tab="human-review">👤 Human Review</button>
+    <button class="tab-btn" data-tab="corrections">🔧 Corrections</button>
+    <button class="tab-btn" data-tab="monthly">📅 Monthly</button>
+    <button class="tab-btn" data-tab="glossary">📖 Glossary</button>
+    <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+  </nav>
 
-      <!-- UPLOAD SECTION -->
-      <div class="card" id="upload-card">
-        <h2 class="card-title">1 · Create Session</h2>
-        <div class="upload-grid">
-          <div id="dropzone" class="dropzone" tabindex="0">
-            <input type="file" id="video-input" accept="video/*,audio/*" hidden />
-            <div class="dropzone-inner">
-              <span class="dz-icon">⬆️</span>
-              <p class="dz-title">Drag &amp; drop video / audio here</p>
-              <p class="dz-hint">or <button type="button" id="browse-btn" class="link-btn">browse files</button></p>
-              <p id="file-name" class="dz-file"></p>
+  <!-- ===== PAGE 1: SEGMENT EDITOR ===== -->
+  <div class="tab-page active" id="page-segment-editor">
+    <main class="layout">
+      <section class="main-col">
+        <!-- UPLOAD SECTION -->
+        <div class="card" id="upload-card">
+          <h2 class="card-title">1 · Create Session</h2>
+          <div class="upload-grid">
+            <div id="dropzone" class="dropzone" tabindex="0">
+              <input type="file" id="video-input" accept="video/*,audio/*" hidden />
+              <div class="dropzone-inner">
+                <span class="dz-icon">⬆️</span>
+                <p class="dz-title">Drag &amp; drop video / audio here</p>
+                <p class="dz-hint">or <button type="button" id="browse-btn" class="link-btn">browse files</button></p>
+                <p id="file-name" class="dz-file"></p>
+              </div>
+            </div>
+            <div class="upload-controls">
+              <label class="field"><span>Source Language</span><select id="src-lang"></select></label>
+              <label class="field"><span>Target Language</span><select id="tgt-lang"></select></label>
+              <button id="create-session-btn" class="btn btn-primary" disabled>Create Session</button>
+              <div class="progress-wrap" id="upload-progress-wrap" hidden>
+                <div class="progress"><div class="progress-bar" id="upload-progress"></div></div>
+                <span class="progress-label" id="upload-progress-label">Uploading…</span>
+              </div>
             </div>
           </div>
+        </div>
 
-          <div class="upload-controls">
-            <label class="field">
-              <span>Source Language</span>
-              <select id="src-lang"></select>
-            </label>
-            <label class="field">
-              <span>Target Language</span>
-              <select id="tgt-lang"></select>
-            </label>
-            <button id="create-session-btn" class="btn btn-primary" disabled>Create Session</button>
-            <div class="progress-wrap" id="upload-progress-wrap" hidden>
-              <div class="progress"><div class="progress-bar" id="upload-progress"></div></div>
-              <span class="progress-label" id="upload-progress-label">Uploading…</span>
+        <!-- BATCH OPERATIONS BAR -->
+        <div class="card batch-bar" id="batch-card">
+          <h2 class="card-title">2 · Batch Operations</h2>
+          <div class="batch-controls">
+            <button id="translate-all-btn" class="btn btn-ghost" disabled>🌐 Translate All</button>
+            <button id="tts-all-btn" class="btn btn-ghost" disabled>🔊 Generate All TTS</button>
+            <button id="auto-approve-btn" class="btn btn-ghost" disabled>✅ Auto-Approve</button>
+            <div class="progress-wrap batch-progress">
+              <div class="progress"><div class="progress-bar" id="batch-progress"></div></div>
+              <span class="progress-label" id="batch-progress-label">Idle</span>
             </div>
           </div>
         </div>
-      </div>
 
-      <!-- BATCH OPERATIONS BAR -->
-      <div class="card batch-bar" id="batch-card">
-        <h2 class="card-title">2 · Batch Operations</h2>
-        <div class="batch-controls">
-          <button id="translate-all-btn" class="btn btn-ghost" disabled>🌐 Translate All</button>
-          <button id="tts-all-btn" class="btn btn-ghost" disabled>🔊 Generate All TTS</button>
-          <button id="auto-approve-btn" class="btn btn-ghost" disabled>✅ Auto-Approve</button>
-          <div class="progress-wrap batch-progress">
-            <div class="progress"><div class="progress-bar" id="batch-progress"></div></div>
-            <span class="progress-label" id="batch-progress-label">Idle</span>
+        <!-- SEGMENT TABLE -->
+        <div class="card table-card">
+          <div class="table-head-row">
+            <h2 class="card-title">3 · Segments</h2>
+            <span id="segment-count" class="muted">0 segments</span>
+          </div>
+          <div class="table-scroll">
+            <table class="seg-table">
+              <thead>
+                <tr><th>ID</th><th>Time</th><th>Dur</th><th class="col-text">Original</th><th>Action</th><th class="col-text">Translation</th><th>TTS Dur</th><th>Fit</th><th>Status</th></tr>
+              </thead>
+              <tbody id="seg-tbody">
+                <tr class="empty-row"><td colspan="9">No segments yet — create a session to begin.</td></tr>
+              </tbody>
+            </table>
           </div>
         </div>
+
+        <!-- FINAL OUTPUT SECTION -->
+        <div class="card" id="output-card">
+          <h2 class="card-title">4 · Final Output</h2>
+          <div class="timeline-preview" id="timeline-preview">
+            <div class="timeline-header">
+              <span class="timeline-title">📊 Duration Preview</span>
+              <span class="timeline-info" id="timeline-info">Select segments to see preview</span>
+            </div>
+            <div class="timeline-bars">
+              <div class="timeline-row"><span class="timeline-label">Original</span><div class="timeline-bar original" id="timeline-original"></div><span class="timeline-dur" id="orig-duration">—</span></div>
+              <div class="timeline-row"><span class="timeline-label">Extended</span><div class="timeline-bar extended" id="timeline-extended"></div><span class="timeline-dur" id="final-duration">—</span></div>
+            </div>
+            <div class="extension-summary" id="extension-summary"></div>
+          </div>
+          <div class="output-controls">
+            <div class="stitch-options">
+              <label class="checkbox-label"><input type="checkbox" id="use-extensions" checked><span>Apply video extensions</span></label>
+              <label class="checkbox-label"><input type="checkbox" id="mix-bgm" checked><span>Mix original background audio</span></label>
+            </div>
+            <div class="stitch-actions">
+              <button id="stitch-btn" class="btn btn-primary" disabled>🎞️ Stitch Video</button>
+              <span class="dur-ratio-badge" id="dur-ratio">—</span>
+            </div>
+          </div>
+          <a id="download-link" class="btn btn-success download-btn" href="#" hidden download>⬇️ Download Dubbed Video</a>
+        </div>
+      </section>
+
+      <!-- RIGHT SIDEBAR -->
+      <aside class="detail-panel" id="detail-panel">
+        <div class="detail-empty" id="detail-empty"><span class="detail-empty-icon">🎯</span><p>Select a segment to edit</p></div>
+        <div class="detail-content" id="detail-content" hidden>
+          <div class="detail-head"><h3>Segment <span id="d-id">—</span></h3><span id="d-status-badge" class="badge">⏳</span></div>
+          <div class="thumb-wrap"><img id="d-thumb" class="thumb" alt="Segment thumbnail" /><div id="d-thumb-fallback" class="thumb-fallback">No preview</div></div>
+          <div class="detail-meta"><span id="d-time" class="chip">00:00 → 00:00</span><span id="d-dur" class="chip">0.0s</span></div>
+          <label class="field"><span>Original Text</span><textarea id="d-original" class="ta ta-readonly" rows="2" readonly></textarea></label>
+          <label class="field"><span>Translation</span><textarea id="d-translation" class="ta" rows="3" placeholder="Edit translation…"></textarea></label>
+          <div class="audio-wrap"><span class="field-label">TTS Preview</span><audio id="d-audio" controls preload="none"></audio></div>
+          <label class="field"><span>Fit Strategy</span><select id="d-fit"><option value="auto">Auto</option><option value="speedup">Speed Up</option><option value="extend">Extend Video</option><option value="trim">Trim</option></select></label>
+          <div class="action-row">
+            <button id="d-translate-btn" class="btn btn-ghost sm">🌐 Translate</button>
+            <button id="d-tts-btn" class="btn btn-ghost sm">🔊 Generate TTS</button>
+            <button id="d-skip-btn" class="btn btn-ghost sm">⏭️ Skip</button>
+            <button id="d-keep-btn" class="btn btn-ghost sm">📌 Keep Original</button>
+          </div>
+          <div class="action-row decision">
+            <button id="d-approve-btn" class="btn btn-success">✅ Approve</button>
+            <button id="d-reject-btn" class="btn btn-danger">✖ Reject</button>
+          </div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <!-- ===== PAGE 2: BATCH DUBBING ===== -->
+  <div class="tab-page" id="page-batch-dubbing">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">🎬 Batch Video Dubbing</h2>
+        <p class="card-desc">iGOT Karmayogi — KB Tender RFB IN-KBL-543730-NC-RFB<br>Mandatory: KB-11 · Output: MP4 + SRT/VTT per language</p>
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="field"><span>Course Video / Audio</span>
+              <div id="batch-dropzone" class="dropzone-mini"><input type="file" id="batch-video-input" accept="video/*,audio/*" hidden /><span class="dz-mini-text">📁 Drop file or click</span><span id="batch-file-name" class="dz-file"></span></div>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="field"><span>Course Metadata (optional)</span>
+              <div id="batch-meta-dropzone" class="dropzone-mini"><input type="file" id="batch-meta-input" accept=".docx,.xlsx,.json" hidden /><span class="dz-mini-text">📁 Metadata file</span><span id="batch-meta-name" class="dz-file"></span></div>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="field"><span>Quiz / Assessment (optional)</span>
+              <div id="batch-quiz-dropzone" class="dropzone-mini"><input type="file" id="batch-quiz-input" accept=".docx,.xlsx,.json" hidden /><span class="dz-mini-text">📁 Quiz file</span><span id="batch-quiz-name" class="dz-file"></span></div>
+            </label>
+          </div>
+          <div class="form-group"><label class="field"><span>Course ID</span><input type="text" id="batch-course-id" class="input" value="KB_COURSE_001" /></label></div>
+          <div class="form-group"><label class="field"><span>Source Language</span><select id="batch-src-lang" class="select"></select></label></div>
+        </div>
+        <label class="field"><span>Target Languages</span></label>
+        <div class="lang-quick-btns">
+          <button type="button" class="btn btn-sm btn-ghost" id="btn-kb11">✅ KB-11</button>
+          <button type="button" class="btn btn-sm btn-ghost" id="btn-all22">All 22</button>
+          <button type="button" class="btn btn-sm btn-ghost" id="btn-clear-langs">Clear</button>
+        </div>
+        <div class="lang-grid" id="batch-tgt-langs"></div>
+        <div class="form-row" style="margin-top:16px;">
+          <label class="checkbox-label"><input type="checkbox" id="batch-cbp"><span>📤 Upload to CBP Portal</span></label>
+          <label class="checkbox-label"><input type="checkbox" id="batch-force"><span>🔄 Force Re-run</span></label>
+        </div>
+        <button id="batch-start-btn" class="btn btn-primary btn-lg" style="margin-top:16px;" disabled>🚀 Start Dubbing</button>
       </div>
 
-      <!-- SEGMENT TABLE -->
-      <div class="card table-card">
-        <div class="table-head-row">
-          <h2 class="card-title">3 · Segments</h2>
-          <span id="segment-count" class="muted">0 segments</span>
-        </div>
-        <div class="table-scroll">
-          <table class="seg-table">
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>Time</th>
-                <th>Dur</th>
-                <th class="col-text">Original</th>
-                <th>Action</th>
-                <th class="col-text">Translation</th>
-                <th>TTS Dur</th>
-                <th>Fit</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody id="seg-tbody">
-              <tr class="empty-row"><td colspan="9">No segments yet — create a session to begin.</td></tr>
-            </tbody>
+      <div class="card" id="batch-progress-card" hidden>
+        <h2 class="card-title">⏳ Progress</h2>
+        <div class="progress-wrap"><div class="progress progress-lg"><div class="progress-bar" id="batch-job-progress"></div></div><span class="progress-label" id="batch-job-label">Initializing...</span></div>
+        <pre class="batch-log" id="batch-log"></pre>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">📊 Results</h2>
+        <div class="results-table-wrap">
+          <table class="results-table" id="batch-results-table">
+            <thead><tr><th>Language</th><th>Score</th><th>Status</th><th>Pass Rate</th><th>Segments</th><th>Failed</th><th>Review</th><th>Dur Ratio</th><th>Download</th></tr></thead>
+            <tbody id="batch-results-tbody"><tr class="empty-row"><td colspan="9">No results yet</td></tr></tbody>
           </table>
         </div>
       </div>
 
-      <!-- FINAL OUTPUT SECTION -->
-      <div class="card" id="output-card">
-        <h2 class="card-title">4 · Final Output</h2>
-        <div class="output-grid">
-          <button id="stitch-btn" class="btn btn-primary" disabled>🎞️ Stitch Video</button>
-          <div class="duration-compare">
-            <div class="dur-box">
-              <span class="dur-label">Original</span>
-              <span id="orig-duration" class="dur-value">—</span>
-            </div>
-            <span class="dur-arrow">→</span>
-            <div class="dur-box">
-              <span class="dur-label">Final</span>
-              <span id="final-duration" class="dur-value">—</span>
-            </div>
-            <div class="dur-box">
-              <span class="dur-label">Ratio</span>
-              <span id="dur-ratio" class="dur-value">—</span>
-            </div>
+      <div class="card">
+        <h2 class="card-title">📝 Job Summary</h2>
+        <pre class="job-summary" id="batch-summary">Results will appear here after job completes...</pre>
+        <div id="batch-downloads" hidden style="margin-top:16px;"><h3>⬇️ Download All Outputs</h3><div id="batch-download-links"></div></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== PAGE 3: TRANSLATE DOCUMENT ===== -->
+  <div class="tab-page" id="page-translate-doc">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">📄 Translate Document</h2>
+        <p class="card-desc">Translate course materials: Quiz/Assessment · Metadata · General Documents<br>⚠️ PDF documents excluded per tender §3.1</p>
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="field"><span>Upload Document (DOCX/TXT/JSON)</span>
+              <div id="doc-dropzone" class="dropzone-mini"><input type="file" id="doc-input" accept=".docx,.doc,.xlsx,.txt,.json" hidden /><span class="dz-mini-text">📁 Drop file or click</span><span id="doc-file-name" class="dz-file"></span></div>
+            </label>
           </div>
-          <a id="download-link" class="btn btn-success" href="#" hidden download>⬇️ Download Dubbed Video</a>
+          <div class="form-group">
+            <label class="field"><span>Document Type</span>
+              <select id="doc-type" class="select">
+                <option value="quiz">Quiz / Assessment (Word .docx)</option>
+                <option value="metadata">Course Metadata (Excel .xlsx)</option>
+                <option value="general">General Document (TXT/DOCX)</option>
+              </select>
+            </label>
+          </div>
+          <div class="form-group"><label class="field"><span>Source Language</span><select id="doc-src-lang" class="select"></select></label></div>
+          <div class="form-group"><label class="field"><span>Course Title (for header)</span><input type="text" id="doc-title" class="input" placeholder="e.g. Introduction to AI" /></label></div>
+        </div>
+        <label class="field"><span>Target Languages</span></label>
+        <div class="lang-quick-btns">
+          <button type="button" class="btn btn-sm btn-ghost" onclick="selectDocLangs('kb11')">✅ KB-11</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="selectDocLangs('all')">All 22</button>
+          <button type="button" class="btn btn-sm btn-ghost" onclick="selectDocLangs('clear')">Clear</button>
+        </div>
+        <div class="lang-grid" id="doc-tgt-langs"></div>
+        <button id="doc-translate-btn" class="btn btn-primary btn-lg" style="margin-top:16px;" disabled>🚀 Translate Document</button>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📝 Translation Log</h2>
+        <pre class="batch-log" id="doc-log">Ready to translate...</pre>
+        <div id="doc-downloads" hidden style="margin-top:16px;"><h3>⬇️ Download Translated Documents</h3><div id="doc-download-links"></div></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== PAGE 4: QA CERTIFICATE ===== -->
+  <div class="tab-page" id="page-qa-cert">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">📋 QA Certificate</h2>
+        <p class="card-desc">Generate Language Quality Assurance Certification per tender SLA.<br>Certifies: ≥98% accuracy · terminology consistency · KB compliance</p>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Course ID</span><input type="text" id="qa-course-id" class="input" placeholder="KB_COURSE_001" /></label></div>
+          <div class="form-group"><label class="field"><span>Source Language</span><select id="qa-src-lang" class="select"></select></label></div>
+          <div class="form-group"><label class="field"><span>Target Language</span><select id="qa-tgt-lang" class="select"></select></label></div>
+          <div class="form-group"><label class="field"><span>Reviewer Name</span><input type="text" id="qa-reviewer" class="input" value="Translation Agency QA Lead" /></label></div>
+          <div class="form-group">
+            <label class="field"><span>Original Source File</span>
+              <div id="qa-src-dropzone" class="dropzone-mini"><input type="file" id="qa-src-input" hidden /><span class="dz-mini-text">📁 Original file</span><span id="qa-src-name" class="dz-file"></span></div>
+            </label>
+          </div>
+          <div class="form-group">
+            <label class="field"><span>Dubbed / Translated Output</span>
+              <div id="qa-out-dropzone" class="dropzone-mini"><input type="file" id="qa-out-input" hidden /><span class="dz-mini-text">📁 Output file</span><span id="qa-out-name" class="dz-file"></span></div>
+            </label>
+          </div>
+        </div>
+        <button id="qa-generate-btn" class="btn btn-primary btn-lg" style="margin-top:16px;">📋 Generate QA Certificate (.docx)</button>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📝 Status</h2>
+        <pre class="batch-log" id="qa-log">Ready...</pre>
+        <a id="qa-download" class="btn btn-success" href="#" hidden download style="margin-top:16px;">⬇️ Download QA Certificate</a>
+        <div class="info-box" style="margin-top:16px;">
+          <h4>SLA Thresholds (KB Tender)</h4>
+          <ul><li>Score ≥ 0.55 → ✅ Pass (98%+ accuracy)</li><li>Score 0.30–0.55 → ⚠️ Needs correction</li><li>Score < 0.30 → ❌ Failed</li></ul>
         </div>
       </div>
-    </section>
+    </main>
+  </div>
 
-    <!-- ===== RIGHT SIDEBAR: SEGMENT DETAIL ===== -->
-    <aside class="detail-panel" id="detail-panel">
-      <div class="detail-empty" id="detail-empty">
-        <span class="detail-empty-icon">🎯</span>
-        <p>Select a segment to edit</p>
+  <!-- ===== PAGE 5: HUMAN REVIEW ===== -->
+  <div class="tab-page" id="page-human-review">
+    <main class="page-grid-wide">
+      <div class="card">
+        <h2 class="card-title">👤 Human Review</h2>
+        <div class="form-row">
+          <div class="form-group">
+            <label class="field"><span>Load *_metadata.json</span>
+              <div id="review-dropzone" class="dropzone-mini"><input type="file" id="review-input" accept=".json" hidden /><span class="dz-mini-text">📁 Metadata JSON</span><span id="review-file-name" class="dz-file"></span></div>
+            </label>
+          </div>
+          <div class="form-group"><label class="field"><span>Reviewer Name</span><input type="text" id="review-name" class="input" placeholder="Dr. Priya Nair" /></label></div>
+          <div class="form-group" style="align-self:end;"><button id="review-load-btn" class="btn btn-primary">📂 Load Segments</button></div>
+        </div>
+        <div class="review-stats" id="review-stats">Review Progress: —</div>
       </div>
-
-      <div class="detail-content" id="detail-content" hidden>
-        <div class="detail-head">
-          <h3>Segment <span id="d-id">—</span></h3>
-          <span id="d-status-badge" class="badge">⏳</span>
+      <div class="card">
+        <div class="table-scroll">
+          <table class="results-table" id="review-table">
+            <thead><tr><th>ID</th><th>Time</th><th>Source</th><th>AI Translation</th><th>Corrected Text</th><th>Score</th><th>Flags</th><th>Decision</th></tr></thead>
+            <tbody id="review-tbody"><tr class="empty-row"><td colspan="8">Load a metadata file to begin review</td></tr></tbody>
+          </table>
         </div>
-
-        <div class="thumb-wrap">
-          <img id="d-thumb" class="thumb" alt="Segment thumbnail" />
-          <div id="d-thumb-fallback" class="thumb-fallback">No preview</div>
+        <div class="action-row" style="margin-top:16px;">
+          <button id="review-approve-all" class="btn btn-ghost">✅ Approve All Unflagged</button>
+          <button id="review-save" class="btn btn-ghost">💾 Save Progress</button>
+          <button id="review-cert" class="btn btn-primary">📜 Export Review Certificate</button>
         </div>
+        <pre class="batch-log" id="review-log" style="margin-top:16px;">Ready...</pre>
+        <a id="review-download" class="btn btn-success" href="#" hidden download style="margin-top:16px;">⬇️ Download Certificate</a>
+      </div>
+    </main>
+  </div>
 
-        <div class="detail-meta">
-          <span id="d-time" class="chip">00:00 → 00:00</span>
-          <span id="d-dur" class="chip">0.0s</span>
+  <!-- ===== PAGE 6: CORRECTIONS ===== -->
+  <div class="tab-page" id="page-corrections">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">🔧 Raise Correction Ticket</h2>
+        <p class="card-desc">KB Tender §5.1B — Deadline: 5 calendar days · Penalty: 0.5% per week delay</p>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Course ID</span><input type="text" id="corr-course" class="input" placeholder="KB_COURSE_001" /></label></div>
+          <div class="form-group"><label class="field"><span>Language</span><select id="corr-lang" class="select"></select></label></div>
+          <div class="form-group full-width"><label class="field"><span>Feedback from KB</span><textarea id="corr-feedback" class="ta" rows="3" placeholder="Describe the issue..."></textarea></label></div>
+          <div class="form-group"><label class="field"><span>Raised By</span><input type="text" id="corr-raised-by" class="input" value="KB Verification Agency" /></label></div>
+          <div class="form-group"><label class="field"><span>Feedback Date (YYYY-MM-DD)</span><input type="text" id="corr-date" class="input" placeholder="blank=today" /></label></div>
         </div>
-
-        <label class="field">
-          <span>Original Text</span>
-          <textarea id="d-original" class="ta ta-readonly" rows="2" readonly></textarea>
-        </label>
-
-        <label class="field">
-          <span>Translation</span>
-          <textarea id="d-translation" class="ta" rows="3" placeholder="Edit translation…"></textarea>
-        </label>
-
-        <div class="audio-wrap">
-          <span class="field-label">TTS Preview</span>
-          <audio id="d-audio" controls preload="none"></audio>
+        <button id="corr-raise-btn" class="btn btn-primary" style="margin-top:16px;">📨 Raise Ticket</button>
+        <pre class="batch-log" id="corr-raise-log" style="margin-top:8px;">Ready...</pre>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📋 Open Tickets</h2>
+        <button id="corr-refresh" class="btn btn-ghost btn-sm" style="margin-bottom:8px;">🔄 Refresh</button>
+        <div class="table-scroll">
+          <table class="results-table" id="corr-table">
+            <thead><tr><th>Ticket ID</th><th>Course</th><th>Lang</th><th>Status</th><th>Feedback</th><th>Deadline</th><th>Penalty</th></tr></thead>
+            <tbody id="corr-tbody"><tr class="empty-row"><td colspan="7">No tickets</td></tr></tbody>
+          </table>
         </div>
+      </div>
+      <div class="card">
+        <h2 class="card-title">✅ Close Ticket</h2>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Ticket ID</span><input type="text" id="corr-ticket-id" class="input" placeholder="COR-0001" /></label></div>
+          <div class="form-group"><label class="field"><span>Closed By</span><input type="text" id="corr-closed-by" class="input" value="Translation Agency" /></label></div>
+          <div class="form-group full-width"><label class="field"><span>Resolution</span><textarea id="corr-resolution" class="ta" rows="2" placeholder="What was corrected..."></textarea></label></div>
+        </div>
+        <div class="action-row" style="margin-top:16px;">
+          <button id="corr-inprog-btn" class="btn btn-ghost">⏳ Mark In Progress</button>
+          <button id="corr-close-btn" class="btn btn-primary">✅ Close Ticket</button>
+        </div>
+        <pre class="batch-log" id="corr-close-log" style="margin-top:8px;">Ready...</pre>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📄 Export Closure Report</h2>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Course ID (blank=all)</span><input type="text" id="corr-rep-course" class="input" /></label></div>
+          <div class="form-group"><label class="field"><span>Language (blank=all)</span><select id="corr-rep-lang" class="select"><option value="">All languages</option></select></label></div>
+          <div class="form-group"><label class="field"><span>Agency Name</span><input type="text" id="corr-rep-agency" class="input" value="Translation Agency" /></label></div>
+        </div>
+        <button id="corr-export-btn" class="btn btn-primary" style="margin-top:16px;">📄 Export Closure Report</button>
+        <a id="corr-download" class="btn btn-success" href="#" hidden download style="margin-top:8px;">⬇️ Download Report</a>
+      </div>
+    </main>
+  </div>
 
-        <label class="field">
-          <span>Fit Strategy</span>
-          <select id="d-fit">
-            <option value="auto">Auto</option>
-            <option value="speedup">Speed Up</option>
-            <option value="extend">Extend Video</option>
-            <option value="trim">Trim</option>
-          </select>
-        </label>
-
+  <!-- ===== PAGE 7: MONTHLY DELIVERY ===== -->
+  <div class="tab-page" id="page-monthly">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">📅 Monthly Delivery Tracker</h2>
+        <p class="card-desc">KB Tender §4.4 + §5.1B SLA · Schedule: 1→50|2→55|3→100|...|11→100 hrs</p>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Month (1-11)</span><input type="number" id="monthly-month" class="input" min="1" max="11" placeholder="e.g. 3" /></label></div>
+          <div class="form-group"><label class="field"><span>Course ID</span><input type="text" id="monthly-course" class="input" placeholder="KB_COURSE_001" /></label></div>
+          <div class="form-group"><label class="field"><span>Hours Delivered</span><input type="number" id="monthly-hours" class="input" step="0.1" value="0" /></label></div>
+        </div>
+        <label class="field"><span>Languages Delivered</span></label>
+        <div class="lang-grid" id="monthly-langs"></div>
+        <button id="monthly-add-btn" class="btn btn-primary" style="margin-top:16px;">➕ Add Entry</button>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📋 Monthly Submissions</h2>
+        <div class="table-scroll">
+          <table class="results-table" id="monthly-table">
+            <thead><tr><th>Month</th><th>Course ID</th><th>Languages</th><th>Hours</th><th>Status</th></tr></thead>
+            <tbody id="monthly-tbody"><tr class="empty-row"><td colspan="5">No entries</td></tr></tbody>
+          </table>
+        </div>
+        <pre class="batch-log" id="monthly-summary" style="margin-top:16px;">SLA Summary will appear here...</pre>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📄 Export Reports</h2>
         <div class="action-row">
-          <button id="d-translate-btn" class="btn btn-ghost sm">🌐 Translate</button>
-          <button id="d-tts-btn" class="btn btn-ghost sm">🔊 Generate TTS</button>
-          <button id="d-skip-btn" class="btn btn-ghost sm">⏭️ Skip</button>
-          <button id="d-keep-btn" class="btn btn-ghost sm">📌 Keep Original</button>
+          <button id="monthly-report-btn" class="btn btn-primary">📄 Monthly Submission Report</button>
+          <button id="monthly-complete-btn" class="btn btn-ghost">📦 Consolidated Completion Report</button>
         </div>
+        <a id="monthly-download" class="btn btn-success" href="#" hidden download style="margin-top:16px;">⬇️ Download Report</a>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📋 Inception Report</h2>
+        <p class="card-desc">Payment Milestone 1 (KB §4.1) — Submit within T0+15 days for 15% payment</p>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>Agency Name</span><input type="text" id="ir-agency" class="input" value="Translation Agency" /></label></div>
+          <div class="form-group"><label class="field"><span>Agency Address</span><input type="text" id="ir-address" class="input" placeholder="123 MG Road, Bengaluru" /></label></div>
+          <div class="form-group"><label class="field"><span>Contact Person</span><input type="text" id="ir-contact" class="input" placeholder="Dr. Priya Nair" /></label></div>
+          <div class="form-group"><label class="field"><span>Contact Email</span><input type="text" id="ir-email" class="input" placeholder="priya@agency.in" /></label></div>
+          <div class="form-group"><label class="field"><span>T0 Date (YYYY-MM-DD)</span><input type="text" id="ir-t0" class="input" placeholder="blank=today" /></label></div>
+          <div class="form-group"><label class="field"><span>Course IDs (comma-sep)</span><input type="text" id="ir-courses" class="input" placeholder="KB_001, KB_002" /></label></div>
+        </div>
+        <button id="ir-generate-btn" class="btn btn-primary" style="margin-top:16px;">📋 Generate Inception Report</button>
+        <a id="ir-download" class="btn btn-success" href="#" hidden download style="margin-top:8px;">⬇️ Download Inception Report</a>
+      </div>
+    </main>
+  </div>
 
-        <div class="action-row decision">
-          <button id="d-approve-btn" class="btn btn-success">✅ Approve</button>
-          <button id="d-reject-btn" class="btn btn-danger">✖ Reject</button>
+  <!-- ===== PAGE 8: GLOSSARY ===== -->
+  <div class="tab-page" id="page-glossary">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">📖 Standardised Glossary</h2>
+        <p class="card-desc">KB Tender Final Deliverable — Add terms with approved translations</p>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>English Term</span><input type="text" id="gl-term" class="input" placeholder="e.g. Competency Framework" /></label></div>
+          <div class="form-group"><label class="field"><span>Domain / Category</span><input type="text" id="gl-domain" class="input" placeholder="e.g. HR, Governance" /></label></div>
+          <div class="form-group full-width"><label class="field"><span>Translations (lang_code: text, one per line)</span><textarea id="gl-translations" class="ta" rows="4" placeholder="hin: दक्षता ढांचा&#10;tam: திறன் கட்டமைப்பு"></textarea></label></div>
+        </div>
+        <button id="gl-add-btn" class="btn btn-primary" style="margin-top:16px;">➕ Add Term</button>
+      </div>
+      <div class="card">
+        <h2 class="card-title">📋 Glossary Entries</h2>
+        <div class="table-scroll">
+          <table class="results-table" id="gl-table">
+            <thead><tr><th>English Term</th><th>Domain</th><th>Languages</th><th>Translations</th></tr></thead>
+            <tbody id="gl-tbody"><tr class="empty-row"><td colspan="4">No entries yet</td></tr></tbody>
+          </table>
+        </div>
+        <div class="action-row" style="margin-top:16px;">
+          <button id="gl-export-btn" class="btn btn-primary">📥 Export Glossary (.xlsx)</button>
+          <div class="dropzone-mini" style="flex:1;"><input type="file" id="gl-import-input" accept=".xlsx" hidden /><span class="dz-mini-text">📤 Import .xlsx</span></div>
+        </div>
+        <a id="gl-download" class="btn btn-success" href="#" hidden download style="margin-top:8px;">⬇️ Download Glossary</a>
+        <pre class="batch-log" id="gl-log" style="margin-top:8px;">Ready...</pre>
+      </div>
+    </main>
+  </div>
+
+  <!-- ===== PAGE 9: SETTINGS ===== -->
+  <div class="tab-page" id="page-settings">
+    <main class="page-grid">
+      <div class="card">
+        <h2 class="card-title">⚙️ Settings</h2>
+        <div class="form-grid">
+          <div class="form-group"><label class="field"><span>HuggingFace Token</span><input type="password" id="settings-hf-token" class="input" placeholder="hf_..." /></label></div>
+          <div class="form-group"><label class="field"><span>Output Save Folder</span><input type="text" id="settings-output-dir" class="input" placeholder="D:\KB_Outputs" /></label></div>
+        </div>
+        <div class="action-row" style="margin-top:16px;">
+          <button id="settings-save-btn" class="btn btn-primary">💾 Save Settings</button>
+          <button id="settings-open-btn" class="btn btn-ghost">📂 Open Output Folder</button>
+        </div>
+        <pre class="batch-log" id="settings-log" style="margin-top:16px;">Ready...</pre>
+      </div>
+      <div class="card">
+        <h2 class="card-title">🇮🇳 Sovereign AI Compliance</h2>
+        <p class="card-desc">KB Tender RFB IN-KBL-543730-NC-RFB</p>
+        <div class="info-box">
+          <p><strong>Status:</strong> <span id="sovereign-status">🔒 ENABLED — Foreign LLM APIs blocked</span></p>
+          <p>All core AI (ASR/Translation/TTS) runs fully <strong>offline on-premise</strong>.</p>
+          <p>Set <code>KB_SOVEREIGN_MODE=1</code> in <code>.env</code> to block foreign LLM APIs.</p>
+          <p style="margin-top:8px;color:var(--text-dim);">Compliant: IT Act 2000 · DPDP Act 2023 · MeitY cloud policy</p>
         </div>
       </div>
-    </aside>
-  </main>
+      <div class="card">
+        <h2 class="card-title">📊 Quality Scoring</h2>
+        <div class="info-box">
+          <p>Every segment scored 0–1 automatically:</p>
+          <ul><li><strong>≥ 0.55</strong> → ✅ Pass</li><li><strong>0.30–0.55</strong> → ⚠️ Needs human review</li><li><strong>< 0.30</strong> → ❌ Failed</li></ul>
+          <p style="margin-top:12px;"><strong>Checkpoint/Resume:</strong> If a job crashes, re-run with same input — completed segments restore automatically.</p>
+        </div>
+      </div>
+    </main>
+  </div>
 
   <div id="toast" class="toast" hidden></div>
 
   <script src="app.js"></script>
+  <script src="admin.js"></script>
 </body>
 </html>

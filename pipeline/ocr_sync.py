@@ -161,16 +161,46 @@ def verify_sync(
 
     ocr_ok = _tesseract_available()
     report["ocr_available"] = ocr_ok
+    deltas = []
 
     if not ocr_ok:
         report["status"] = "ocr_unavailable"
-        # Still record timestamp-based sync check (no OCR)
+        # No OCR - just do timestamp-based sync check without frame extraction
         for seg in segments:
             orig_start  = float(seg.get("start", 0))
             audio_start = float(seg.get("audio_start", seg.get("start", 0)))
             delta       = abs(audio_start - orig_start)
 
-            # Extract frame at segment start
+            flagged = delta > SYNC_THRESHOLD_S
+            if flagged:
+                report["sync_violations"] += 1
+
+            deltas.append(delta)
+            report["segments"].append({
+                "id":           str(seg.get("id", "")),
+                "start":        round(orig_start, 3),
+                "audio_start":  round(audio_start, 3),
+                "sync_delta_s": round(delta, 3),
+                "has_text":     False,
+                "text_preview": "",
+                "flag":         flagged,
+            })
+        
+        report["avg_sync_delta_s"] = round(
+            sum(deltas) / len(deltas) if deltas else 0.0, 4)
+        return report
+    
+    # OCR available - extract frames and check text
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="kb_sync_") as tmpdir:
+        for i, seg in enumerate(segments):
+            if sample_every_n > 1 and i % sample_every_n != 0:
+                continue
+                
+            orig_start  = float(seg.get("start", 0))
+            audio_start = float(seg.get("audio_start", seg.get("start", 0)))
+            delta       = abs(audio_start - orig_start)
+
             frame_path = str(Path(tmpdir) / f"frame_{i:04d}.png")
             has_text   = False
             text_preview = ""

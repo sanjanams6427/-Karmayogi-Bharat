@@ -79,27 +79,133 @@ _SUB_FIXUPS: dict[str, list[tuple[str, str]]] = {
         (r'^15\s+\u0b9a\u0ba4\u0bb5\u0bc0\u0ba4\u0bae\u0bcd\.\s*',
          '\u0bb5\u0bbf\u0bb3\u0bbf\u0bae\u0bcd\u0baa\u0bc1 \u0ba4\u0bc7\u0bb5\u0bc8 15 \u0b9a\u0ba4\u0bb5\u0bc0\u0ba4\u0bae\u0bcd. '),
     ],
-    "hin": [],
-    "kan": [],
-    "mal": [],
-    "tel": [],
-    "urd": [],
-    "guj": [],
-    "ben": [],
-    "asm": [],
-    "pan": [],
-    "ory": [],
-    "mar": [],
-
-
-
+    "hin": [
+        # Strip छे. / छे sentence-initial Maithili copula artifact
+        (r'^\u091b\u0947\.?\s+', ''),
+        # Strip OCR page-reference artifacts from slide images picked up by ASR
+        # e.g. "अब समारोहक किछु विवरण" → "अब समारोह के कुछ विवरण"
+        (r'\u0938\u092e\u093e\u0930\u094b\u0939\u0915\s+\u0915\u093f\u091b\u0941', 'समारोह के कुछ'),
+        # Strip Maithili morphemes that survived drift guard
+        (r'\u0913\s+\u092b\u094b\u091f\u094b\s+\u0916\u093f\u091a\u092f\u092c\u093e\u0915[^\u0964\u0965.!?]*',
+         'फ़ोटो खिंचवाने के अवसर के लिए'),
+        (r'\u0915\u0915\u094d\u0937\u092e\u0947(?=[\s\u0964\u0965]|$)', 'बैठक कक्ष में'),
+        (r'\u0906\u092c\s+\u092e\u093e\u0928\u0928\u0940\u092f(?=[\s\u0964\u0965]|$)', 'अब माननीय'),
+        (r'\u0938\u092e\u092f\u092e\u0947(?=[\s\u0964\u0965]|$)', 'समय में'),
+        (r'\u0915\u093f\u091b\u0941(?=[\s\u0964\u0965]|$)', 'कुछ'),
+        # Strip Bodo morphemes that may slip past translation-time guard
+        (r'\u0916\u093e\u0932\u093e\u092e\u094b(?=[\s\u0964\u0965]|$)', ''),  # खालामो
+        (r'\u0906\u0930\u094b(?=[\s\u0964\u0965]|$)', ''),                    # आरो (Bodo "and")
+        (r'\u0917\u0941\u0926\u0941\u0902(?=[\s\u0964\u0965]|$)', ''),         # गुदुं
+        (r'\u0928\u093f\u092b\u094d\u0930\u093e\u092f(?=[\s\u0964\u0965]|$)', ''),  # निफ्राय
+    ],
+    "kan": [
+        # Strip ಸೇದುವು/ಸೇದು/ಸೇಡಂ/ಸೇಬಿನ/ಸೇರ್ಪಡೆಯ sentence-initial hallucination prefix
+        (r'^\u0cb8\u0cc7(?:\u0ca6\u0cc1\u0cb5\u0cc1|\u0ca6\u0cc1|\u0ca1\u0c82|\u0cac\u0cbf\u0ca8|\u0ca6\u0ccd|\u0cb2\u0ccd|\u0cac\u0ccd|\u0cb0\u0ccd\u0caa\u0ca1\u0cc6\u0caf)[.\s]+', ''),
+    ],
+    "mal": [
+        # Strip ഛ/ഛെ/ഛമായ prefix artifacts
+        (r'^\u0d1b(?:\u0d2e\u0d3e\u0d2f|\u0d46)?\s*', ''),
+        # Strip ഘനിർമ്മിത prefix artifact
+        (r'^\u0d18\u0d28\u0d3f\u0d7c\u0d2e\u0d4d\u0d2e\u0d3f\u0d24\s*', ''),
+        # Strip തൃ prefix artifact
+        (r'^\u0d24\u0d43\s+', ''),
+        # Strip തവണത്തെ prefix artifact
+        (r'^\u0d24\u0d35\u0d23\u0d24\u0d4d\u0d24\u0d46\s+', ''),
+    ],
+    "tel": [
+        # Strip Telugu sentence-initial conjunction/artifact
+        (r'^(?:\u0c2e\u0c30\u0c3f\u0c2f\u0c41|\u0c05\u0c2f\u0c3f\u0c24\u0c47)\s+', ''),
+    ],
+    "urd": [
+        # Strip کا / کہ sentence-initial bare preposition artifacts
+        (r'^(?:\u06a9\u0627|\u06a9\u06c1)\s+', ''),
+    ],
+    "guj": [
+        # Strip leading punctuation artifacts
+        (r'^[,;:\u0964\u0965]+\s*', ''),
+    ],
+    "ben": [
+        # Strip ঔর (Hindi "aur" in Bengali script) sentence-initial artifact
+        (r'^\u0994\u09b0\s+', ''),
+    ],
+    "asm": [
+        # Strip টাৰ/টা prefix artifact
+        (r'^\u099f\u09be(?:\u09f0)?\s+', ''),
+    ],
+    "pan": [
+        # Strip OCR page-reference artifacts: "ਸਫ਼ਾ 3 ਉੱਤੇ ਤਸਵੀਰ" (picture on page 3)
+        (r'\u0a38\u0a2b\u0a3c\u0a3e\s+\d+\s+\u0a09\u0a71\u0a24\u0a47\s+\u0a24\u0a38\u0a35\u0a40\u0a30', ''),
+        # Strip ਨਾ ਸਿਰਫ / ਨਾ ਭੁੱਲੋ prefix artifacts
+        (r'^\u0a28\u0a3e\s+(?:\u0a38\u0a3f\u0a30\u0a2b\u0a3c?|\u0a2d\u0a41\u0a71\u0a32\u0a4b)\s*', ''),
+    ],
+    "ory": [
+        # Strip ମରିଯୁ prefix artifact
+        (r'^\u0b2e\u0b30\u0b3f\u0b2f\u0b41\s*', ''),
+    ],
+    "mar": [
+        # Strip OCR page-reference artifacts: "१५ पानांवरील चित्र" / "१३ पानांवरील चित्र"
+        (r'[\u0966-\u096f]+\s+\u092a\u093e\u0928\u093e\u0902\u0935\u0930\u0940\u0932\s+\u091a\u093f\u0924\u094d\u0930', ''),
+        # Strip किवा/किवी/किडे prefix artifacts
+        (r'^\u0915\u093f(?:\u0935\u093e|\u0935\u0940|\u0921\u0947)\s*', ''),
+    ],
+    "nep": [
+        # Strip ते/तेता/तेसै/तेखाको/तेपनि hallucination prefixes
+        (r'^\u0924\u0947(?:\u0924\u093e|\u0938\u0948|\u0916\u093e\u0915\u094b|\u092a\u0928\u093f|\u0916\u093e\u0930\u094d\u0928\u0947|\u0928\u094d\u091c\u0947\u0932|\u092a\u093e\u0938|\u0939\u093f\u0932\u094b|\u0928\u0940|\u0924\u094d\u0930\u0948)?\s+', ''),
+    ],
+    "mai": [
+        # Fix Maithili postposition spacing: NLLB inserts space before क/मे postpositions
+        # NOTE: replacement must be a lambda — \u escapes are invalid in re.sub replacement strings
+        (r'([\u0900-\u097F]) \u0915(?=[\s\u0964\u0965,;]|$)', None),  # handled below
+        (r'([\u0900-\u097F]) \u092e\u0947(?=[\s\u0964\u0965,;]|$)', None),  # handled below
+    ],
+    "doi": [
+        # Strip फोरन/फोर/ऐम्म prefix artifacts
+        (r'^\u092b\u094b\u0930(?:\u0928)?\s+', ''),
+        (r'^\u0910\u092e\u094d\u092e\s+', ''),
+    ],
+    "bod": [
+        # Strip stray single-quote artifacts around Devanagari technical terms
+        ("(?<=[\u0900-\u097F]) '(?=[\u0900-\u097F])", ' '),
+        ("(?<=[\u0900-\u097F])' (?=[\u0900-\u097F])", ' '),
+    ],
+    "san": [
+        # Strip पाल्य/पालक/पालित/पालन prefix artifacts
+        (r'^\u092a\u093e\u0932(?:\u094d\u092f(?:\u092e\u093e\u0928)?|\u0915|\u093f\u0924|\u0928)\s+', ''),
+    ],
+    "mni": [
+        # Collapse Bengali virama + space + vowel sign (broken cluster from NLLB)
+        (r'([\u09cd]) ([\u09be-\u09cc\u09d7])', r'\1\2'),
+    ],
+    "sat": [
+        # Strip any non-Ol-Chiki prefix garbage (Latin/Devanagari leaking in)
+        (r'^[^\u1c50-\u1c7f\s]+\s*', ''),
+    ],
+    "snd": [
+        (r'^(?:\u06a9\u0627|\u06a9\u06c1)\s+', ''),
+    ],
+    "kas": [
+        (r'^(?:\u06a9\u0627|\u06a9\u06c1)\s+', ''),
+    ],
+    "kok": [
+        # Strip leading punctuation artifacts (Konkani shares Devanagari with Hindi/Marathi)
+        (r'^[,;:\u0964\u0965]+\s*', ''),
+    ],
 }
 
 
 def _apply_sub_fixups(text: str, tgt_lang: str) -> str:
     """Apply per-language post-translation fixups to subtitle text."""
+    _MAI_KA  = '\u0915'
+    _MAI_ME  = '\u092e\u0947'
     for pattern, replacement in _SUB_FIXUPS.get(tgt_lang, []):
-        text = re.sub(pattern, replacement, text)
+        if replacement is None:
+            # Lambda replacements for patterns where \u in replacement string is invalid
+            if '\u0915' in pattern and '\u092e' not in pattern:
+                text = re.sub(pattern, lambda m: m.group(1) + _MAI_KA, text)
+            elif '\u092e\u0947' in pattern:
+                text = re.sub(pattern, lambda m: m.group(1) + _MAI_ME, text)
+        else:
+            text = re.sub(pattern, replacement, text)
     return text
 
 

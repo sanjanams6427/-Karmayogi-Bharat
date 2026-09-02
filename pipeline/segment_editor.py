@@ -676,11 +676,24 @@ class SegmentEditor:
             and not (s.tts_audio_path and Path(s.tts_audio_path).exists())
         ]
         
+        if not to_synth:
+            session.step = "review"
+            session.save()
+            return []
+        
         total = len(to_synth)
-        for i, seg in enumerate(to_synth):
-            self.synthesize_segment(session, seg.id)
-            if progress_callback:
-                progress_callback(i + 1, total)
+        
+        # Initialize TTS with voice pinning for consistent voice across segments
+        self.tts.pin_voice_for_session(session.target_lang)
+        
+        try:
+            for i, seg in enumerate(to_synth):
+                self.synthesize_segment(session, seg.id)
+                if progress_callback:
+                    progress_callback(i + 1, total)
+        finally:
+            # Release voice pinning after all segments done
+            self.tts.unpin_voice()
         
         session.step = "review"
         session.save()
@@ -827,9 +840,10 @@ class SegmentEditor:
         
         # Mux into video
         if output_video_path is None:
+            video_stem = Path(session.video_path).stem
             output_video_path = str(
                 Path(session.output_dir) / session.target_lang /
-                f"{Path(session.video_path).stem}_{session.target_lang}.mp4"
+                f"{video_stem}_{session.target_lang}_{session.session_id[:8]}.mp4"
             )
         Path(output_video_path).parent.mkdir(parents=True, exist_ok=True)
         
@@ -1175,9 +1189,11 @@ class SegmentEditor:
         
         # Mux into video
         if output_video_path is None:
+            # Include session ID in filename to prevent different sessions overwriting each other
+            video_stem = Path(session.video_path).stem
             output_video_path = str(
                 Path(session.output_dir) / session.target_lang /
-                f"{Path(session.video_path).stem}_{session.target_lang}.mp4"
+                f"{video_stem}_{session.target_lang}_{session.session_id[:8]}.mp4"
             )
         Path(output_video_path).parent.mkdir(parents=True, exist_ok=True)
         
@@ -1231,13 +1247,14 @@ class SegmentEditor:
         """
         Create extended video by inserting freeze frames where needed.
         
-        For each EXTEND_VIDEO segment:
-          - Take the last frame of that segment
-          - Hold it for the extension duration
-          - Then continue with the next segment
+        Strategy:
+          1. Extract video in continuous chunks (including gaps between segments)
+          2. After each EXTEND_VIDEO segment, insert a freeze frame of the last frame
+          3. Concatenate all clips preserving the full original video content
+        
+        This preserves gaps/pauses between segments that the original approach lost.
         """
         import subprocess
-        import tempfile
         
         try:
             import imageio_ffmpeg
@@ -1245,56 +1262,139 @@ class SegmentEditor:
         except Exception:
             ffmpeg = "ffmpeg"
         
-        # Build a filter complex for the extensions
-        # Strategy: extract clips, add freeze frames, concatenate
-        
-        clips = []
-        prev_end = 0.0
         temp_dir = Path(output_path).parent / "temp_clips"
         temp_dir.mkdir(exist_ok=True)
         
-        for i, (seg, new_start, new_end, _) in enumerate(segment_timings):
-            # Extract segment from original video
-            clip_path = str(temp_dir / f"clip_{i:04d}.mp4")
-            duration = seg.end - seg.start
-            
-            subprocess.run([
-                ffmpeg, "-y",
-                "-ss", f"{seg.start:.3f}",
-                "-i", source_video,
-                "-t", f"{duration:.3f}",
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-an",  # No audio in intermediate clips
-                clip_path,
-                "-loglevel", "error"
-            ], check=True, timeout=120)
-            clips.append(clip_path)
-            
-            # If this segment needs extension, add a freeze frame
+        # Get video framerate for accurate freeze frame generation
+        probe_result = subprocess.run([
+            ffmpeg, "-i", source_video
+        ], capture_output=True, text=True, timeout=30)
+        # Parse framerate from ffmpeg output (e.g., "30 fps" or "29.97 fps")
+        import re
+        fps_match = re.search(r'(\d+(?:\.\d+)?)\s*fps', probe_result.stderr)
+        fps = float(fps_match.group(1)) if fps_match else 30.0
+        
+        # Build list of clips to create:
+        # - Extract continuous video chunks from source
+        # - Insert freeze frames after EXTEND_VIDEO segments
+        clips = []
+        clip_idx = 0
+        
+        # Find segments that need freeze frames
+        extend_points = []  # (original_end_time, extension_duration)
+        for seg, new_start, new_end, _ in segment_timings:
             if seg.fit_strategy == FitStrategy.EXTEND_VIDEO and seg.tts_duration > seg.original_duration:
                 extension = seg.tts_duration - seg.original_duration
-                freeze_path = str(temp_dir / f"freeze_{i:04d}.mp4")
+                extend_points.append((seg.end, extension))
+        
+        if not extend_points:
+            # No extensions needed - just copy the video
+            import shutil
+            shutil.copy2(source_video, output_path)
+            log.info(f"No extensions needed - copied source video")
+            return
+        
+        # Sort by time
+        extend_points.sort(key=lambda x: x[0])
+        
+        # Extract video in chunks, inserting freeze frames at extension points
+        current_pos = 0.0
+        
+        for ext_time, ext_duration in extend_points:
+            # Extract chunk from current_pos to ext_time
+            if ext_time > current_pos:
+                chunk_path = str(temp_dir / f"chunk_{clip_idx:04d}.mp4")
+                chunk_duration = ext_time - current_pos
                 
-                # Extract last frame and loop it
-                last_frame_time = seg.end - 0.1  # Slightly before end
-                subprocess.run([
+                cmd = [
                     ffmpeg, "-y",
-                    "-ss", f"{last_frame_time:.3f}",
+                    "-ss", f"{current_pos:.3f}",
                     "-i", source_video,
-                    "-frames:v", "1",
-                    "-vf", f"loop=loop={int(extension * 30)}:size=1:start=0,setpts=N/30/TB",
-                    "-t", f"{extension:.3f}",
+                    "-t", f"{chunk_duration:.3f}",
                     "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                    freeze_path,
+                    "-an",  # No audio - we handle audio separately
+                    chunk_path,
                     "-loglevel", "error"
-                ], check=True, timeout=60)
-                clips.append(freeze_path)
+                ]
+                subprocess.run(cmd, check=True, timeout=120)
+                clips.append(chunk_path)
+                clip_idx += 1
+            
+            # Create freeze frame for the extension
+            freeze_path = str(temp_dir / f"freeze_{clip_idx:04d}.mp4")
+            frame_time = ext_time - 0.05  # Slightly before end to get clean frame
+            
+            # Calculate number of frames needed
+            num_frames = max(1, int(ext_duration * fps))
+            
+            # Use a two-step approach for reliable freeze frame:
+            # 1. Extract single frame as image
+            # 2. Create video from that image
+            frame_img = str(temp_dir / f"frame_{clip_idx:04d}.png")
+            
+            # Step 1: Extract frame
+            cmd_extract = [
+                ffmpeg, "-y",
+                "-ss", f"{frame_time:.3f}",
+                "-i", source_video,
+                "-frames:v", "1",
+                "-q:v", "2",
+                frame_img,
+                "-loglevel", "error"
+            ]
+            subprocess.run(cmd_extract, check=True, timeout=30)
+            
+            # Step 2: Create video from frame
+            cmd_freeze = [
+                ffmpeg, "-y",
+                "-loop", "1",
+                "-i", frame_img,
+                "-t", f"{ext_duration:.3f}",
+                "-r", f"{fps:.2f}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                freeze_path,
+                "-loglevel", "error"
+            ]
+            subprocess.run(cmd_freeze, check=True, timeout=60)
+            clips.append(freeze_path)
+            clip_idx += 1
+            
+            current_pos = ext_time
+        
+        # Extract remaining video after last extension point
+        # Get total video duration
+        probe_cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", source_video
+        ]
+        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        video_duration = float(probe_result.stdout.strip())
+        
+        if current_pos < video_duration - 0.1:  # More than 0.1s remaining
+            final_chunk_path = str(temp_dir / f"chunk_{clip_idx:04d}.mp4")
+            remaining = video_duration - current_pos
+            
+            cmd = [
+                ffmpeg, "-y",
+                "-ss", f"{current_pos:.3f}",
+                "-i", source_video,
+                "-t", f"{remaining:.3f}",
+                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                "-an",
+                final_chunk_path,
+                "-loglevel", "error"
+            ]
+            subprocess.run(cmd, check=True, timeout=120)
+            clips.append(final_chunk_path)
         
         # Create concat list
         concat_list = str(temp_dir / "concat.txt")
         with open(concat_list, "w") as f:
             for clip in clips:
-                f.write(f"file '{clip}'\n")
+                # Use forward slashes or escape backslashes for ffmpeg
+                clip_escaped = clip.replace("\\", "/")
+                f.write(f"file '{clip_escaped}'\n")
         
         # Concatenate all clips
         subprocess.run([
