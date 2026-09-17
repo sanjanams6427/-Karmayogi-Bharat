@@ -14,7 +14,8 @@ from pathlib import Path
 from .lang_config import INDIC_TRANS2_CODES, SEAMLESS_CODES, SEAMLESS_S2ST_LANGS, NLLB_CODES, LANG_NAMES
 from .logger import get_logger
 from .retry import retry
-from .quality import score_segment, review_summary
+from .quality import score_segment, review_summary, detect_wrong_language
+from . import gpu_monitor as _gpu_monitor
 
 # Matches <unk>, &lt;unk&gt;, [unk], (unk) — case-insensitive, with surrounding whitespace
 _UNK_RE = re.compile(r"\s*(?:<unk>|&lt;unk&gt;|\[unk\]|\(unk\))\s*", re.IGNORECASE)
@@ -553,6 +554,24 @@ def _naturalise(text: str, tgt_lang: str = "") -> str:
         text = re.sub(r'\u0913\s+\u092b\u094b\u091f\u094b\s+\u0916\u093f\u091a\u092f\u092c\u093e\u0915[^\u0964\u0965.!?]*', '\u092b\u093c\u094b\u091f\u094b \u0916\u093f\u0902\u091a\u0935\u093e\u0928\u0947 \u0915\u0947 \u0905\u0935\u0938\u0930 \u0915\u0947 \u0932\u093f\u090f', text)
         text = re.sub(r'\u0915\u0915\u094d\u0937\u092e\u0947(?=[\s\u0964\u0965]|$)', '\u092c\u0948\u0920\u0915 \u0915\u0915\u094d\u0937 \u092e\u0947\u0902', text)
         text = re.sub(r'\u0906\u092c\s+\u092e\u093e\u0928\u0928\u0940\u092f(?=[\s\u0964\u0965]|$)', '\u0905\u092c \u092e\u093e\u0928\u0928\u0940\u092f', text)
+        # IndicTrans2 word-join spacing artifacts (observed in KB_COURSE_001 SRT):
+        # the model drops the space between a common word and नैतिक*, क्या/क्यों etc.
+        #   लेकिनैतिकता → लेकिन नैतिकता   (लेकिन + नैतिकता, shared न)
+        #   विभिन्नैतिक  → विभिन्न नैतिक
+        #   दार्शनिक्या  → दार्शनिक क्या ;  दार्शनिक्यों → दार्शनिक क्यों
+        text = text.replace('\u0932\u0947\u0915\u093f\u0928\u0948\u0924\u093f\u0915\u0924\u093e',
+                            '\u0932\u0947\u0915\u093f\u0928 \u0928\u0948\u0924\u093f\u0915\u0924\u093e')
+        text = text.replace('\u0932\u0947\u0915\u093f\u0928\u0948\u0924\u093f\u0915',
+                            '\u0932\u0947\u0915\u093f\u0928 \u0928\u0948\u0924\u093f\u0915')
+        text = text.replace('\u0935\u093f\u092d\u093f\u0928\u094d\u0928\u0948\u0924\u093f\u0915',
+                            '\u0935\u093f\u092d\u093f\u0928\u094d\u0928 \u0928\u0948\u0924\u093f\u0915')
+        text = text.replace('\u0926\u093e\u0930\u094d\u0936\u0928\u093f\u0915\u094d\u092f\u093e',
+                            '\u0926\u093e\u0930\u094d\u0936\u0928\u093f\u0915 \u0915\u094d\u092f\u093e')
+        text = text.replace('\u0926\u093e\u0930\u094d\u0936\u0928\u093f\u0915\u094d\u092f\u094b\u0902',
+                            '\u0926\u093e\u0930\u094d\u0936\u0928\u093f\u0915 \u0915\u094d\u092f\u094b\u0902')
+        # Untranslated English philosophy term left in Devanagari output.
+        text = re.sub(r'\baxiology\b', '\u092e\u0942\u0932\u094d\u092f\u092e\u0940\u092e\u093e\u0902\u0938\u093e',
+                      text, flags=re.IGNORECASE)
     text = re.sub(r" {2,}", " ", text)
     return text.strip()
 
@@ -759,6 +778,18 @@ _MAITHILI_IN_HIN_RE = re.compile(
     r'|\u0906\u092c\s+\u092e\u093e\u0928\u0928\u0940\u092f(?=[\s\u0964\u0965]|$|[^\u0900-\u097F])'  # आब माननीय
     r'|\u091b\u0947\.(?=[\s]|$)'  # छे. (Maithili copula artifact prefix)
     r'|^\u091b\u0947\s'           # छे at sentence start
+    # Found leaking into real KB Hindi output at threshold=1 (single occurrence — not "2+ hits" like _MAITHILI_DRIFT_RE requires): checked output/hin/*_98746a97_hin.srt, every leaked segment had only ONE recognized marker, never enough to cross that threshold.
+    r'|लेल(?=[\s।॥]|$|[^ऀ-ॿ])'  # लेल (Maithili "for")
+    r'|नहि(?=[\s।॥]|$|[^ऀ-ॿ])'  # नहि (Maithili "not" — Hindi is नहीं)
+    r'|एकर(?=[\s।॥]|$|[^ऀ-ॿ])'  # एकर (Maithili "his/her/its")
+    r'|एकटा(?=[\s।॥]|$|[^ऀ-ॿ])'  # एकटा (Maithili "one/a")
+    r'|एहन(?=[\s।॥]|$|[^ऀ-ॿ])'  # एहन (Maithili "such/like this")
+    r'|सेहो(?=[\s।॥]|$|[^ऀ-ॿ])'  # सेहो (Maithili "also")
+    r'|ओकर(?=[\s।॥]|$|[^ऀ-ॿ])'  # ओकर (Maithili "his/her")
+    r'|भेटैत(?=[\s।॥]|$|[^ऀ-ॿ])'  # भेटैत (Maithili verb form)
+    r'|अछि(?=[\s।॥]|$|[^ऀ-ॿ])'  # अछि — same word as the threshold=2 drift list above, but one occurrence is already unambiguous (Hindi never says this, it says है)
+    r'|(?<![\u0900-\u097F])\u091b\u0940(?=[\s।॥]|$|[^ऀ-ॿ])'
+    # छी standalone only — lookbehind excludes it as the tail of अच्छी ("well/good"), a common legitimate Hindi word ending in the same two characters; without the lookbehind this would misfire on every अच्छी in real Hindi output. Standalone छी is unambiguously the Maithili copula (Hindi says है/हैं).
 )
 _HIN_SUBJ_NOUNS_RE = re.compile(
     r'(?:^|\s)(?:'
@@ -874,16 +905,37 @@ class Translator:
             model.eval()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                # torch.compile gives ~20% speedup on repeated forward passes
-                try:
-                    model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
-                except Exception as _compile_err:
-                    log.info(f"torch.compile unavailable ({_compile_err}) — running eager mode")
+                # torch.compile speeds up repeated forward passes, but the
+                # "reduce-overhead" mode captures CUDA graphs and spawns
+                # persistent Inductor/Triton background worker threads that do
+                # NOT terminate. Those threads keep the CUDA context alive, so
+                # the process cannot exit cleanly — the terminal/port hangs and
+                # GPU memory is never released (system freeze on close).
+                #
+                # Default: skip torch.compile entirely for a clean, killable
+                # process. Set PIPELINE_TORCH_COMPILE=1 to opt back in (uses the
+                # safer default mode, which does not use CUDA graphs), or
+                # PIPELINE_TORCH_COMPILE=reduce-overhead to force the old fast
+                # path if you accept the shutdown cost.
+                _compile_mode = _os.environ.get("PIPELINE_TORCH_COMPILE", "0").strip()
+                if _compile_mode and _compile_mode != "0":
+                    try:
+                        _mode = _compile_mode if _compile_mode in (
+                            "default", "reduce-overhead", "max-autotune"
+                        ) else "default"
+                        model = torch.compile(model, mode=_mode, fullgraph=False)
+                        log.info(f"torch.compile enabled (mode={_mode})")
+                    except Exception as _compile_err:
+                        log.info(f"torch.compile unavailable ({_compile_err}) — running eager mode")
             processor = IndicProcessor(inference=True)
             self._indic_trans2[direction] = {
                 "tokenizer": tokenizer, "model": model, "processor": processor,
                 "dtype": dtype,  # store intended dtype — don't infer from parameters()
             }
+            _gpu_monitor.log_load(
+                f"translator:indictrans2:{direction}", f"IndicTrans2 ({direction})",
+                detail="checkpoint" if _ckpt.exists() else "base",
+            )
         return self._indic_trans2[direction]
 
     def _load_seamless(self):
@@ -898,6 +950,7 @@ class Translator:
                 "processor": AutoProcessor.from_pretrained(path),
                 "model": seamless_model,
             }
+            _gpu_monitor.log_load("translator:seamless", "SeamlessM4T")
         return self._seamless
 
     def translate_speech_to_speech(
@@ -961,6 +1014,7 @@ class Translator:
                     path, torch_dtype=torch.float16, low_cpu_mem_usage=True,
                 ).to(NLLB_DEV),
             }
+            _gpu_monitor.log_load("translator:nllb", "NLLB-200")
         return self._nllb
 
     # ----------------------------------------------------------
@@ -1479,6 +1533,28 @@ class Translator:
                 engine_used = "nllb"
             except Exception as _mni_e:
                 log.warning(f"NLLB mni hallucination-retry failed: {_mni_e}")
+
+        # hin drift guard: IndicTrans2 en_indic sometimes emits Maithili (mai_Deva)
+        # instead of Hindi (both Devanagari, so no script check catches it). Detect
+        # via Maithili grammatical markers and retry via NLLB (eng→hin), which does
+        # not exhibit this drift. If NLLB also drifts or fails, keep the best of the
+        # two so we never return None (silence is worse than a flagged segment).
+        if tgt_lang == "hin" and translated:
+            _is_wrong, _reason = detect_wrong_language(translated, "hin")
+            if _is_wrong:
+                log.warning(f"[hin] Maithili drift detected ({_reason}) — retrying via NLLB")
+                try:
+                    _nllb_hin = self._translate_nllb(
+                        work_text, NLLB_CODES["eng"], NLLB_CODES["hin"])
+                    _nllb_wrong, _ = detect_wrong_language(_nllb_hin or "", "hin")
+                    if (_nllb_hin or "").strip() and not _nllb_wrong:
+                        translated  = _nllb_hin
+                        engine_used = "nllb"
+                        log.info("[hin] NLLB retry produced clean Hindi — using it")
+                    else:
+                        log.warning("[hin] NLLB retry still not clean Hindi — keeping best available")
+                except Exception as _hin_e:
+                    log.warning(f"NLLB hin drift-retry failed: {_hin_e}")
 
         if translated is None:
             raise RuntimeError(

@@ -76,6 +76,48 @@ app.add_middleware(
 # lazily instantiated and safe to reuse across requests.
 _editor = SegmentEditor()
 
+
+@app.on_event("shutdown")
+def _release_gpu_on_shutdown():
+    """
+    Free GPU memory and drop model handles when uvicorn stops.
+
+    Without this, stopping the server (Ctrl+C / terminal close) leaves the
+    shared editor's translator/TTS/ASR models resident and the CUDA context
+    alive. Combined with any torch.compile/Triton worker threads, the process
+    cannot exit cleanly — the port stays bound, GPU memory is never released,
+    and the machine can freeze. This tears everything down so the process can
+    actually terminate.
+    """
+    try:
+        _editor._translator = None
+        _editor._tts = None
+        if getattr(_editor, "_asr", None) is not None:
+            try:
+                _editor._asr._fw_model = None
+            except Exception:
+                pass
+            _editor._asr = None
+    except Exception:
+        pass
+    try:
+        from pipeline import gpu_monitor as _gm
+        _gm.evict_all("translator:")
+        _gm.evict_all("tts:")
+        _gm.evict_all("asr")
+    except Exception:
+        pass
+    try:
+        import gc
+        import torch
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
 # In-memory session registry: session_id -> EditSession
 _sessions: dict[str, EditSession] = {}
 _sessions_lock = threading.Lock()

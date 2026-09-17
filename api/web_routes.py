@@ -102,7 +102,7 @@ def _seg_status(seg: Segment) -> str:
     # reviewer explicitly rejected (approved=False but has notes flagged)
     if seg.reviewer_notes and seg.reviewer_notes.lower().startswith("reject"):
         return "rejected"
-    if seg.will_overflow or seg.estimated_overflow:
+    if seg.is_overflowing:
         return "overflow"
     return "pending"
 
@@ -139,6 +139,7 @@ def _seg_to_ui(session_id: str, seg: Segment) -> dict:
         "audio_url": audio_url,
         "thumb_url": thumb_url,
         "score": round(seg.translation_score, 2),
+        "qa": getattr(seg, "qa_score", -1.0),
     }
 
 
@@ -148,6 +149,7 @@ def _segments_payload(session) -> dict:
         "segments": [_seg_to_ui(session.session_id, s) for s in session.segments],
         "stats": session.stats(),
         "video_duration": session.video_duration,
+        "target_lang": session.target_lang,
         "step": session.step,
     }
 
@@ -305,6 +307,160 @@ def patch_segment(session_id: str, seg_id: int, body: PatchBody):
 
 
 # ══════════════════════════════════════════════════════════════
+# Glossary — view terms, and fix a term across the whole session
+# ══════════════════════════════════════════════════════════════
+@router.get("/api/glossary/{lang}")
+def glossary_terms(lang: str):
+    gm = core._get_glossary(lang)
+    return {"lang": lang, "terms": gm.get_glossary(lang) if gm else {}}
+
+
+class GlossaryFixBody(BaseModel):
+    find: str                    # text to find in translated segments
+    replace: str                 # approved replacement term
+    register_src: Optional[str] = None  # English term — registers replace in glossary
+
+
+@router.post("/api/sessions/{session_id}/glossary")
+def glossary_fix(session_id: str, body: GlossaryFixBody):
+    """Fix a term once, apply it everywhere: replaces `find` with `replace`
+    in every translated segment (word-boundary, case-insensitive). Segments
+    whose text changed lose their (now stale) TTS and approval. Optionally
+    registers the approved term in the language glossary so all FUTURE
+    translations use it too — this is how the glossary library grows."""
+    import re as _re
+    sess = core._load_session(session_id)
+    find = body.find.strip()
+    replace = body.replace.strip()
+    if not find or not replace:
+        raise HTTPException(status_code=400, detail="find and replace are required")
+
+    if body.register_src and body.register_src.strip():
+        gm = core._get_glossary(sess.target_lang)
+        if gm:
+            gm.add_term(body.register_src.strip(), replace, sess.target_lang)
+
+    pat = _re.compile(r"(?<![\w])" + _re.escape(find) + r"(?![\w])", _re.IGNORECASE)
+    changed = []
+    for seg in sess.segments:
+        if seg.action != SegmentAction.TRANSLATE or not seg.translated_text:
+            continue
+        if not pat.search(seg.translated_text):
+            continue
+        seg.translated_text = pat.sub(replace, seg.translated_text)
+        seg.translation_engine = "glossary_fix"
+        seg.approved = False
+        # TTS is now stale — clear it so 'Generate TTS All' resynthesizes.
+        if seg.tts_audio_path and Path(seg.tts_audio_path).exists():
+            try:
+                Path(seg.tts_audio_path).unlink()
+            except Exception:
+                pass
+        seg.tts_audio_path = ""
+        seg.tts_duration = 0.0
+        seg.qa_score = -1.0
+        changed.append(seg.id)
+    sess.save()
+    payload = _segments_payload(sess)
+    payload["applied_to"] = changed
+    return payload
+
+
+# ══════════════════════════════════════════════════════════════
+# LLM assists — shorten-to-fit and fluency polish (cloud LLM,
+# gated by .env API keys + sovereign guard; graceful 400 if off)
+# ══════════════════════════════════════════════════════════════
+def _get_enhancer():
+    from pipeline.llm_enhancer import LLMEnhancer
+    global _ENHANCER
+    try:
+        _ENHANCER
+    except NameError:
+        _ENHANCER = LLMEnhancer()
+    return _ENHANCER
+
+
+@router.post("/api/sessions/{session_id}/segments/{seg_id}/shorten")
+def shorten_segment(session_id: str, seg_id: int):
+    """LLM-shorten a translation so its audio fits the video slot — fixes
+    overflow in the TEXT instead of speeding up or extending."""
+    sess = core._load_session(session_id)
+    seg = core._get_segment_or_404(sess, seg_id)
+    if not seg.translated_text:
+        raise HTTPException(status_code=400, detail="Segment not translated yet")
+    enh = _get_enhancer()
+    if not enh.available:
+        raise HTTPException(status_code=400, detail=(
+            "LLM enhancer unavailable — set GROQ_API_KEY/GEMINI_API_KEY in .env "
+            "(and note KB_SOVEREIGN_MODE blocks cloud LLMs for KB content)"))
+    cur_words = len(seg.translated_text.split())
+    if seg.tts_duration > 0 and seg.original_duration > 0:
+        # Scale word count by how much the audio overflows, small safety margin.
+        target = int(cur_words * (seg.original_duration / seg.tts_duration) * 0.95)
+    else:
+        target = int(seg.original_duration * 2.5)  # ~2.5 words/sec spoken Hindi
+    target = max(target, 3)
+    shorter = enh.shorten_to_fit(seg.source_text, seg.translated_text,
+                                 sess.target_lang, target)
+    if not shorter:
+        raise HTTPException(status_code=502, detail="LLM did not return a usable shorter translation")
+    core._editor.edit_translation(sess, seg_id, shorter)  # clears stale TTS + approval
+    seg = core._get_segment_or_404(sess, seg_id)
+    seg.translation_engine = "llm_shorten"
+    sess.save()
+    return _seg_to_ui(session_id, seg)
+
+
+@router.post("/api/sessions/{session_id}/segments/{seg_id}/enhance")
+def enhance_segment(session_id: str, seg_id: int):
+    """LLM fluency polish of one translation (grammar, word order, naturalness)."""
+    sess = core._load_session(session_id)
+    seg = core._get_segment_or_404(sess, seg_id)
+    if not seg.translated_text:
+        raise HTTPException(status_code=400, detail="Segment not translated yet")
+    enh = _get_enhancer()
+    if not enh.available:
+        raise HTTPException(status_code=400, detail=(
+            "LLM enhancer unavailable — set GROQ_API_KEY/GEMINI_API_KEY in .env "
+            "(and note KB_SOVEREIGN_MODE blocks cloud LLMs for KB content)"))
+    improved = enh.enhance(seg.source_text, seg.translated_text,
+                           sess.source_lang, sess.target_lang)
+    if not improved or improved.strip() == seg.translated_text.strip():
+        raise HTTPException(status_code=502, detail="LLM returned no improvement")
+    core._editor.edit_translation(sess, seg_id, improved)  # clears stale TTS + approval
+    seg = core._get_segment_or_404(sess, seg_id)
+    seg.translation_engine = "llm_enhanced"
+    sess.save()
+    return _seg_to_ui(session_id, seg)
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /api/sessions/{sid}/fit-all — set fit strategy on every segment
+# ══════════════════════════════════════════════════════════════
+class FitAllBody(BaseModel):
+    fit: str  # auto | speedup | extend | trim (UI tokens)
+
+
+@router.post("/api/sessions/{session_id}/fit-all")
+def fit_all(session_id: str, body: FitAllBody):
+    sess = core._load_session(session_id)
+    enum_val = _UI_TO_FIT.get(body.fit, body.fit)
+    try:
+        strategy = FitStrategy(enum_val)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid fit '{body.fit}'")
+    updated = 0
+    for seg in sess.segments:
+        if seg.action == SegmentAction.TRANSLATE:
+            seg.fit_strategy = strategy
+            updated += 1
+    sess.save()
+    payload = _segments_payload(sess)
+    payload["updated"] = updated
+    return payload
+
+
+# ══════════════════════════════════════════════════════════════
 # POST /api/sessions/{sid}/batch/{op}  ->  returns {job_id}
 #   op ∈ { translate, tts, auto-approve }
 # ══════════════════════════════════════════════════════════════
@@ -339,6 +495,13 @@ def batch_op(session_id: str, op: str):
                 sess.save()
                 progress_cb(1, 1)
                 return {"stats": sess.stats(), "step": sess.step}
+
+    elif op in ("qa-verify", "qa_verify"):
+
+        def worker(progress_cb):
+            with lock:
+                summary = core._editor.qa_verify_all(sess, progress_callback=progress_cb)
+                return {"stats": sess.stats(), "qa": summary}
 
     else:
         raise HTTPException(status_code=400, detail=f"Unknown batch op '{op}'")
@@ -430,10 +593,14 @@ def segment_audio(session_id: str, seg_id: int):
     seg = core._get_segment_or_404(sess, seg_id)
     if not seg.tts_audio_path or not Path(seg.tts_audio_path).exists():
         raise HTTPException(status_code=404, detail="No TTS audio for this segment yet")
+    # No filename= — that sets Content-Disposition: attachment, which is for
+    # downloads; this endpoint feeds an inline <audio> player. Short-lived
+    # private cache so replaying/scrubbing a segment doesn't refetch the WAV
+    # (and re-parse the session) on every Range request.
     return FileResponse(
         seg.tts_audio_path,
         media_type="audio/wav",
-        filename=f"seg_{seg_id:04d}.wav",
+        headers={"Cache-Control": "private, max-age=60"},
     )
 
 
@@ -516,6 +683,7 @@ class BatchJobState:
         self.summary = ""
         self.error = None
         self._log_index = 0
+        self.num_gpus_used = 1
 
 
 def _get_batch_job(job_id: str) -> BatchJobState:
@@ -574,6 +742,58 @@ async def batch_start(
     return {"job_id": job_id, "status": "started", "languages": langs}
 
 
+def _apply_dubbing_result(job: BatchJobState, tgt_lang: str, result) -> None:
+    """
+    Write one language's DubbingResult into job.results in place.
+
+    Shared by both the sequential (1 GPU) and parallel (multi-GPU) code
+    paths in _run_batch_job so the two don't drift out of sync — and fixes
+    a real bug in the process: dub_video() never *raises* on failure, it
+    catches internally and returns a DubbingResult with success=False. The
+    old code here only had a try/except around the call, so a failed
+    language was never caught by it and got recorded as "completed" with
+    empty/wrong output paths. This checks result.success explicitly.
+    """
+    idx = next((i for i, r in enumerate(job.results) if r["lang"] == tgt_lang), None)
+    if idx is None:
+        log.warning(f"_apply_dubbing_result: {tgt_lang} not in job.results for {job.job_id}")
+        return
+
+    if not result.success:
+        job.results[idx]["status"] = "failed"
+        job.results[idx]["error"] = result.error or "unknown error"
+        job.log_lines.append(f"❌ {tgt_lang} failed: {result.error}")
+        return
+
+    job.results[idx]["status"] = "completed"
+    job.results[idx]["output_path"] = result.output_video_path
+    job.results[idx]["output_audio_path"] = result.output_audio_path
+
+    if result.output_video_path:
+        out_dir = Path(result.output_video_path).parent
+        video_stem = Path(result.output_video_path).stem.replace(f"_{tgt_lang}", "")
+        job.results[idx]["srt_path"] = str(out_dir / f"{video_stem}_{tgt_lang}.srt")
+        job.results[idx]["vtt_path"] = str(out_dir / f"{video_stem}_{tgt_lang}.vtt")
+        job.results[idx]["metadata_path"] = str(out_dir / f"{video_stem}_{tgt_lang}_metadata.json")
+
+    if result.quality_summary:
+        qs = result.quality_summary
+        job.results[idx]["score"] = qs.get("avg_score", qs.get("overall_score", 0))
+        job.results[idx]["pass_rate"] = qs.get("pass_rate", 0)
+        job.results[idx]["duration_ratio"] = qs.get("duration_ratio", 1.0)
+        job.results[idx]["total_segments"] = qs.get("total", 0)
+        job.results[idx]["failed_segments"] = qs.get("failed", 0)
+        job.results[idx]["review_segments"] = qs.get("needs_review", 0)
+        job.results[idx]["avg_chrf"] = qs.get("avg_chrf", 0)
+
+    job.results[idx]["duration_original"] = result.duration_original
+    job.results[idx]["duration_output"] = result.duration_output
+    job.results[idx]["elapsed_s"] = result.elapsed_s
+
+    out_name = Path(result.output_video_path or result.output_audio_path or "").name
+    job.log_lines.append(f"✅ {tgt_lang} completed: {out_name}")
+
+
 def _run_batch_job(job: BatchJobState):
     """Background worker for batch dubbing."""
     try:
@@ -581,76 +801,85 @@ def _run_batch_job(job: BatchJobState):
         job.log_lines.append(f"Starting batch dubbing job {job.job_id}")
         job.log_lines.append(f"Video: {Path(job.video_path).name}")
         job.log_lines.append(f"Languages: {', '.join(job.tgt_langs)}")
-        
+
         # Initialize results
         job.results = [{"lang": lang, "status": "pending", "score": None, "pass_rate": None, "duration_ratio": None, "output_path": None} for lang in job.tgt_langs]
-        
+
         # Load pipeline
         job.log_lines.append("Loading dubbing pipeline...")
         job.status_message = "Loading models..."
-        
+
         from pipeline.dubbing_pipeline import DubbingPipeline
         pipeline = DubbingPipeline()
-        
+
         job.log_lines.append("Pipeline ready")
-        
+
+        # Detect how many GPUs are actually available. Previously this
+        # function always called pipeline.dub_video() directly, one
+        # language at a time, in this process — which pins every model to
+        # GPU 0 regardless of how many GPUs the machine has, and never
+        # freed GPU memory between languages either. dub_course() now does
+        # both: it distributes languages across GPUs (multiprocessing,
+        # same mechanism scripts/dub.py --num-gpus uses) when more than one
+        # GPU is available, and evicts translator/TTS engines between
+        # languages either way (see DubbingPipeline.unload_models()).
+        try:
+            import torch
+            n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        except Exception:
+            n_gpus = 1
+        n_gpus = max(1, min(n_gpus, len(job.tgt_langs)))
+        job.num_gpus_used = n_gpus
+        job.log_lines.append(
+            f"Using {n_gpus} GPU(s)" + (" (parallel across languages)" if n_gpus > 1 else "")
+        )
+
         total = len(job.tgt_langs)
         completed = 0
-        
-        for i, tgt_lang in enumerate(job.tgt_langs):
-            job.status_message = f"Processing {tgt_lang} ({i+1}/{total})"
-            job.log_lines.append(f"--- Starting {tgt_lang} ---")
-            
-            # Update result status
-            job.results[i]["status"] = "processing"
-            
-            try:
-                result = pipeline.dub_video(
-                    video_path=job.video_path,
-                    src_lang=job.src_lang,
-                    tgt_lang=tgt_lang,
-                    output_dir=str(Path("output") / job.course_id),
-                    course_id=job.course_id,
-                    force=job.force,
-                )
-                
-                # Update result with all output paths
-                job.results[i]["status"] = "completed"
-                job.results[i]["output_path"] = result.output_video_path
-                job.results[i]["output_audio_path"] = result.output_audio_path
-                
-                # Find SRT, VTT, and metadata JSON paths
-                out_dir = Path(result.output_video_path).parent
-                video_stem = Path(result.output_video_path).stem.replace(f"_{tgt_lang}", "")
-                job.results[i]["srt_path"] = str(out_dir / f"{video_stem}_{tgt_lang}.srt")
-                job.results[i]["vtt_path"] = str(out_dir / f"{video_stem}_{tgt_lang}.vtt")
-                job.results[i]["metadata_path"] = str(out_dir / f"{video_stem}_{tgt_lang}_metadata.json")
-                
-                # Quality summary with all details
-                if result.quality_summary:
-                    qs = result.quality_summary
-                    job.results[i]["score"] = qs.get("avg_score", qs.get("overall_score", 0))
-                    job.results[i]["pass_rate"] = qs.get("pass_rate", 0)
-                    job.results[i]["duration_ratio"] = qs.get("duration_ratio", 1.0)
-                    job.results[i]["total_segments"] = qs.get("total", 0)
-                    job.results[i]["failed_segments"] = qs.get("failed", 0)
-                    job.results[i]["review_segments"] = qs.get("needs_review", 0)
-                    job.results[i]["avg_chrf"] = qs.get("avg_chrf", 0)
-                
-                job.results[i]["duration_original"] = result.duration_original
-                job.results[i]["duration_output"] = result.duration_output
-                job.results[i]["elapsed_s"] = result.elapsed_s
-                
-                job.log_lines.append(f"✅ {tgt_lang} completed: {Path(result.output_video_path).name}")
-                
-            except Exception as e:
-                job.results[i]["status"] = "failed"
-                job.results[i]["error"] = str(e)
-                job.log_lines.append(f"❌ {tgt_lang} failed: {e}")
-            
-            completed += 1
+
+        def _progress_cb(group: dict) -> None:
+            nonlocal completed
+            for tgt_lang, result in group.items():
+                _apply_dubbing_result(job, tgt_lang, result)
+                completed += 1
             job.progress = int((completed / total) * 100)
-        
+            job.status_message = f"Processed {completed}/{total} language(s)"
+
+        job.status_message = f"Processing {total} language(s) on {n_gpus} GPU(s)..."
+        # No per-language "started" signal is available once work is
+        # distributed across GPU workers (each worker processes its whole
+        # bucket before returning) — mark the batch in-flight as a whole
+        # rather than leaving every row reading "pending" until it's done.
+        for r in job.results:
+            r["status"] = "processing"
+        try:
+            merged = pipeline.dub_course(
+                video_path=job.video_path,
+                src_lang=job.src_lang,
+                tgt_langs=job.tgt_langs,
+                output_dir=str(Path("output") / job.course_id),
+                course_id=job.course_id,
+                force=job.force,
+                num_gpus=n_gpus,
+                progress_callback=_progress_cb,
+            )
+        finally:
+            # Belt-and-braces: dub_course/_worker_dub_langs already evict
+            # between languages, but make sure nothing is left resident
+            # once the whole job is done either.
+            pipeline.unload_models()
+
+        # Defensive pass — every language should already be applied via
+        # _progress_cb above; this only catches a language whose callback
+        # never fired (e.g. a bug in a future refactor), so job.results
+        # can never silently stay "pending" after the job finishes.
+        for tgt_lang, result in merged.items():
+            idx = next((i for i, r in enumerate(job.results) if r["lang"] == tgt_lang), None)
+            if idx is not None and job.results[idx]["status"] == "pending":
+                _apply_dubbing_result(job, tgt_lang, result)
+
+        job.progress = 100
+
         # Generate summary
         success_count = sum(1 for r in job.results if r["status"] == "completed")
         failed_count = sum(1 for r in job.results if r["status"] == "failed")
@@ -776,6 +1005,29 @@ def pipeline_status():
         return {"ready": True, "status": "Pipeline ready"}
     except Exception as e:
         return {"ready": False, "status": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════
+# GPU MONITOR — live stats + model load/evict event feed
+# ══════════════════════════════════════════════════════════════
+
+@router.get("/api/gpu/stats")
+def gpu_stats():
+    """Current per-GPU utilization/VRAM/temperature (nvidia-smi), plus
+    which engines this process currently has loaded/cached."""
+    from pipeline import gpu_monitor
+    stats = gpu_monitor.get_gpu_stats()
+    stats["loaded"] = gpu_monitor.currently_loaded()
+    return stats
+
+
+@router.get("/api/gpu/events")
+def gpu_events(since: float = 0.0, limit: int = 200):
+    """Model load/swap/evict events after `since` (unix seconds) — poll
+    this with the `ts` of the last event you already have to get only
+    what's new."""
+    from pipeline import gpu_monitor
+    return {"events": gpu_monitor.recent_events(since=since, limit=limit), "server_ts": time.time()}
 
 
 @router.get("/api/settings")

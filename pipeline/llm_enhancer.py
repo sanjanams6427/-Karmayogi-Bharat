@@ -151,6 +151,42 @@ class LLMEnhancer:
             log.warning(f"LLM enhance failed: {e} — using raw translation")
             return translation
 
+    def shorten_to_fit(self, source: str, translation: str, tgt_lang: str,
+                       target_words: int) -> str:
+        """Ask the LLM for a SHORTER paraphrase of `translation` (same meaning,
+        ~target_words words) so the dubbed audio fits its video slot without
+        speedup or extension. Returns "" on failure/unavailable — the caller
+        must treat empty as 'no change', never overwrite with "".
+        """
+        if not self.available or not translation.strip() or target_words < 3:
+            return ""
+        prompt = (
+            "You are a professional dubbing-script adapter for Indian languages.\n"
+            f"The {tgt_lang} translation below is too long to fit its video slot.\n"
+            f"Rewrite it in AT MOST {target_words} words, keeping the full meaning.\n"
+            "- Keep all proper nouns, scheme names, and numbers exactly as-is\n"
+            "- Prefer dropping filler phrases over dropping information\n"
+            "- Natural spoken style; same language as the translation\n"
+            "- Output ONLY the shortened translation, nothing else\n\n"
+            f"Original meaning (source): {source}\n"
+            f"Translation to shorten ({tgt_lang}): {translation}\n"
+            "Shortened translation:"
+        )
+        import concurrent.futures
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                result = ex.submit(self._call, prompt).result(timeout=45).strip()
+            # Sanity: must be non-empty and actually shorter than the input.
+            if result and len(result.split()) < len(translation.split()):
+                log.info(f"LLM shortened [{tgt_lang}]: {len(translation.split())}w "
+                         f"→ {len(result.split())}w (target {target_words}w)")
+                return result
+            log.warning(f"LLM shorten produced no usable result [{tgt_lang}]")
+            return ""
+        except Exception as e:
+            log.warning(f"LLM shorten failed: {e}")
+            return ""
+
     def enhance_batch(self, sources: list[str], translations: list[str],
                       src_lang: str, tgt_lang: str) -> list[str]:
         """Enhance a batch of translations in one LLM call."""

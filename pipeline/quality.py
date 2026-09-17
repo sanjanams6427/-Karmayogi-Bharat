@@ -49,6 +49,62 @@ def detect_transliteration(text: str, tgt_lang: str) -> bool:
     return latin_ratio > 0.60
 
 
+# Maithili grammatical markers that do NOT occur in standard Hindi.
+# IndicTrans2 frequently drifts Hindi → Maithili (both use Devanagari, so the
+# script check and Lingua both miss it). These are Maithili copulas, genitive/
+# dative postpositions and plural/quantifier morphemes. Matched as whole words
+# (with Devanagari word boundaries) so they do not false-positive inside longer
+# valid Hindi words.
+#   अछि / छथि / छलाह / छी / छैक  → Maithili copula "is/are" (Hindi uses है/हैं/हूँ)
+#   लेल                          → Maithili "for" (Hindi uses के लिए)
+#   करबाक / देबाक                → Maithili infinitive+genitive (Hindi uses करने का)
+#   एकटा / दूटा                  → Maithili "one/two" + classifier टा (Hindi uses एक/दो)
+#   सभ                           → Maithili plural marker (Hindi uses सब, spelled differently)
+#   एहन / जकर / एकर              → Maithili demonstratives/relatives
+#   चाही (as standalone)         → Maithili "should" (Hindi uses चाहिए)
+_MAITHILI_MARKERS = [
+    "अछि", "छथि", "छलाह", "छलैक", "छैक", "छी",
+    "लेल", "करबाक", "देबाक", "कयलक", "गेलाह",
+    "एकटा", "दूटा", "तीनटा",
+    "एहन", "जकर", "एकर", "ओकर",
+    "डिब्बासभ", "बातसभ",
+]
+
+# Whole-word Maithili marker regex (Devanagari uses no Latin \b, so bound with
+# start/space/punct on both sides). Compiled once.
+_MAITHILI_RE = re.compile(
+    r"(?:(?<=^)|(?<=[\s।॥,.\"'()]))(" + "|".join(re.escape(m) for m in _MAITHILI_MARKERS) +
+    r")(?=$|[\s।॥,.\"'()])"
+)
+
+
+def detect_wrong_language(text: str, tgt_lang: str) -> tuple[bool, str]:
+    """Detect that `text` is in the WRONG Indic language for `tgt_lang`.
+
+    Focused on the two failure modes seen in production:
+      1. Hindi target drifting to Maithili (IndicTrans2) — both Devanagari,
+         so this is caught via Maithili-specific grammatical markers.
+      2. (handled elsewhere) untranslated English in a non-Latin target.
+
+    Returns (is_wrong, reason). Conservative: only fires when there is clear
+    positive evidence of the wrong language, so correct output never fails.
+    """
+    if not text or not text.strip():
+        return False, ""
+    # Hindi (and Sanskrit/Nepali share Devanagari but are separate targets):
+    # only apply the Maithili guard when the TARGET is Hindi. If the target is
+    # actually Maithili, these markers are correct and must not fail.
+    if tgt_lang == "hin":
+        hits = _MAITHILI_RE.findall(text)
+        # A single incidental match could be coincidence; require it to be a
+        # real signal. Two distinct markers, or one high-confidence copula,
+        # is decisive evidence of Maithili drift.
+        high_conf = {"अछि", "छथि", "छलाह", "छलैक", "छैक", "छी", "लेल", "करबाक", "एकटा"}
+        if any(h in high_conf for h in hits) or len(set(hits)) >= 2:
+            return True, f"maithili_drift:{','.join(sorted(set(hits))[:5])}"
+    return False, ""
+
+
 def chrf_score(reference: str, hypothesis: str, n: int = 6, beta: float = 2.0) -> float:
     """
     Character n-gram F-score (ChrF). Works well for Indic scripts.
@@ -204,6 +260,15 @@ def score_segment(source: str, translation: str,
     #    source ≠ reference (different scripts), so skip cross-script pairs.
     same_script = (src_lang == "eng" and tgt_lang == "eng") or (src_lang == tgt_lang)
     chrf = chrf_score(source, translation) if same_script else 0.0
+
+    # 9. Wrong-language detection (decisive fail).
+    #    Catches Hindi→Maithili drift that the script check and Lingua both miss
+    #    (both are Devanagari). A wrong-language segment is unusable regardless
+    #    of the heuristic score, so force it below the reject threshold.
+    is_wrong, wrong_reason = detect_wrong_language(translation, tgt_lang)
+    if is_wrong:
+        flags.append(f"wrong_language:{wrong_reason}")
+        score = 0.0
 
     score = max(0.0, round(score, 3))
     needs_review = score < REVIEW_THRESHOLD

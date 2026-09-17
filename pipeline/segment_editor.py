@@ -27,6 +27,7 @@ import soundfile as sf
 
 from .logger import get_logger
 from .lang_config import LANG_NAMES
+from . import gpu_monitor as _gpu_monitor
 
 log = get_logger("segment_editor")
 
@@ -83,6 +84,9 @@ class Segment:
     # Approval
     approved: bool = False
     reviewer_notes: str = ""
+    # Round-trip QA: similarity between ASR-transcribed TTS audio and the
+    # target text. -1.0 = not verified yet; 0..1 = verified score.
+    qa_score: float = -1.0
     
     @property
     def original_duration(self) -> float:
@@ -124,16 +128,31 @@ class Segment:
     
     @property
     def estimated_tts_duration(self) -> float:
-        """Estimate TTS duration from translated text length.
-        
-        Rough heuristic: ~5 characters per second for most Indian languages.
-        This is used BEFORE actual TTS to warn about potential overflow.
+        """Estimate TTS duration from translated text length, BEFORE actual
+        TTS runs (used to warn about likely overflow ahead of time).
+
+        A flat chars-per-second rate doesn't work across scripts —
+        Devanagari/Telugu render many sounds as multi-codepoint combining
+        clusters, so counting Unicode characters badly overestimates how
+        long they take to speak (this used to flag nearly every Hindi
+        segment as "overflow" before TTS had even run, even ones that
+        later synthesized well under their slot). Mirrors the word-rate
+        model pipeline/tts.py::_calc_max_tokens already uses and has
+        tuned against real Parler-TTS output: ~2.5-3.0 words/sec for
+        Devanagari/Telugu; a coarser chars/sec fallback elsewhere.
         """
-        if not self.translated_text:
+        text = self.translated_text
+        if not text:
             return 0.0
-        # Adjust for script density — Devanagari/Tamil are denser
-        chars = len(self.translated_text)
-        return chars / 5.0  # ~5 chars/sec average speaking rate
+        deva_count = sum(1 for c in text if 'ऀ' <= c <= 'ॿ')
+        is_devanagari = (deva_count / max(len(text), 1)) > 0.4
+        tel_count = sum(1 for c in text if 'ఀ' <= c <= '౿')
+        is_telugu = (tel_count / max(len(text), 1)) > 0.4
+        if is_devanagari or is_telugu:
+            words = max(len(text.split()), 1)
+            rate = 2.5 if is_telugu else 3.0
+            return words / rate
+        return len(text) / 5.0  # chars/sec fallback for Latin/other scripts
     
     @property
     def estimated_overflow(self) -> bool:
@@ -141,6 +160,20 @@ class Segment:
         est = self.estimated_tts_duration
         return est > self.original_duration * self.max_speed
     
+    @property
+    def is_overflowing(self) -> bool:
+        """Single source of truth for "should this segment show an overflow
+        warning" — trusts the measured ratio (will_overflow) once real TTS
+        audio exists, and only falls back to the pre-TTS text-length
+        estimate (estimated_overflow) before that. Every UI surface should
+        use this instead of `will_overflow or estimated_overflow`, which
+        keeps flagging a segment forever once the (often wrong — see
+        estimated_tts_duration) pre-TTS guess said it would overflow, even
+        after real synthesis proves it fits."""
+        if self.tts_duration > 0:
+            return self.will_overflow
+        return self.estimated_overflow
+
     @property
     def extension_needed(self) -> float:
         """How much video extension needed if using EXTEND_VIDEO strategy."""
@@ -171,6 +204,7 @@ class Segment:
             "adjusted_end": self.adjusted_end,
             "approved": self.approved,
             "reviewer_notes": self.reviewer_notes,
+            "qa_score": self.qa_score,
         }
     
     @classmethod
@@ -197,6 +231,7 @@ class Segment:
             adjusted_end=d.get("adjusted_end", -1.0),
             approved=d.get("approved", False),
             reviewer_notes=d.get("reviewer_notes", ""),
+            qa_score=d.get("qa_score", -1.0),
         )
 
 
@@ -307,7 +342,7 @@ class EditSession:
                 tts_done += 1
             if seg.approved:
                 approved += 1
-            if seg.will_overflow or seg.estimated_overflow:
+            if seg.is_overflowing:
                 overflow_warning += 1
         
         return {
@@ -337,6 +372,7 @@ class SegmentEditor:
         if self._asr is None:
             from .asr import ASREngine
             self._asr = ASREngine()
+            _gpu_monitor.log_load("asr", "faster-whisper large-v3")
         return self._asr
     
     @property
@@ -359,7 +395,41 @@ class SegmentEditor:
             from .video_processor import VideoProcessor
             self._video = VideoProcessor()
         return self._video
-    
+
+    # ══════════════════════════════════════════════════════════
+    # GPU memory management
+    # ══════════════════════════════════════════════════════════
+    def unload_models(self):
+        """
+        Free GPU memory held by the translator and TTS engines.
+
+        api/server.py holds ONE SegmentEditor as a module-level singleton,
+        shared by every session for the entire lifetime of the server
+        process — so unlike the batch pipeline (a fresh DubbingPipeline per
+        job), engines loaded here were never scoped to anything smaller
+        than "the server is still running". Call this when a session's
+        work is done (see stitch()/stitch_with_extensions()) to bound
+        memory growth across sessions.
+
+        Safe to call while other sessions are mid-flight: it only clears
+        this shared editor's cached engine objects, it doesn't touch
+        session state. A concurrently active session's next translate/TTS
+        call will simply reload the engine it needs — a latency cost, not
+        a correctness issue, since ASR (kept loaded — see below) is the
+        only per-session state these properties hold.
+        """
+        self._translator = None
+        self._tts = None
+        _gpu_monitor.evict_all("translator:")
+        _gpu_monitor.evict_all("tts:")
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     # ══════════════════════════════════════════════════════════
     # STEP 1: Extract & Segment
     # ══════════════════════════════════════════════════════════
@@ -668,37 +738,85 @@ class SegmentEditor:
         session: EditSession,
         progress_callback: Callable[[int, int], None] = None,
     ) -> list[Segment]:
-        """Generate TTS for all translated segments."""
+        """Generate TTS for all translated segments.
+
+        Batched — reuses TTSEngine.synthesize_segments(), the same batching
+        (4 segments per Parler forward pass), long-segment sentence-split
+        pre-pass, and layered MMS fallback that oneshot/batch dubbing
+        already uses, instead of the old one-segment-at-a-time loop. Also
+        picks up the sentence-split safety net for long segments, which
+        the old per-segment path never had — long segments are the ones
+        most likely to hit Parler's "doesn't find a stop point" timeout.
+
+        GPU-sharded across every available GPU (see pipeline/tts_shard.py) —
+        a segment-editor session is always a single language, so unlike
+        oneshot dubbing there is never a multi-language worker already using
+        the other GPUs. Safe to use all of them here unconditionally.
+
+        Trade-off: progress reporting is coarser than before (0% then
+        100%, not per-segment) since synthesize_segments() doesn't expose
+        incremental progress. Worth it — this is a large speedup, and the
+        wait itself is now much shorter than the old per-segment version.
+        To regenerate ONE segment after reviewing (e.g. from the detail
+        panel), synthesize_segment() below is unchanged and still works
+        exactly as before, per-segment, with its own voice pinning.
+        """
         to_synth = [
             s for s in session.segments
             if s.action == SegmentAction.TRANSLATE
             and s.translated_text
             and not (s.tts_audio_path and Path(s.tts_audio_path).exists())
         ]
-        
+
         if not to_synth:
             session.step = "review"
             session.save()
             return []
-        
+
         total = len(to_synth)
-        
-        # Initialize TTS with voice pinning for consistent voice across segments
-        self.tts.pin_voice_for_session(session.target_lang)
-        
-        try:
-            for i, seg in enumerate(to_synth):
-                self.synthesize_segment(session, seg.id)
-                if progress_callback:
-                    progress_callback(i + 1, total)
-        finally:
-            # Release voice pinning after all segments done
-            self.tts.unpin_voice()
-        
+        if progress_callback:
+            progress_callback(0, total)
+
+        tts_dir = session.session_dir / "tts"
+        tts_dir.mkdir(exist_ok=True)
+        batch_input = [
+            {"id": s.id, "text": s.translated_text, "start": s.start, "end": s.end}
+            for s in to_synth
+        ]
+        from .tts_shard import synthesize_segments_sharded
+        results = synthesize_segments_sharded(
+            batch_input, session.target_lang, str(tts_dir))
+
+        by_id = {s.id: s for s in to_synth}
+        for r in results:
+            seg = by_id.get(r.get("id"))
+            if seg is None:
+                continue
+            audio_path = r.get("audio_path", "")
+            duration = 0.0
+            if audio_path and Path(audio_path).exists():
+                try:
+                    duration = sf.info(audio_path).duration
+                except Exception:
+                    pass
+            seg.tts_audio_path = audio_path
+            seg.tts_duration = duration
+            # synthesize_segments() doesn't report which specific engine
+            # won per segment (Parler vs its MMS fallback) — only whether
+            # every engine failed (tts_silent_failure, silence written).
+            # "batch" is intentionally generic rather than guessing wrong.
+            seg.tts_engine = "silence" if r.get("tts_silent_failure") else "batch"
+            seg.approved = False
+            log.info(f"[{session.session_id}] TTS seg {seg.id}: dur={duration:.2f}s "
+                     f"(orig={seg.original_duration:.2f}s, ratio={seg.duration_ratio:.2f}x)")
+
+        if progress_callback:
+            progress_callback(total, total)
+
         session.step = "review"
         session.save()
         return to_synth
-    
+
     def set_segment_max_speed(
         self,
         session: EditSession,
@@ -777,6 +895,53 @@ class SegmentEditor:
         session.save()
         log.info(f"[{session.session_id}] Auto-approved {approved} segments")
         return approved
+
+    # ══════════════════════════════════════════════════════════
+    # Round-trip QA — transcribe the TTS audio and compare to the
+    # target text. Catches garbled TTS, dropped/truncated sentences,
+    # and wrong-language output automatically. Local ASR only
+    # (faster-whisper) — sovereign-safe, no cloud calls.
+    # ══════════════════════════════════════════════════════════
+    def qa_verify_all(self, session: EditSession, progress_callback=None) -> dict:
+        import difflib
+        import re as _re
+
+        def _norm(t: str) -> list[str]:
+            # Strip punctuation/danda, lowercase, tokenize — ASR won't
+            # reproduce punctuation, so only word content is compared.
+            return _re.sub(r"[^\w\s]", " ", (t or "")).lower().split()
+
+        targets = [
+            s for s in session.segments
+            if s.action == SegmentAction.TRANSLATE and s.tts_audio_path
+            and Path(s.tts_audio_path).exists()
+        ]
+        total = len(targets)
+        if progress_callback:
+            progress_callback(0, max(total, 1))
+        low, failed = [], []
+        for i, seg in enumerate(targets):
+            try:
+                heard = self.asr.transcribe_file(seg.tts_audio_path, session.target_lang)
+            except Exception as e:
+                log.warning(f"[{session.session_id}] QA seg {seg.id}: ASR failed ({e})")
+                failed.append(seg.id)
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, _norm(seg.translated_text), _norm(heard)).ratio()
+            seg.qa_score = round(ratio, 3)
+            if ratio < 0.6:
+                low.append(seg.id)
+                log.warning(f"[{session.session_id}] QA LOW seg {seg.id}: "
+                            f"score={ratio:.2f} — audio may be garbled/truncated. "
+                            f"heard: {heard[:80]!r}")
+            if progress_callback:
+                progress_callback(i + 1, total)
+        session.save()
+        summary = {"verified": total - len(failed), "low_score": low,
+                   "asr_failed": failed}
+        log.info(f"[{session.session_id}] QA verify: {summary}")
+        return summary
     
     # ══════════════════════════════════════════════════════════
     # STEP 6: Stitch Final Output
@@ -810,7 +975,12 @@ class SegmentEditor:
                 "end": seg.end,
                 "text": seg.translated_text,
                 "audio_path": None,
-                "max_speed": seg.max_speed,
+                # Per-segment cap only applies to SPEED_UP segments — others
+                # signal "use the assembler's global cap" (same convention as
+                # stitch_with_extensions). Passing seg.max_speed for every
+                # segment would silently lower the global 1.6x cap to the
+                # 1.35 dataclass default for AUTO segments too.
+                "max_speed": seg.max_speed if seg.fit_strategy == FitStrategy.SPEED_UP else 1.0,
             }
             
             if seg.action == SegmentAction.TRANSLATE and seg.tts_audio_path:
@@ -881,6 +1051,10 @@ class SegmentEditor:
         }
         
         log.info(f"[{session.session_id}] Stitch complete → {output_video_path}")
+        # Session's work is done — free the shared editor's GPU engines
+        # rather than leaving them resident for the rest of the server's
+        # uptime (see unload_models() docstring).
+        self.unload_models()
         return result
     
     # ══════════════════════════════════════════════════════════
@@ -1124,7 +1298,17 @@ class SegmentEditor:
                 segment_timings.append((seg, new_start, new_end, orig_clip))
             
             elif seg.action == SegmentAction.TRANSLATE:
-                if seg.fit_strategy == FitStrategy.EXTEND_VIDEO and seg.tts_duration > seg.original_duration:
+                # AUTO now actually decides (its documented purpose — before
+                # this it NEVER extended, making it indistinguishable from
+                # SPEED_UP): extend when the overflow exceeds what max audio
+                # compression (1.6x, the assembler's cap) can absorb, else
+                # let the audio be sped up into the original slot.
+                _wants_extend = (
+                    seg.fit_strategy == FitStrategy.EXTEND_VIDEO
+                    or (seg.fit_strategy == FitStrategy.AUTO
+                        and seg.tts_duration > seg.original_duration * 1.6)
+                )
+                if _wants_extend and seg.tts_duration > seg.original_duration:
                     # Video will be extended — audio plays at natural speed
                     new_end = new_start + seg.tts_duration
                     extension = seg.tts_duration - seg.original_duration
@@ -1235,6 +1419,10 @@ class SegmentEditor:
         
         log.info(f"[{session.session_id}] Extended stitch complete → {output_video_path} "
                  f"(+{time_shift:.2f}s = {final_duration:.2f}s total)")
+        # Session's work is done — free the shared editor's GPU engines
+        # rather than leaving them resident for the rest of the server's
+        # uptime (see unload_models() docstring).
+        self.unload_models()
         return result
     
     def _create_extended_video(
@@ -1429,7 +1617,7 @@ def segments_to_table(session: EditSession) -> list[list]:
             status = "⏭️"
         elif seg.action == SegmentAction.KEEP_ORIGINAL:
             status = "🔊"
-        elif seg.will_overflow or seg.estimated_overflow:
+        elif seg.is_overflowing:
             status = "⚠️"
         else:
             status = "⏳"
@@ -1469,7 +1657,7 @@ def segments_to_table_extended(session: EditSession) -> list[list]:
             status = "⏭️"
         elif seg.action == SegmentAction.KEEP_ORIGINAL:
             status = "🔊"
-        elif seg.will_overflow or seg.estimated_overflow:
+        elif seg.is_overflowing:
             status = "⚠️"
         else:
             status = "⏳"

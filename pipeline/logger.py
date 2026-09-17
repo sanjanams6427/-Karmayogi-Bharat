@@ -1,12 +1,20 @@
 # ============================================================
 # Structured Logger — JSON lines to file + console
 # ============================================================
-import json, logging, sys, time
+import json, logging, os, sys, time
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
 LOGS_DIR = Path(__file__).parent.parent / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
+
+# Which GPU this PROCESS is pinned to. Set by the parent's env= for TTS
+# shard workers (and by dub_course_parallel language workers), absent in
+# the web-server process. Read once at import — the env is fixed before
+# the interpreter starts for subprocesses, which is the only case where
+# it's meaningful. With 4 shard workers all writing pipeline.log, a line
+# like "Parler single TIMEOUT [hin]" is unattributable without this.
+_GPU = os.environ.get("PIPELINE_GPU")
 
 
 class _JsonFormatter(logging.Formatter):
@@ -17,6 +25,8 @@ class _JsonFormatter(logging.Formatter):
             "module": record.name,
             "msg": record.getMessage(),
         }
+        if _GPU is not None:
+            obj["gpu"] = _GPU
         if record.exc_info:
             obj["exc"] = self.formatException(record.exc_info)
         if hasattr(record, "extra"):
@@ -44,7 +54,8 @@ def get_logger(name: str, log_file: str = "pipeline.log") -> logging.Logger:
         io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
         if hasattr(sys.stdout, 'buffer') else sys.stdout
     )
-    ch.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+    _prefix = f"[gpu{_GPU}]" if _GPU is not None else ""
+    ch.setFormatter(logging.Formatter(f"{_prefix}[%(name)s] %(message)s"))
     ch.setLevel(logging.INFO)
 
     logger.addHandler(fh)

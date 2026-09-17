@@ -320,32 +320,34 @@ class VideoProcessor:
         bgm_volume: float = 0.18,
     ) -> str:
         """
-        Sync-accurate dubbing assembly.
+        Slot-locked dubbing assembly (video-synced).
 
-        Every segment is placed at its EXACT original start timestamp so the
-        dubbed voice stays locked to video slide transitions.
+        Each segment is ANCHORED at its original start timestamp so the dubbed
+        voice stays aligned with the on-screen speaker for the entire video —
+        there is NO cumulative push-forward drift. A segment longer than its slot
+        is time-compressed (atempo, pitch-preserving) up to MAX_SPEED; if it is
+        still longer it may extend into the following silent gap only, and is
+        clipped at the next segment's anchor so two voices never overlap. Output
+        length matches the original video (no freeze-frame tail needed).
 
-        Fit-to-slot strategy (in priority order, no data is ever dropped):
-          1. TTS fits within original slot → place as-is.
-          2. TTS overflows into silence gap before next speech → allow it,
-             no speed change, no trim.  All words heard.
-          3. TTS would overlap next speech start → speed up via atempo
-             (max 1.35x).  Every word is still heard, just slightly faster.
-          4. Still over limit after 1.35x → extend limit by 300ms rather
-             than trim.  Only trim as absolute last resort with 250ms
-             fade-out so the final syllable decays naturally.
-
-        Sync guarantee: start timestamp is NEVER moved.  Only the tail of
-        a segment can be compressed/trimmed, never the head.
+        Guarantees:
+          - Every segment starts exactly at its original timestamp (video sync).
+          - No cumulative drift; subtitles resync to these anchored positions.
+          - No overlapping voices (tail clipped at next anchor in extreme cases).
         """
         import logging as _log
         _vp_log = _log.getLogger(__name__)
 
         FADE_IN_MS  = int(0.005 * sample_rate)   # 5ms click-kill fade-in
         FADE_OUT_MS = int(0.020 * sample_rate)   # 20ms fade-out — VITS endings are abrupt
-        MAX_SPEED   = 1.35                        # max atempo speed-up
-        TAIL_FADE   = int(0.250 * sample_rate)   # 250ms fade-out on forced trim
-        GAP_GUARD   = int(0.040 * sample_rate)   # 40ms guard — absorbs VITS inter-seg silence
+        # Slot-locked sync: each segment is ANCHORED to its original start time so
+        # the dubbed voice stays aligned with the on-screen speaker for the whole
+        # video (no cumulative push-forward drift). A segment longer than its slot
+        # is time-compressed (atempo, pitch-preserving) up to MAX_SPEED; if it is
+        # still longer it may run into the FOLLOWING gap only (bounded by the next
+        # segment's start), so it never pushes later segments and never drifts.
+        MAX_SPEED   = 1.6   # allow a little more compression than before (was 1.35)
+                            # so dense segments fit their slot and stay in sync.
 
         # ── Pre-load all segment audio ────────────────────────────────────────
         loaded: list = []
@@ -367,101 +369,99 @@ class VideoProcessor:
                 loaded.append(None)
 
         # ── Allocate output buffer ────────────────────────────────────────────
-        # Buffer = original_duration + 60s tail so even a video where every
-        # segment overruns by 2-3s never exhausts the buffer and silently truncates.
+        # Slot-locked: output length tracks the original video. Keep a small 5s
+        # margin only for a final segment that overflows its last slot (bounded).
         total_samp  = max(int(original_duration * sample_rate), 1)
-        buffer_samp = total_samp + int(60.0 * sample_rate)
+        buffer_samp = total_samp + int(5.0 * sample_rate)
         output_audio = np.zeros(buffer_samp, dtype=np.float32)
 
-        # Track the actual end sample of each placed segment (after stretch/trim)
-        # so the comfort-noise mask is built from real placed audio, not raw TTS.
-        placed_end: list[int] = []   # parallel to segments
+        # Track the actual placed start/end sample of each segment so the
+        # comfort-noise mask, BGM ducking, and subtitle resync are built from
+        # real placed audio positions.
+        placed_start: list[int] = []   # parallel to segments
+        placed_end: list[int] = []     # parallel to segments
 
-        # ── Place each segment ────────────────────────────────────────────────
+        # ── Place each segment (slot-locked) ──────────────────────────────────
+        # Each segment is anchored at its ORIGINAL start timestamp. To decide how
+        # much a long segment may overflow, we need the next segment's original
+        # start, so precompute the anchor starts first.
+        n_seg = len(segments)
+        anchor_start = [int(seg.get("start", 0) * sample_rate) for seg in segments]
+
         for i, (seg, seg_audio) in enumerate(zip(segments, loaded)):
+            start_samp = anchor_start[i]
             if seg_audio is None:
-                placed_end.append(int(seg.get("start", 0) * sample_rate))
+                placed_start.append(start_samp)
+                placed_end.append(start_samp)
                 continue
 
-            start_samp    = int(seg["start"] * sample_rate)
-            orig_end_samp = int(seg.get("end", seg["start"]) * sample_rate)
-            # Original slot duration — minimum space guaranteed for this segment
-            slot_samp     = max(orig_end_samp - start_samp, int(0.1 * sample_rate))
+            orig_start_samp = anchor_start[i]
+            orig_end_samp   = int(seg.get("end", seg.get("start", 0)) * sample_rate)
+            slot_samp       = max(orig_end_samp - orig_start_samp, int(0.1 * sample_rate))
 
-            # Find next segment that has actual speech
-            next_speech_samp = buffer_samp
-            for j in range(i + 1, len(segments)):
-                if loaded[j] is not None and len(loaded[j]) > 0:
-                    next_speech_samp = int(segments[j]["start"] * sample_rate)
-                    break
-            is_last = (next_speech_samp == buffer_samp)
-
-            # Hard limit: next speech start minus GAP_GUARD breathing room.
-            # Never less than the original slot so we never compress a segment
-            # that already fits.
-            # For the last speech segment: give it the full remaining buffer
-            # so the final sentence is NEVER trimmed by a tight hard_limit.
-            if is_last:
-                hard_limit = buffer_samp - start_samp
-            else:
-                gap_available = next_speech_samp - start_samp - GAP_GUARD
-                # Allow overflow into the gap — only compress if TTS would
-                # actually collide with the next speech start.
-                # Use max(gap_available, slot_samp * 2) so a segment that
-                # is 2x its original slot still plays fully if there is room.
-                hard_limit = max(gap_available, slot_samp)
+            # Available room = own slot + the gap until the NEXT segment starts.
+            # Overflowing into the following gap is allowed (it is silence anyway)
+            # but we NEVER move this segment's start or the next segment's start,
+            # so there is zero cumulative drift — the voice stays locked to video.
+            next_start = anchor_start[i + 1] if i + 1 < n_seg else (orig_end_samp + slot_samp)
+            room_samp  = max(slot_samp, next_start - orig_start_samp)
 
             audio_len = len(seg_audio)
-
-            if audio_len <= hard_limit:
-                # Case 1 & 2: fits — place as-is, no modification
-                final_audio = seg_audio
-
-            else:
-                # Case 3: need to compress
-                ratio = audio_len / hard_limit
-                if ratio <= MAX_SPEED:
+            final_audio = seg_audio
+            # Time-compress to fit the available room, capped at MAX_SPEED so it
+            # never sounds chipmunk-fast. Pitch is preserved (atempo).
+            # A per-segment cap > 1.0 (segment editor SPEED_UP strategy with a
+            # user-set max speed) overrides the global cap; <= 1.0 or absent
+            # means "no per-segment preference" and uses the global MAX_SPEED.
+            # This field used to be passed by both stitch paths and silently
+            # ignored here — the UI's per-segment max-speed did nothing.
+            seg_cap = seg.get("max_speed") or 0
+            eff_max = seg_cap if seg_cap > 1.0 else MAX_SPEED
+            if audio_len > room_samp:
+                ratio = min(audio_len / room_samp, eff_max)
+                if ratio > 1.01:
                     stretched = self._atempo_stretch_file(seg_audio, sample_rate, ratio)
-                    final_audio = stretched if len(stretched) > 0 else seg_audio
-                else:
-                    # Speed up to MAX_SPEED first
-                    stretched   = self._atempo_stretch_file(seg_audio, sample_rate, MAX_SPEED)
-                    final_audio = stretched if len(stretched) > 0 else seg_audio
+                    if len(stretched) > 0:
+                        final_audio = stretched
+                        audio_len   = len(stretched)
 
-                # Case 4: still over limit after max speed-up
-                # Extend limit by 300ms before trimming — preserves last word
-                if len(final_audio) > hard_limit:
-                    extended_limit = hard_limit + int(0.300 * sample_rate)
-                    if len(final_audio) <= extended_limit:
-                        # Fits in extended window — allow overflow, no trim
-                        pass
-                    else:
-                        # Must trim — 250ms fade-out so final syllable decays
-                        cut      = extended_limit
-                        fade_len = min(TAIL_FADE, cut // 2)
-                        final_audio = final_audio.copy()
-                        final_audio[cut - fade_len:cut] *= np.linspace(1.0, 0.0, fade_len)
-                        final_audio = final_audio[:cut]
-                        _vp_log.warning(
-                            f"[assemble] seg {i} trimmed: "
-                            f"orig={audio_len/sample_rate:.2f}s "
-                            f"limit={hard_limit/sample_rate:.2f}s "
-                            f"placed={len(final_audio)/sample_rate:.2f}s"
-                        )
+            # 5ms/20ms click-kill fades (no forced word trim).
+            final_audio = final_audio.copy()
 
-            # 5ms click-kill fades
+            # Overlap guard: keep starts locked to the video, so if a segment is
+            # STILL longer than the room even after max compression, prevent it
+            # from bleeding over the next segment's voice. Clip the tail to the
+            # next anchor (rare — only for extremely dense segments) and apply a
+            # fade so the clip is not an abrupt cut. This preserves sync and
+            # avoids two overlapping voices, which is worse than a tiny tail loss.
+            if i + 1 < n_seg:
+                max_len = max(int(0.1 * sample_rate), next_start - start_samp)
+                if len(final_audio) > max_len:
+                    final_audio = final_audio[:max_len]
+
             fi = min(FADE_IN_MS, len(final_audio) // 8)
             if fi > 0:
-                final_audio = final_audio.copy()
                 final_audio[:fi] *= np.linspace(0.0, 1.0, fi)
             fo = min(FADE_OUT_MS, len(final_audio) // 8)
             if fo > 0:
                 final_audio[-fo:] *= np.linspace(1.0, 0.0, fo)
 
-            # Write at exact original timestamp
-            end_samp = min(start_samp + len(final_audio), buffer_samp)
-            output_audio[start_samp:end_samp] += final_audio[:end_samp - start_samp]
+            need = start_samp + len(final_audio)
+            if need > len(output_audio):
+                output_audio = np.concatenate(
+                    [output_audio,
+                     np.zeros(need - len(output_audio) + sample_rate, dtype=np.float32)])
+
+            end_samp = start_samp + len(final_audio)
+            output_audio[start_samp:end_samp] += final_audio
+            placed_start.append(start_samp)
             placed_end.append(end_samp)
+
+            # Write placed timings back so subtitle generation resyncs SRT/VTT to
+            # the actual dubbed audio positions (now == original stamps, so the
+            # subtitle blocks match the video and are no longer 30-60s long).
+            seg["placed_start"] = start_samp / sample_rate
+            seg["placed_end"]   = end_samp / sample_rate
 
         # ── Trim/pad to cover all placed audio, then pad to original_duration ─
         # Never trim below the last placed segment's end so the final word
@@ -470,7 +470,7 @@ class VideoProcessor:
             last_placed = max(placed_end)
             # Use whichever is longer: original duration or last placed audio end
             final_samp = max(int(original_duration * sample_rate), last_placed)
-            final_samp = min(final_samp, buffer_samp)
+            final_samp = min(final_samp, len(output_audio))
         else:
             final_samp = int(original_duration * sample_rate)
         if len(output_audio) < final_samp:
@@ -480,27 +480,32 @@ class VideoProcessor:
             output_audio = output_audio[:final_samp]
 
         # ── Comfort noise in silence gaps ─────────────────────────────────────
-        # Build speech mask from PLACED audio positions (not raw TTS lengths)
-        # so the mask is accurate after stretch/trim.
-        COMFORT_LEVEL = 0.002
-        rng = np.random.default_rng(seed=42)
-        speech_mask = np.zeros(final_samp, dtype=np.float32)
-        for i, (seg, pe) in enumerate(zip(segments, placed_end)):
-            s = int(seg["start"] * sample_rate)
-            e = min(pe, final_samp)
-            if e > s:
-                speech_mask[s:e] = 1.0
-        # 50ms smooth so comfort noise fades in/out at segment edges
-        smooth_len = int(0.050 * sample_rate)
-        from scipy.ndimage import uniform_filter1d
-        speech_mask = uniform_filter1d(speech_mask.astype(np.float64),
-                                       size=smooth_len).astype(np.float32)
-        gap_mask = np.clip(1.0 - speech_mask, 0.0, 1.0)
-        white = rng.standard_normal(final_samp).astype(np.float32)
-        pink  = (white
-                 + np.concatenate([np.zeros(3,  dtype=np.float32), white[:-3]])
-                 + np.concatenate([np.zeros(7,  dtype=np.float32), white[:-7]])) / 3.0
-        output_audio[:final_samp] += pink * gap_mask * COMFORT_LEVEL
+        # Production-ready output uses TRUE digital silence in gaps. Any injected
+        # comfort/pink noise (previously 0.002, then 0.0004) was audible on quiet
+        # playback and headphones as a faint background hiss between every
+        # segment — reported as "noise in the silence". Set to 0.0 so gaps are
+        # clean silence. Keep the masking scaffold behind a guard so re-enabling
+        # a small comfort level later is a one-line change if ever needed.
+        COMFORT_LEVEL = 0.0
+        if COMFORT_LEVEL > 0.0:
+            rng = np.random.default_rng(seed=42)
+            speech_mask = np.zeros(final_samp, dtype=np.float32)
+            for ps, pe in zip(placed_start, placed_end):
+                s = min(ps, final_samp)
+                e = min(pe, final_samp)
+                if e > s:
+                    speech_mask[s:e] = 1.0
+            # 50ms smooth so comfort noise fades in/out at segment edges
+            smooth_len = int(0.050 * sample_rate)
+            from scipy.ndimage import uniform_filter1d
+            speech_mask = uniform_filter1d(speech_mask.astype(np.float64),
+                                           size=smooth_len).astype(np.float32)
+            gap_mask = np.clip(1.0 - speech_mask, 0.0, 1.0)
+            white = rng.standard_normal(final_samp).astype(np.float32)
+            pink  = (white
+                     + np.concatenate([np.zeros(3,  dtype=np.float32), white[:-3]])
+                     + np.concatenate([np.zeros(7,  dtype=np.float32), white[:-7]])) / 3.0
+            output_audio[:final_samp] += pink * gap_mask * COMFORT_LEVEL
 
         # ── BGM mix ───────────────────────────────────────────────────────────
         if bgm_path and Path(bgm_path).exists():
@@ -520,10 +525,10 @@ class VideoProcessor:
                     bgm = bgm[:final_samp]
                 duck_mask = np.full(final_samp, bgm_volume, dtype=np.float32)
                 fade_d    = int(0.05 * sample_rate)
-                for i, (seg, pe) in enumerate(zip(segments, placed_end)):
+                for i, (ps, pe) in enumerate(zip(placed_start, placed_end)):
                     if loaded[i] is None:
                         continue
-                    s = int(seg["start"] * sample_rate)
+                    s = min(ps, final_samp)
                     e = min(pe + int(0.15 * sample_rate), final_samp)
                     duck_mask[s:e] = bgm_volume * 0.4
                     if fade_d > 0 and e > s:
@@ -573,27 +578,16 @@ class VideoProcessor:
         video_dur = self.get_video_duration(video_path)
         audio_dur = self.get_audio_duration(audio_path)
 
-        # If dubbed audio is longer than video, pad the video with a freeze-frame
-        # tail rather than trimming the audio — the last sentence must never be cut.
-        # Only trim audio if it overruns by more than 30s (silence tail artifact).
+        # Dubbed audio may be longer than the video because translated speech
+        # takes longer to say (push-forward assembly). ALWAYS extend the video
+        # with a freeze-frame tail to match — never trim the audio, so the last
+        # sentence is never cut. The assembly step already trims the silence
+        # buffer, so audio_dur reflects real speech content.
         work_audio = audio_path
         work_video = video_path
-        if audio_dur > video_dur + 30.0:
-            # More than 30s overflow = silence tail from buffer padding — safe to trim
-            trimmed_audio = str(Path(output_path).parent / "_trimmed_audio.wav")
-            ret = subprocess.run(
-                [_FFMPEG, "-y", "-i", str(audio_path),
-                 "-t", str(audio_dur - 5.0),  # keep all but last 5s silence tail
-                 "-c:a", "pcm_s16le",
-                 trimmed_audio, "-loglevel", "error"],
-                capture_output=True, timeout=120,
-            ).returncode
-            if ret == 0 and Path(trimmed_audio).exists():
-                work_audio = trimmed_audio
-        elif audio_dur > video_dur + 0.1:
-            # Audio is 0.1–30s longer than video — pad video with freeze-frame tail.
-            # This fixes the 8-language drift (kan +10.6s, kas +9.2s, etc.).
-            # tpad filter: add silence-padded frames at the end to match audio duration.
+        if audio_dur > video_dur + 0.1:
+            # Pad video with freeze-frame tail to match dubbed audio length.
+            # tpad clones the last frame for the overflow duration.
             pad_dur = audio_dur - video_dur
             padded_video = str(Path(output_path).parent / "_padded_video.mp4")
             ret = subprocess.run(

@@ -33,6 +33,7 @@ from .subtitles import generate_subtitles
 from .ocr_sync import verify_voiceover_sync
 from .scorm_guard import assert_non_scorm
 from .content_safety import check_segments, safety_summary
+from . import gpu_monitor as _gpu_monitor
 
 log = get_logger("dubbing_pipeline", "pipeline.log")
 audit_log = get_logger("audit", "audit.log")
@@ -96,16 +97,11 @@ def _worker_dub_langs(args: tuple) -> dict:
             force=force,
             _preloaded_segments=preloaded_segments,
         )
-        # Free VRAM between languages so the next language starts clean
-        try:
-            import torch as _torch
-            if _torch.cuda.is_available():
-                _torch.cuda.synchronize()
-                _torch.cuda.empty_cache()
-        except Exception:
-            pass
-        # Unload TTS engine between languages to free ~4GB VRAM
-        pipeline._tts = None
+        # Free VRAM between languages so the next language starts clean.
+        # NOTE: this used to clear only pipeline._tts — the translator's
+        # internal engine cache (IndicTrans2/SeamlessM4T/NLLB) was never
+        # reset and leaked for the lifetime of this worker process.
+        pipeline.unload_models()
     return results
 
 
@@ -132,6 +128,26 @@ def _get_job_lock(course_id: str, tgt_lang: str) -> threading.Lock:
         if key not in _JOB_LOCKS:
             _JOB_LOCKS[key] = threading.Lock()
         return _JOB_LOCKS[key]
+
+
+# Global per-GPU model lock. The per-(course,lang) lock above does NOT stop two
+# DIFFERENT languages (e.g. hin and pan) from running at the same time, and each
+# loads the full model stack (NLLB + IndicTrans2 + SeamlessM4T + TTS) onto the
+# SAME GPU. Two full stacks exceed VRAM + system RAM → Windows swaps → the whole
+# machine freezes (observed 2026-09-16). This lock serializes the model-heavy
+# dubbing work so only ONE job per GPU loads/runs models at a time; other jobs
+# wait their turn instead of loading a second copy concurrently.
+_GPU_MODEL_LOCKS: dict[str, threading.Lock] = {}
+_GPU_MODEL_LOCKS_LOCK = threading.Lock()
+
+
+def _get_gpu_model_lock() -> threading.Lock:
+    """Return the lock for the GPU this process targets (keyed by device index)."""
+    gpu_key = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("PIPELINE_GPU", "0")
+    with _GPU_MODEL_LOCKS_LOCK:
+        if gpu_key not in _GPU_MODEL_LOCKS:
+            _GPU_MODEL_LOCKS[gpu_key] = threading.Lock()
+        return _GPU_MODEL_LOCKS[gpu_key]
 
 # KB tender Section 3.1 — content exclusion patterns
 # These patterns identify content that must NOT be translated
@@ -351,6 +367,7 @@ class DubbingPipeline:
         if self._asr is None:
             log.info("Loading ASR engine...")
             self._asr = ASREngine()
+            _gpu_monitor.log_load("asr", "faster-whisper large-v3")
         return self._asr
 
     @property
@@ -366,6 +383,72 @@ class DubbingPipeline:
             log.info("Loading TTS engine...")
             self._tts = TTSEngine()
         return self._tts
+
+    # ----------------------------------------------------------
+    # GPU memory management
+    # ----------------------------------------------------------
+    def unload_models(self):
+        """
+        Free GPU memory held by the translator and TTS engines.
+
+        Both are lazily-loaded singletons (see the ``translator``/``tts``
+        properties above) that, once touched, cache every distinct engine
+        they load for as long as this ``DubbingPipeline`` instance lives —
+        ``Translator`` keeps a dict of IndicTrans2 directions plus
+        SeamlessM4T/NLLB, and ``TTSEngine`` keeps Parler/MMS/XTTS. Nothing
+        ever evicted them, so a job spanning many languages accumulated
+        every engine its routing table ever touched, simultaneously, for
+        the rest of the job.
+
+        Call this between languages (or between jobs) to bound VRAM use.
+        ASR is deliberately left loaded — it's a single fixed model reused
+        for the same audio across every language in a job, not something
+        that accumulates variants, so there's nothing to gain by dropping it.
+        """
+        self._translator = None
+        self._tts = None
+        _gpu_monitor.evict_all("translator:")
+        _gpu_monitor.evict_all("tts:")
+        try:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def full_teardown(self):
+        """
+        Release EVERYTHING — translator, TTS, AND the ASR model — and force a
+        full CUDA cache flush. Use this at process end (CLI finish or web-server
+        shutdown), NOT between languages.
+
+        ``unload_models()`` deliberately keeps ASR resident because it's reused
+        across languages within a job. But on final shutdown that resident ASR
+        model (plus any lingering CUDA context) is exactly what keeps GPU memory
+        allocated and the process from exiting cleanly, causing the terminal /
+        port to hang and the machine to freeze. This drops ASR too so the
+        process can terminate and free the GPU.
+        """
+        self.unload_models()
+        try:
+            if self._asr is not None:
+                # faster-whisper holds a CTranslate2 model handle
+                self._asr._fw_model = None
+                self._asr = None
+            _gpu_monitor.evict_all("asr")
+        except Exception:
+            pass
+        try:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
     # ----------------------------------------------------------
     # Input validation
@@ -438,6 +521,12 @@ class DubbingPipeline:
         generate_subs:   bool = True,
         force:           bool = False,
         _preloaded_segments: list | None = None,  # injected by parallel worker — skip ASR
+        shard_tts_gpus:  bool = False,  # split this language's TTS across ALL GPUs —
+                                         # only safe when this is the only language
+                                         # running (see dub_course); a dub_course_parallel
+                                         # worker is already pinned to one GPU for its
+                                         # language bucket and must NOT set this True,
+                                         # or GPUs get oversubscribed N-workers x M-shards.
     ) -> DubbingResult:
 
         t0         = time.time()
@@ -491,6 +580,18 @@ class DubbingPipeline:
             result.error = f"Job already running for {course_id}/{tgt_lang} — skipping duplicate"
             log.warning(f"[{job_id}] {result.error}")
             return result
+
+        # Serialize model-heavy work per GPU: if another language/job is already
+        # loading or running models on this GPU, WAIT for it rather than loading
+        # a second full model stack concurrently (which exhausts VRAM+RAM and
+        # freezes the machine). This makes hin,pan run one-after-another safely.
+        gpu_model_lock = _get_gpu_model_lock()
+        _gpu_waited = not gpu_model_lock.acquire(blocking=False)
+        if _gpu_waited:
+            log.info(f"[{job_id}] Another job holds the GPU — waiting for it to finish "
+                     f"before loading models (prevents concurrent OOM/freeze)")
+            gpu_model_lock.acquire()  # block until the other job releases
+        log.info(f"[{job_id}] Acquired GPU model lock — proceeding")
 
         try:
             # ── Validate ───────────────────────────────────────────
@@ -640,31 +741,62 @@ class DubbingPipeline:
             log.info(f"[{job_id}] Step 4/6: TTS synthesis")
             tts_dir = str(tmp_dir / "tts_segments")
             shutil.rmtree(tts_dir, ignore_errors=True)
-            # Check for spare-GPU sidecar written by dub_course_parallel
-            try:
-                tts_segments = self.tts.synthesize_segments(
+            if shard_tts_gpus:
+                from .tts_shard import synthesize_segments_sharded
+                tts_segments = synthesize_segments_sharded(
                     translated_segments, tgt_lang, tts_dir)
-            except RuntimeError as _tts_err:
-                err_s = str(_tts_err).lower()
-                if "illegal memory" in err_s or "cuda" in err_s:
-                    log.warning(f"[{job_id}] TTS CUDA error — resetting engine and retrying with MMS fallback: {_tts_err}")
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
-                    except Exception:
-                        pass
-                    self._tts = None  # force reload
+            else:
+                try:
                     tts_segments = self.tts.synthesize_segments(
                         translated_segments, tgt_lang, tts_dir)
-                else:
-                    raise
+                except RuntimeError as _tts_err:
+                    err_s = str(_tts_err).lower()
+                    if "illegal memory" in err_s or "cuda" in err_s:
+                        log.warning(f"[{job_id}] TTS CUDA error — resetting engine and retrying with MMS fallback: {_tts_err}")
+                        try:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                                torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        self._tts = None  # force reload
+                        tts_segments = self.tts.synthesize_segments(
+                            translated_segments, tgt_lang, tts_dir)
+                    else:
+                        raise
+
+            # ── TTS silent-failure gate ────────────────────────────
+            # If TTS engines failed on segments and wrote silence (e.g. a CUDA
+            # fault corrupted the GPU mid-run), the output would be partially or
+            # fully silent. Never report such a job as SUCCESS — fail loudly so
+            # it is caught and re-run, instead of shipping a silent deliverable.
+            _silent = [s for s in tts_segments if s.get("tts_silent_failure")]
+            _n_text = sum(1 for s in translated_segments if s.get("text", "").strip())
+            if _silent:
+                _frac = len(_silent) / max(_n_text, 1)
+                log.error(f"[{job_id}] {len(_silent)}/{_n_text} segment(s) had SILENT TTS "
+                          f"failure ({_frac:.0%}). Likely a CUDA fault corrupted the GPU.")
+                # More than 10% silent = unusable deliverable → fail the job.
+                if _frac > 0.10:
+                    raise RuntimeError(
+                        f"TTS silent failure on {len(_silent)}/{_n_text} segments "
+                        f"({_frac:.0%}) — GPU likely faulted. Re-run this language on a "
+                        f"clean GPU/process; not shipping silent output.")
 
             # ── Step 5: Assemble audio ─────────────────────────────
             log.info(f"[{job_id}] Step 5/6: Assembling audio")
             dubbed_wav = str(tmp_dir / "dubbed.wav")
             self.video.assemble_dubbed_audio(
                 tts_segments, result.duration_original, dubbed_wav)
+
+            # Propagate placed timings (from push-forward assembly) back onto
+            # translated_segments so SRT/VTT resync to the actual dubbed audio.
+            _placed = {s.get("id"): (s.get("placed_start"), s.get("placed_end"))
+                       for s in tts_segments if s.get("placed_start") is not None}
+            for _ts in translated_segments:
+                _pt = _placed.get(_ts.get("id"))
+                if _pt and _pt[0] is not None:
+                    _ts["placed_start"], _ts["placed_end"] = _pt
 
             # ── §3.2 Voiceover sync verification ──────────────────
             # Only runs on video inputs (not audio-only); skipped silently
@@ -787,6 +919,11 @@ class DubbingPipeline:
             }, ensure_ascii=False))
         finally:
             job_lock.release()
+            # Release the GPU model lock so a waiting job can now load its models.
+            try:
+                gpu_model_lock.release()
+            except Exception:
+                pass
             # Keep tmp only on failure (for resume); clean on success
             if result.success:
                 shutil.rmtree(str(tmp_dir), ignore_errors=True)
@@ -802,19 +939,41 @@ class DubbingPipeline:
         course_id:       str  = "course",
         force:           bool = False,
         num_gpus:        int  = 1,
+        progress_callback=None,
     ) -> dict[str, DubbingResult]:
-        """Run target languages — parallel across GPUs when num_gpus > 1."""
-        if num_gpus > 1:
+        """Run target languages — parallel across GPUs when num_gpus > 1.
+
+        Single target language is a special case: dub_course_parallel's
+        language-bucket parallelism can't help (there is only one bucket to
+        make), which is exactly why a single-language job used to pin itself
+        to one GPU no matter how many were available. Route it through the
+        sequential loop instead with shard_tts_gpus=True, so its TTS step
+        splits across every available GPU (pipeline/tts_shard.py) rather
+        than leaving the rest idle.
+        """
+        if num_gpus > 1 and len(tgt_langs) > 1:
             return self.dub_course_parallel(
                 video_path, src_lang, tgt_langs, output_dir, course_id,
                 force=force, num_gpus=num_gpus,
+                progress_callback=progress_callback,
             )
+        shard_tts = len(tgt_langs) == 1
         results = {}
         for tgt_lang in tgt_langs:
-            results[tgt_lang] = self.dub_video(
+            result = self.dub_video(
                 video_path, src_lang, tgt_lang, output_dir, course_id,
-                force=force,
+                force=force, shard_tts_gpus=shard_tts,
             )
+            results[tgt_lang] = result
+            # Evict translator/TTS engines between languages — see
+            # unload_models() docstring for why this matters even in the
+            # single-GPU path (previously nothing freed GPU memory here).
+            self.unload_models()
+            if progress_callback:
+                try:
+                    progress_callback({tgt_lang: result})
+                except Exception:
+                    log.warning("dub_course progress_callback raised", exc_info=True)
         return results
 
     def dub_course_parallel(
@@ -826,12 +985,20 @@ class DubbingPipeline:
         course_id:       str  = "course",
         force:           bool = False,
         num_gpus:        int  = 4,
+        progress_callback=None,
     ) -> dict[str, DubbingResult]:
         """
         Distribute target languages across num_gpus GPUs using multiprocessing.
         ASR runs ONCE here in the main process, segments are cached to disk and
         shared to all workers — eliminates 4x redundant transcription.
         Each worker gets its own GPU via PIPELINE_GPU and runs translate+TTS+assemble.
+
+        ``progress_callback(group: dict[str, DubbingResult])`` — if given, is
+        called once per GPU worker as it finishes its bucket of languages
+        (not once per language: each worker processes several languages in
+        sequence before returning). Results stream back via
+        ``imap_unordered`` instead of ``pool.map`` so callers get incremental
+        updates instead of waiting for every GPU to finish.
         """
         import multiprocessing as mp
         ctx = mp.get_context("spawn")
@@ -906,8 +1073,20 @@ class DubbingPipeline:
             if langs:
                 log.info(f"  GPU {gpu_id}: {langs}")
 
+        merged: dict[str, DubbingResult] = {}
         with ctx.Pool(processes=n_workers) as pool:
-            group_results = pool.map(_worker_dub_langs, worker_args)
+            # imap_unordered streams each worker's result back as soon as
+            # that worker's language bucket is done, instead of blocking
+            # until every GPU has finished (pool.map's behaviour) — this is
+            # what lets a caller (e.g. the web UI) show progress instead of
+            # a progress bar frozen at 0% for the whole job.
+            for group in pool.imap_unordered(_worker_dub_langs, worker_args):
+                merged.update(group)
+                if progress_callback:
+                    try:
+                        progress_callback(group)
+                    except Exception:
+                        log.warning("[parallel] progress_callback raised", exc_info=True)
 
         # Clean up shared ASR cache
         try:
@@ -915,9 +1094,6 @@ class DubbingPipeline:
         except Exception:
             pass
 
-        merged: dict[str, DubbingResult] = {}
-        for group in group_results:
-            merged.update(group)
         return merged
 
     # ----------------------------------------------------------

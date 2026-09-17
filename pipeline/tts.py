@@ -4,7 +4,7 @@
 # Fallback1: MMS-TTS — all 22 langs
 # ============================================================
 
-import os, subprocess, json
+import os, subprocess, json, shutil
 os.environ["NUMBA_DISABLE_JIT"] = "1"  # must be set before any numba/librosa import
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -14,6 +14,7 @@ import soundfile as sf
 from pathlib import Path
 from .lang_config import LANG_NAMES
 from .logger import get_logger
+from . import gpu_monitor as _gpu_monitor
 
 log = get_logger(__name__)
 
@@ -36,6 +37,30 @@ try:
     _FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 except Exception:
     _FFMPEG = "ffmpeg"
+
+# ── Liveness heartbeat hook ─────────────────────────────────────────────
+# The GPU-shard worker (pipeline/tts_shard_worker.py) registers a callback
+# here so its parent's watchdog sees a heartbeat after EVERY generation
+# attempt, not just after a whole chunk of segments. Without this the
+# watchdog killed workers that were making perfectly good progress, because
+# one chunk of long segments legitimately takes longer than the stall
+# budget (observed 2026-09-16: all 4 workers killed mid-chunk at exactly
+# 480s, restarted from zero, killed again — every segment ended as silence).
+_HEARTBEAT_CB = None
+
+
+def set_heartbeat_callback(cb) -> None:
+    """Register a zero-arg callable invoked after each TTS generation attempt."""
+    global _HEARTBEAT_CB
+    _HEARTBEAT_CB = cb
+
+
+def _beat() -> None:
+    if _HEARTBEAT_CB is not None:
+        try:
+            _HEARTBEAT_CB()
+        except Exception:
+            pass
 
 MODELS_DIR       = Path(__file__).parent.parent / "models"
 CKPT_DIR         = Path(__file__).parent.parent / "checkpoints"
@@ -228,6 +253,118 @@ def _trim_leading_silence(audio: np.ndarray, sr: int, threshold: float = 0.008) 
     return audio
 
 
+def _phase_vocoder_stretch(audio: np.ndarray, rate: float,
+                           n_fft: int = 2048, hop: int = 512) -> np.ndarray:
+    """Time-stretch by `rate` (>1 = longer) via a phase vocoder using only
+    numpy/scipy. No librosa/numba dependency (librosa 0.11 + numba 0.67 is
+    broken in this env: pitch_shift raises get_call_template)."""
+    from scipy.signal import get_window
+    if abs(rate - 1.0) < 1e-3 or len(audio) < n_fft:
+        return audio.astype(np.float32)
+    win = get_window("hann", n_fft, fftbins=True).astype(np.float32)
+    # Analysis STFT
+    pad = n_fft
+    x = np.concatenate([np.zeros(pad, np.float32), audio.astype(np.float32),
+                        np.zeros(pad, np.float32)])
+    n_frames = 1 + (len(x) - n_fft) // hop
+    stft = np.empty((n_fft // 2 + 1, n_frames), np.complex64)
+    for i in range(n_frames):
+        frame = x[i * hop:i * hop + n_fft] * win
+        stft[:, i] = np.fft.rfft(frame)
+    # Phase-advance synthesis at stretched time steps
+    mag = np.abs(stft)
+    phase = np.angle(stft)
+    omega = 2.0 * np.pi * np.arange(n_fft // 2 + 1) * hop / n_fft
+    t = np.arange(0, n_frames, rate)
+    out = np.zeros((n_fft // 2 + 1, len(t)), np.complex64)
+    acc = phase[:, 0].copy()
+    for k, tf in enumerate(t):
+        i0 = int(np.floor(tf))
+        frac = tf - i0
+        i1 = min(i0 + 1, n_frames - 1)
+        m = (1.0 - frac) * mag[:, i0] + frac * mag[:, i1]
+        out[:, k] = m * np.exp(1j * acc)
+        if i1 != i0:
+            dphi = phase[:, i1] - phase[:, i0] - omega
+            dphi = dphi - 2.0 * np.pi * np.round(dphi / (2.0 * np.pi))
+            acc = acc + omega + dphi
+    # Overlap-add ISTFT
+    out_len = n_fft + hop * (out.shape[1] - 1)
+    y = np.zeros(out_len, np.float32)
+    wsum = np.zeros(out_len, np.float32)
+    for k in range(out.shape[1]):
+        frame = np.fft.irfft(out[:, k]).astype(np.float32) * win
+        y[k * hop:k * hop + n_fft] += frame
+        wsum[k * hop:k * hop + n_fft] += win ** 2
+    nz = wsum > 1e-8
+    y[nz] /= wsum[nz]
+    return y[pad:pad + int(round(len(audio) / rate))].astype(np.float32)
+
+
+def _median_f0(audio: np.ndarray, sr: int, fmin: float = 70.0, fmax: float = 350.0):
+    """Estimate median voiced F0 (Hz) via autocorrelation. Returns None if unvoiced.
+    Used to normalize each Parler segment to a single pitch register so the
+    narrator's pitch does not jump between segments (do_sample introduces
+    per-segment pitch variation even with a pinned voice)."""
+    frame = int(0.04 * sr)
+    hop   = int(0.02 * sr)
+    if frame <= 0 or len(audio) < frame:
+        return None
+    lo, hi = int(sr / fmax), int(sr / fmin)
+    f0s = []
+    for i in range(0, len(audio) - frame, hop):
+        seg = audio[i:i + frame].astype(np.float64)
+        if np.sqrt(np.mean(seg ** 2)) < 0.02:
+            continue
+        seg = seg - seg.mean()
+        ac = np.correlate(seg, seg, "full")[len(seg) - 1:]
+        if ac[0] <= 0:
+            continue
+        region = ac[lo:hi]
+        if len(region) == 0:
+            continue
+        lag = lo + int(np.argmax(region))
+        if lag <= 0 or ac[lag] / ac[0] < 0.3:
+            continue
+        f0s.append(sr / lag)
+    return float(np.median(f0s)) if f0s else None
+
+
+# Target pitch register (Hz) for the fixed male narrator voice per script family.
+# Every Parler segment is shifted toward this so the pitch stays constant across
+# the whole video instead of jumping segment-to-segment.
+_F0_TARGET = {
+    "hin": 150.0, "mar": 150.0, "nep": 150.0, "mai": 150.0, "san": 150.0,
+}
+
+
+def _normalize_pitch(audio: np.ndarray, sr: int, target_hz: float,
+                     max_semitones: float = 4.0) -> np.ndarray:
+    """Shift `audio` so its median F0 matches `target_hz` (bounded shift).
+    Pure numpy/scipy/soxr — no librosa. Pitch shift = time-stretch by `ratio`
+    (phase vocoder) then resample by `1/ratio` so duration is preserved.
+    Bounded to +/- max_semitones so a mis-estimated F0 can never produce a
+    chipmunk/robot artifact — worst case is a small, safe correction."""
+    f0 = _median_f0(audio, sr)
+    if not f0 or f0 <= 0:
+        return audio
+    import math
+    n_steps = 12.0 * math.log2(target_hz / f0)
+    if abs(n_steps) < 0.3:  # already close — skip to avoid needless processing
+        return audio
+    n_steps = max(-max_semitones, min(max_semitones, n_steps))
+    ratio = 2.0 ** (n_steps / 12.0)  # target pitch multiplier
+    try:
+        import soxr
+        stretched = _phase_vocoder_stretch(audio, ratio)  # longer if ratio>1
+        # Resample back by 1/ratio → pitch scaled by ratio, duration ~unchanged
+        shifted = soxr.resample(stretched, int(round(sr * ratio)), sr).astype(np.float32)
+        return shifted
+    except Exception as _pn_err:
+        log.warning(f"pitch normalize failed ({_pn_err}) — keeping original pitch")
+        return audio
+
+
 def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False,
                   female_shift: bool = False, lang: str = "") -> np.ndarray:
     from scipy.signal import butter, sosfilt
@@ -241,10 +378,19 @@ def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False,
     # to remove Parler's high-frequency hiss without muffling consonants.
     _DEVA_PARLER_LANGS = {"hin", "mar", "nep", "mai", "san"}
     if not is_mms and lang in _DEVA_PARLER_LANGS:
-        sos_hiss = butter(2, 8000.0 / (sr / 2), btype="low", output="sos")
+        # Gentle de-hiss only. Previously this blended 70% of an 8kHz low-passed
+        # signal, which muffled consonants and made the voice sound unclear.
+        # Blend 35% filtered + 65% original so sibilants/plosives stay crisp
+        # (clear voice) while still shaving Parler's high-frequency hiss.
+        sos_hiss = butter(2, 9000.0 / (sr / 2), btype="low", output="sos")
         audio_hf  = sosfilt(sos_hiss, audio).astype(np.float32)
-        # Blend: 70% filtered + 30% original — keeps consonant crispness and naturalness
-        audio = (0.70 * audio_hf + 0.30 * audio).astype(np.float32)
+        audio = (0.35 * audio_hf + 0.65 * audio).astype(np.float32)
+        # NOTE: the fixed-150Hz F0 pitch-lock (_normalize_pitch) was REMOVED here.
+        # Its per-segment autocorrelation F0 estimate is unreliable, so adjacent
+        # segments were shifted by different amounts — producing the audible
+        # low-to-high pitch wobble instead of the intended constant register.
+        # Parler with a pinned voice + shared encoder output is already
+        # register-consistent, so no post-hoc pitch shifting is applied.
     if is_mms:
         # Low-pass at 7000Hz: removes VITS high-freq buzz above 7kHz,
         # preserves retroflex consonant energy (peaks at 5-6kHz for Tamil/Dravidian).
@@ -263,8 +409,10 @@ def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False,
             audio = audio[:keep]
     if female_shift:
         try:
-            import librosa
-            audio = librosa.effects.pitch_shift(audio.astype(np.float32), sr=sr, n_steps=5, res_type='soxr_hq')
+            import soxr
+            ratio = 2.0 ** (5.0 / 12.0)  # +5 semitones
+            stretched = _phase_vocoder_stretch(audio, ratio)
+            audio = soxr.resample(stretched, int(round(sr * ratio)), sr).astype(np.float32)
         except Exception as _ps_err:
             log.warning(f"pitch_shift failed ({_ps_err}) — keeping original pitch")
     # Normalize to -3 dBFS — broadcast/streaming standard.
@@ -278,12 +426,26 @@ def _post_process(audio: np.ndarray, sr: int = SR, is_mms: bool = False,
 
 class TTSEngine:
     _PARLER_MIN_DUR = 0.4  # seconds — below this is likely a noise burst, not speech
+    # Languages that must ALWAYS render with Parler and never fall back to MMS.
+    # For these, a Parler-failed segment is retried harder (sentence-split →
+    # half-split → slow single attempt) rather than handed to MMS-VITS, so the
+    # voice stays the Parler voice throughout. If Parler still cannot produce
+    # audio after all retries, silence is written for that one segment (rare,
+    # and preferred over a different-sounding MMS voice for these langs).
+    _PARLER_ONLY_LANGS = {"hin"}
+    # Word count above which a segment is sentence-split BEFORE the first Parler
+    # attempt. Must stay below the point where _calc_max_tokens would hit its cap
+    # (~26 words for Devanagari), so a long segment is broken into short sentences
+    # that each decode fast (~30-45s) instead of one long decode that times out.
+    # Was 45, then 30; 22 guarantees every generated piece is well under the cap.
+    _PARLER_LONG_SPLIT_WORDS = 22
 
     def __init__(self):
         self._parler_model     = None
         self._parler_tokenizer = None
         self._parler_desc_tok  = None
         self._parler_label     = None
+        self._xtts_engine      = None   # lazy XTTS-v2 wrapper (natural Hindi)
         self._mms_model        = None
         self._mms_processor    = None
         self._mms_current_lang = None
@@ -303,6 +465,12 @@ class TTSEngine:
         _standalone_only.add("hin")
         self._mms_adapter_failed: set = set(_standalone_only)
         self._vits_rng_pinned: bool = False    # True while a segment batch is running
+        # Set when a Parler generate() failed to return even past its max_time
+        # deadline + wedge grace — that thread is stuck in a driver call and
+        # this PROCESS is compromised (the stuck thread holds GPU work that
+        # only process death can reclaim). The shard worker checks this after
+        # each chunk and exits so its parent respawns a fresh process.
+        self.wedged: bool = False
         
         # Voice consistency for single-segment synthesis (used by web UI)
         self._voice_pinned: bool = False
@@ -462,6 +630,7 @@ class TTSEngine:
             self._standalone_vits[lang] = {"model": model, "tokenizer": tokenizer,
                                            "seed": 42}
             log.info(f"Standalone VITS [{lang}] loaded (noise_scale={_ns} natural prosody)")
+            _gpu_monitor.log_load(f"tts:standalone_vits:{lang}", f"Standalone VITS ({lang})")
             # Warn when using a proxy model for a language with no dedicated TTS
             _VITS_PROXY = {
                 "snd": ("urd", "Urdu", "Nastaliq Arabic script — closest available proxy; no facebook/mms-tts-snd exists"),
@@ -571,13 +740,27 @@ class TTSEngine:
             chunks.append(current)
         return [c for c in chunks if c.strip()] or [text]
 
-    def _synthesize_standalone_vits(self, text: str, lang: str, output_path: str) -> bool:
+    def _synthesize_standalone_vits(self, text: str, lang: str, output_path: str,
+                                    force_cpu: bool = False) -> bool:
         if not self._load_standalone_vits(lang):
             return False
         try:
             engine    = self._standalone_vits[lang]
             tokenizer = engine["tokenizer"]
             model     = engine["model"]
+            # force_cpu: used by the fallback path after a Parler CUDA timeout,
+            # which can leave the GPU context corrupted so that ANY subsequent
+            # CUDA call faults. Running VITS on CPU is slower but cannot be
+            # corrupted, so it reliably produces audio instead of silence.
+            if force_cpu and not engine.get("on_cpu"):
+                try:
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                model = model.to("cpu")
+                engine["model"] = model
+                engine["on_cpu"] = True
+                log.warning(f"Standalone VITS [{lang}] forced to CPU for fallback synthesis")
             native    = model.config.sampling_rate
             chunks    = self._vits_chunks(text, tokenizer, lang=lang)
             wavs      = []
@@ -592,10 +775,35 @@ class TTSEngine:
                 if not chunk.strip():
                     continue
                 inputs = tokenizer(chunk, return_tensors="pt")
-                inputs = {k: v.long().to(DEVICE) if k == "input_ids" else v.to(DEVICE)
-                          for k, v in inputs.items()}
-                with torch.no_grad():
-                    out = model(**inputs)
+                dev = "cpu" if engine.get("on_cpu") else DEVICE
+                inputs_dev = {k: v.long().to(dev) if k == "input_ids" else v.to(dev)
+                              for k, v in inputs.items()}
+                try:
+                    with torch.no_grad():
+                        out = model(**inputs_dev)
+                except Exception as _cuda_err:
+                    # A CUDA fault (e.g. "illegal memory access") — or ANY error
+                    # while on GPU — can mean the GPU context is corrupted (common
+                    # after an abandoned Parler timeout thread). Rather than write
+                    # silence, move this VITS model to CPU and retry. CPU VITS is
+                    # slower but produces correct audio, so no segment is lost.
+                    if not engine.get("on_cpu"):
+                        log.warning(f"Standalone VITS [{lang}] GPU fault on chunk {ci} "
+                                    f"({_cuda_err}) — moving model to CPU and retrying")
+                        try:
+                            torch.cuda.synchronize()
+                        except Exception:
+                            pass
+                        model = model.to("cpu")
+                        engine["model"] = model            # keep on CPU for rest of run
+                        engine["on_cpu"] = True
+                        inputs_dev = {k: v.long().to("cpu") if k == "input_ids" else v.to("cpu")
+                                      for k, v in inputs.items()}
+                        with torch.no_grad():
+                            out = model(**inputs_dev)
+                    else:
+                        raise
+                _beat()
                 if out.waveform is None:
                     log.warning(f"Standalone VITS [{lang}] waveform=None for chunk {ci} — skipping")
                     continue
@@ -661,11 +869,24 @@ class TTSEngine:
         for model_dir, label in candidates:
             try:
                 log.info(f"Loading Parler-TTS [{label}] from {model_dir.name}")
-                self._parler_model = ParlerTTSForConditionalGeneration.from_pretrained(
-                    str(model_dir),
-                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                    attn_implementation="eager",
-                ).to(DEVICE).eval()
+                # Prefer SDPA attention — a faster, numerically-equivalent kernel
+                # than "eager" (same output, less time, no quality/token change).
+                # Fall back to eager if this build/model doesn't support SDPA.
+                _dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                try:
+                    self._parler_model = ParlerTTSForConditionalGeneration.from_pretrained(
+                        str(model_dir),
+                        torch_dtype=_dtype,
+                        attn_implementation="sdpa",
+                    ).to(DEVICE).eval()
+                    log.info(f"Parler-TTS [{label}] using SDPA attention (faster)")
+                except Exception as _sdpa_err:
+                    log.warning(f"Parler-TTS [{label}] SDPA unavailable ({_sdpa_err}) — using eager")
+                    self._parler_model = ParlerTTSForConditionalGeneration.from_pretrained(
+                        str(model_dir),
+                        torch_dtype=_dtype,
+                        attn_implementation="eager",
+                    ).to(DEVICE).eval()
 
                 self._parler_tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
                 # Description tokenizer MUST be flan-t5-large (text encoder), not the model's LLaMA tokenizer
@@ -680,6 +901,7 @@ class TTSEngine:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 log.info(f"Parler-TTS [{label}] loaded successfully")
+                _gpu_monitor.log_load("tts:parler", f"Parler-TTS ({label})")
                 return True
             except Exception as e:
                 log.warning(f"Parler-TTS [{label}] load failed: {e} — trying next")
@@ -714,21 +936,31 @@ class TTSEngine:
         return BaseModelOutput(last_hidden_state=hidden)
 
     def _parler_generate(self, desc_ids, prompt_ids, max_tok: int, lang: str = "hin",
-                         encoder_outputs=None):
+                         encoder_outputs=None, max_time: float | None = None):
         """Fixed voice — seed is set ONCE before the primer warmup and never reset here.
-        Resetting seed per-segment causes different noise draws → voice drift across video.
-        do_sample=True with temperature=0.6 + fixed seed = consistent Indian accent.
+
+        GREEDY decoding (do_sample=False): deterministic output. Parler's random
+        sampling (do_sample=True) occasionally produced a loud, high-pitched,
+        distorted "screaming" sample on some segments — the artifact the user
+        reported. Greedy decoding removes that entirely at the cost of a flatter,
+        more neutral delivery, which is the desired tradeoff here. temperature is
+        omitted (irrelevant when not sampling).
+
+        max_time: hard wall-clock deadline enforced INSIDE the generation loop
+        via transformers' MaxTimeCriteria (generation_config.max_time →
+        _get_stopping_criteria). Generation that hits the deadline returns
+        cleanly instead of being abandoned in a thread.
         """
-        temperature = 0.6  # 0.6 = best balance of naturalness vs consistency for Hindi Devanagari
         kwargs = dict(
             prompt_input_ids=prompt_ids.input_ids,
             prompt_attention_mask=prompt_ids.attention_mask,
             attention_mask=desc_ids.attention_mask,
-            do_sample=True,
-            temperature=temperature,
+            do_sample=False,          # greedy — no random pitch/energy spikes
             repetition_penalty=1.3,
             max_new_tokens=max_tok,
         )
+        if max_time is not None:
+            kwargs["max_time"] = max_time
         if encoder_outputs is not None:
             kwargs["encoder_outputs"] = encoder_outputs
         else:
@@ -743,9 +975,13 @@ class TTSEngine:
         "hin": 0.005, "mar": 0.005, "nep": 0.005, "mai": 0.005, "san": 0.005,
     }
 
-    # Batch size for Parler — 4 segments per forward pass.
-    # Segments sorted by token length before batching so padding waste is minimal.
-    _PARLER_BATCH_SIZE = 4
+    # Batch size for Parler — segments decoded in parallel per forward pass.
+    # Raised 4 → 8: more parallelism = higher GPU throughput = faster output,
+    # with NO change to tokens-per-segment or audio quality. The existing OOM
+    # guard halves the batch and retries if VRAM is tight, so 8 is safe; it only
+    # helps on GPUs with headroom. Segments are length-sorted before batching so
+    # padding waste stays low even at the larger size.
+    _PARLER_BATCH_SIZE = 8
 
     def _parler_generate_batch(self, texts: list[str], lang: str,
                                output_paths: list[str], desc_ids,
@@ -765,15 +1001,13 @@ class TTSEngine:
             max_tok = max(self._calc_max_tokens(t) for t in texts)
             # No seed reset here — seed is pinned once before primer warmup.
             # Resetting per-batch causes voice drift between segments.
-            temperature = 0.6  # 0.6 = best balance of naturalness vs consistency for Hindi Devanagari
             from transformers.modeling_outputs import BaseModelOutput
             attn_b = desc_ids.attention_mask.expand(n, -1).contiguous()
             kwargs = dict(
                 prompt_input_ids=enc.input_ids,
                 prompt_attention_mask=enc.attention_mask,
                 attention_mask=attn_b,
-                do_sample=True,
-                temperature=temperature,
+                do_sample=False,          # greedy — no random pitch/energy spikes
                 repetition_penalty=1.3,
                 max_new_tokens=max_tok,
             )
@@ -791,27 +1025,54 @@ class TTSEngine:
             batch_timeout = ((self._PARLER_TIMEOUT_TEL if (len(sample_text) > 0 and sum(1 for c in sample_text if '\u0C00'<=c<='\u0C7F')/max(len(sample_text),1)>0.4)
                              else self._PARLER_TIMEOUT_DEVA if (len(sample_text) > 0 and deva_count / max(len(sample_text),1) > 0.4)
                              else self._PARLER_TIMEOUT_S))
-            # Batch timeout: base + 60s per extra item (not multiplicative — batching
-            # is faster than n sequential singles due to parallel decoding).
-            effective_timeout = batch_timeout + 60 * max(0, n - 1)
-            # Always create a fresh executor — never reuse one whose thread may
-            # still be running a timed-out generation (causes CUDA state corruption).
+            # Batch deadline: base + 60s per extra item (not multiplicative — batching
+            # is faster than n sequential singles due to parallel decoding), plus
+            # headroom that scales with the token budget. Observed healthy decode
+            # rate is ~28 audio-tokens/s wall time (e.g. 1677 tokens in ~60s), so
+            # scale from 900 tokens up — the old formula only added time above
+            # 1800 tokens and was then nullified by a 75s ceiling, leaving real
+            # 60s generations only ~20% headroom. That tightness is what caused
+            # the constant timeouts under multi-GPU load.
+            token_headroom = max(0, max_tok - 900) // 86 * 6
+            effective_timeout = batch_timeout + 60 * max(0, n - 1) + token_headroom
+            effective_timeout = min(effective_timeout, self._PARLER_TIMEOUT_CEILING)
+            kwargs["max_time"] = effective_timeout  # clean in-loop deadline (MaxTimeCriteria)
+            import time as _time
+            _t0 = _time.time()
+            # The executor is now only a BACKSTOP for a truly wedged driver
+            # call (max_time stops a healthy-but-slow generation from inside
+            # the loop, so it always returns shortly after the deadline).
             _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             _fut = _ex.submit(_run)
             try:
-                gen = _fut.result(timeout=effective_timeout)
+                gen = _fut.result(timeout=effective_timeout + self._PARLER_WEDGE_GRACE)
             except concurrent.futures.TimeoutError:
-                log.error(f"Parler batch TIMEOUT [{lang}] {n} segs")
+                log.error(f"Parler batch WEDGED [{lang}] {n} segs — generate() did not "
+                          f"return {self._PARLER_WEDGE_GRACE}s past its {effective_timeout}s "
+                          f"max_time deadline (driver-level stall, not a slow decode)")
+                self.wedged = True
+                # Do NOT call torch.cuda.synchronize() here. The abandoned
+                # thread's generate() call is still running on the default
+                # CUDA stream — synchronize() blocks until ALL queued work
+                # on that stream finishes, which means it would sit and
+                # wait for the very generation we just timed out on to
+                # actually finish before this function could return.
+                # _ex.shutdown(wait=False) detaches without waiting.
                 _ex.shutdown(wait=False)
-                if torch.cuda.is_available():
-                    try:
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                _beat()
                 return results
             finally:
                 _ex.shutdown(wait=False)
+            _elapsed = _time.time() - _t0
+            _beat()
+            if _elapsed >= effective_timeout - 0.5:
+                # Generation hit the max_time deadline — output is truncated
+                # mid-speech. Treat as failure (fall back per segment), but
+                # crucially there is NO abandoned GPU thread left behind.
+                log.error(f"Parler batch TIMEOUT [{lang}] {n} segs — hit {effective_timeout}s "
+                          f"max_time deadline (stopped cleanly, no zombie thread)")
+                return results
+            log.info(f"Parler batch [{lang}] {n} segs gen in {_elapsed:.1f}s (max_tok={max_tok}, timeout={effective_timeout}s)")
             try:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -858,28 +1119,44 @@ class TTSEngine:
             timeout = (self._PARLER_TIMEOUT_TEL if (len(text) > 0 and sum(1 for c in text if '\u0C00'<=c<='\u0C7F')/max(len(text),1)>0.4)
                        else self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
                        else self._PARLER_TIMEOUT_S)
+            # Scale with token budget (observed ~28 audio-tokens/s wall time),
+            # bounded by the ceiling. See _parler_generate_batch for why the
+            # old (max_tok-1800)-based formula was effectively zero headroom.
+            timeout += max(0, max_tok - 900) // 86 * 6
+            timeout = min(timeout, self._PARLER_TIMEOUT_CEILING)
             def _gen_no_grad():
                 with torch.no_grad():
                     return self._parler_generate(desc_ids, prompt_ids, max_tok,
-                                                 lang=lang, encoder_outputs=encoder_outputs)
+                                                 lang=lang, encoder_outputs=encoder_outputs,
+                                                 max_time=timeout)
             import concurrent.futures
-            # Fresh executor every call — a timed-out thread must not be reused.
+            import time as _time
+            _t0 = _time.time()
+            # Backstop only — max_time stops a slow generation from inside the
+            # loop; the thread timeout fires only on a true driver wedge.
             _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             _fut = _ex.submit(_gen_no_grad)
             try:
-                gen = _fut.result(timeout=timeout)
+                gen = _fut.result(timeout=timeout + self._PARLER_WEDGE_GRACE)
             except concurrent.futures.TimeoutError:
-                log.error(f"Parler single TIMEOUT [{lang}] after {timeout}s STUCK FOR LONG TIME")
+                log.error(f"Parler single WEDGED [{lang}] — generate() did not return "
+                          f"{self._PARLER_WEDGE_GRACE}s past its {timeout}s max_time "
+                          f"deadline — abandoning, falling back")
+                self.wedged = True
+                # See the identical comment in _parler_generate_batch: no
+                # torch.cuda.synchronize() here — it would block on the
+                # abandoned thread's still-running generation instead of
+                # actually bailing out.
                 _ex.shutdown(wait=False)
-                if torch.cuda.is_available():
-                    try:
-                        torch.cuda.synchronize()
-                        torch.cuda.empty_cache()
-                    except Exception:
-                        pass
+                _beat()
                 return False
             finally:
                 _ex.shutdown(wait=False)
+            _beat()
+            if _time.time() - _t0 >= timeout - 0.5:
+                log.error(f"Parler single TIMEOUT [{lang}] — hit {timeout}s max_time "
+                          f"deadline (stopped cleanly, no zombie thread) — falling back")
+                return False
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             wav = gen.detach().cpu().float().numpy().squeeze()
@@ -895,6 +1172,70 @@ class TTSEngine:
         except Exception as e:
             log.error(f"Parler single [{lang}] failed: {e}")
             return False
+
+    def _synthesize_long_segment(self, text: str, lang: str, output_path: str,
+                                 desc_ids, encoder_outputs=None) -> bool:
+        """Render a long segment by splitting into sentences and concatenating.
+
+        Parler truncates very long dense inputs (drops the end of the sentence).
+        Splitting on sentence terminators (। / . / ? / !) keeps each piece within
+        Parler's reliable range so the FULL segment is dubbed — no missing words.
+        Any sentence that is itself longer than the safe word limit is further
+        broken into word groups so NO part ever hits the token cap / decode
+        timeout. A short breath of silence is inserted between parts.
+        """
+        import re as _re
+        raw_parts = [p.strip() for p in _re.split(r"(?<=[।.?!])\s+", text) if p.strip()]
+        # Sub-split any part still longer than the safe word limit (run-on
+        # sentences with no internal punctuation) into word groups.
+        _limit = self._PARLER_LONG_SPLIT_WORDS
+        parts: list[str] = []
+        for p in raw_parts:
+            w = p.split()
+            if len(w) <= _limit:
+                parts.append(p)
+            else:
+                for j in range(0, len(w), _limit):
+                    parts.append(" ".join(w[j:j + _limit]))
+        parts = [p for p in parts if p.strip()]
+        if len(parts) <= 1:
+            # Not splittable — fall back to single generation.
+            return self._parler_generate_single(text, lang, output_path,
+                                                 desc_ids, encoder_outputs=encoder_outputs)
+        sr = self._parler_model.config.sampling_rate
+        gap = np.zeros(int(0.12 * sr), dtype=np.float32)  # 120ms breath
+        tmp_dir = Path(output_path).parent / "_long_parts"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        part_paths = [str(tmp_dir / f"{Path(output_path).stem}_p{pi}.wav")
+                      for pi in range(len(parts))]
+        # Render all sentence parts in one batched forward pass (parallel decode)
+        # instead of serial single calls — same fixed voice (shared encoder_outputs),
+        # but far faster on long segments, which is the main long-video slowdown.
+        batch_ok = self._parler_generate_batch(
+            parts, lang, part_paths, desc_ids, encoder_outputs=encoder_outputs)
+        # Retry any failed part once as a single call so no sentence is dropped.
+        for pi, ok in enumerate(batch_ok):
+            if not ok:
+                batch_ok[pi] = self._parler_generate_single(
+                    parts[pi], lang, part_paths[pi], desc_ids,
+                    encoder_outputs=encoder_outputs)
+        if not all(batch_ok) or not all(os.path.exists(p) for p in part_paths):
+            log.warning(f"Long-segment [{lang}] had failed part(s) — aborting split, will fall back")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return False
+        wavs = []
+        for pi, part_path in enumerate(part_paths):
+            w, _ = sf.read(part_path)
+            if w.ndim > 1:
+                w = w[:, 0]
+            wavs.append(w.astype(np.float32))
+            if pi < len(parts) - 1:
+                wavs.append(gap)
+        combined = np.concatenate(wavs)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, combined, sr, subtype="PCM_16")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return True
 
     # Indic Unicode block ranges — each codepoint is one visible akshar
     # Using grapheme clusters: count \X matches (one per visible character)
@@ -929,22 +1270,58 @@ class TTSEngine:
             words = max(len(text.split()), 1)
             rate  = 2.5 if is_telugu else 3.0
             tokens = int((words / rate) * 86 * 1.5)
-            cap = 1800  # ~21s max — long Hindi segments need headroom
+            # Cap 1100 (~13s audio). Parler decodes autoregressively, so wall-clock
+            # time scales with max_new_tokens: ~2400 tokens took 100s+ and hit the
+            # 120s deadline (→ MMS fallback). ~1100 tokens finishes in ~30-45s, far
+            # under the deadline. Segments that would need MORE than this are
+            # sentence-split BEFORE generation (see _PARLER_LONG_SPLIT_WORDS), so
+            # capping here never truncates a segment — it only bounds decode time.
+            cap = 1100
         else:
             graphemes = self._count_graphemes(text)
             tokens = int(graphemes * 43 * 1.6)
-            cap = 1800
+            cap = 1100
         return min(max(tokens, 250), cap)
 
     # Per-segment generation timeout.
-    # cap=2000 tokens → worst-case ~23s audio → at ~150 tok/s = 13s → 120s is safe.
-    # All scripts use 120s — Devanagari long segments were timing out at 60s.
-    _PARLER_TIMEOUT_S    = 120  # all scripts — unified timeout
-    _PARLER_TIMEOUT_DEVA = 120
-    _PARLER_TIMEOUT_TEL  = 120
+    # On an A6000 a healthy Parler batch finishes in ~20-45s. A generation that
+    # runs much longer is stuck (autoregressive loop) — bail fast to the VITS
+    # fallback (also natural, and much faster) instead of wasting minutes and
+    # risking a stuck GPU thread corrupting CUDA state.
+    _PARLER_TIMEOUT_S    = 60   # all scripts — unified base timeout
+    _PARLER_TIMEOUT_DEVA = 60
+    _PARLER_TIMEOUT_TEL  = 60
+    # Hard ceiling on any single generation's deadline. Enforced INSIDE the
+    # generation loop via max_time (MaxTimeCriteria), so overruns stop cleanly
+    # instead of leaving an abandoned GPU thread. Observed healthy decode is
+    # ~28 audio-tokens/s wall time → a 2400-token generation legitimately
+    # needs ~85s; the old 75s ceiling guaranteed timeouts on long segments.
+    _PARLER_TIMEOUT_CEILING = 120
+    # Extra time the backstop thread-join waits PAST the max_time deadline.
+    # If generate() still hasn't returned by then, the process is wedged in a
+    # driver call (not merely slow) — only then abandon the thread.
+    _PARLER_WEDGE_GRACE = 30
     # After a timeout the GPU thread may still be running — track the executor
     # so we can abandon it and create a fresh one for the next segment.
     _parler_executor     = None
+
+    # ----------------------------------------------------------
+    # XTTS-v2 (natural Hindi) — primary for XTTS_LANGS when available
+    # ----------------------------------------------------------
+    def _try_xtts(self, text: str, lang: str, output_path: str) -> bool:
+        """Synthesize with XTTS-v2 if it's available and routed for this lang.
+        Returns True on success. Any unavailability/failure returns False so the
+        caller falls back to (greedy) Parler — nothing breaks if Coqui/XTTS is
+        not installed."""
+        try:
+            from . import xtts_engine as _xe
+        except Exception:
+            return False
+        if lang not in _xe.XTTS_LANGS or not _xe.xtts_available():
+            return False
+        if self._xtts_engine is None:
+            self._xtts_engine = _xe.XTTSEngine(device=DEVICE)
+        return self._xtts_engine.synthesize(text, lang, output_path)
 
     def _synthesize_parler(self, text: str, lang: str, output_path: str) -> bool:
         if lang in _PARLER_SKIP_LANGS:
@@ -972,36 +1349,60 @@ class TTSEngine:
                     desc_ids   = type(desc_ids)({k: v.to(dtype=model_dtype) if v.is_floating_point() else v
                                                  for k, v in desc_ids.items()})
                     enc_out    = self._parler_encode_description(desc_ids)
-                
+
+                # Long segments (>45 words) are the ones most likely to hit
+                # Parler's "doesn't find a stop point" failure mode \u2014 the
+                # batch path (synthesize_segments) already avoids this by
+                # sentence-splitting such segments before ever attempting
+                # one continuous generation. This is that same safety net,
+                # applied here too, so a manual single-segment regenerate
+                # (e.g. from the review panel after a batch run) gets it.
+                if len(text.split()) > self._PARLER_LONG_SPLIT_WORDS:
+                    return self._synthesize_long_segment(
+                        text, lang, output_path, desc_ids, encoder_outputs=enc_out)
+
                 prompt_ids = self._parler_tokenizer(text, return_tensors="pt").to(DEVICE)
                 max_tok    = self._calc_max_tokens(text)
                 deva_count = sum(1 for c in text if '\u0900' <= c <= '\u097F')
                 _timeout = (self._PARLER_TIMEOUT_TEL if (len(text) > 0 and sum(1 for c in text if '\u0C00'<=c<='\u0C7F')/max(len(text),1)>0.4)
                             else self._PARLER_TIMEOUT_DEVA if (len(text) > 0 and deva_count / max(len(text),1) > 0.4)
                             else self._PARLER_TIMEOUT_S)
+                # Same token-scaled deadline as the batch/single paths — this
+                # path previously had NO token scaling at all, so any segment
+                # needing >60s of decode was guaranteed to time out here.
+                _timeout += max(0, max_tok - 900) // 86 * 6
+                _timeout = min(_timeout, self._PARLER_TIMEOUT_CEILING)
                 def _gen_no_grad_synth():
                     with torch.no_grad():
                         return self._parler_generate(desc_ids, prompt_ids, max_tok,
-                                                     lang=lang, encoder_outputs=enc_out)
+                                                     lang=lang, encoder_outputs=enc_out,
+                                                     max_time=_timeout)
                 import concurrent.futures
-                # Fresh executor — never reuse a thread that may still be running
-                # a timed-out generation (causes CUDA state corruption on next call).
+                import time as _time_mod
+                _t0 = _time_mod.time()
+                # Backstop only — max_time stops slow generations inside the loop.
                 _ex = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                 _fut = _ex.submit(_gen_no_grad_synth)
                 try:
-                    gen = _fut.result(timeout=_timeout)
+                    gen = _fut.result(timeout=_timeout + self._PARLER_WEDGE_GRACE)
                 except concurrent.futures.TimeoutError:
-                    log.error(f"Parler TIMEOUT [{lang}] after {_timeout}s — MMS fallback")
+                    log.error(f"Parler WEDGED [{lang}] — generate() did not return "
+                              f"{self._PARLER_WEDGE_GRACE}s past its {_timeout}s "
+                              f"max_time deadline — MMS fallback")
+                    self.wedged = True
+                    # See _parler_generate_batch — no torch.cuda.synchronize()
+                    # here; it would block on the abandoned thread's still-
+                    # running generation, not skip past it.
                     _ex.shutdown(wait=False)
-                    if torch.cuda.is_available():
-                        try:
-                            torch.cuda.synchronize()
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
+                    _beat()
                     return False
                 finally:
                     _ex.shutdown(wait=False)
+                _beat()
+                if _time_mod.time() - _t0 >= _timeout - 0.5:
+                    log.error(f"Parler TIMEOUT [{lang}] — hit {_timeout}s max_time deadline "
+                              f"(stopped cleanly, no zombie thread) — MMS fallback")
+                    return False
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 wav = gen.detach().cpu().numpy().squeeze().astype(np.float32)
@@ -1088,6 +1489,9 @@ class TTSEngine:
     # ----------------------------------------------------------
     def synthesize(self, text: str, lang: str, output_path: str) -> str:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        # XTTS-v2 first for routed langs (natural, neutral Hindi) — if available.
+        if self._try_xtts(text, lang, output_path):
+            return output_path
         # Primary: Parler-TTS Indic Large (Indian-trained, 44kHz, fast)
         parler_text = self._normalize_text_for_tts(text, lang, for_mms=False)
         if lang not in _PARLER_SKIP_LANGS:
@@ -1098,6 +1502,13 @@ class TTSEngine:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             log.warning(f"Parler failed both attempts [{LANG_NAMES.get(lang, lang)}] — trying MMS")
+        # Parler-only langs (e.g. Hindi): never use MMS. Write silence if Parler
+        # could not produce audio, so the voice never switches engines.
+        if lang in self._PARLER_ONLY_LANGS:
+            log.error(f"[{LANG_NAMES.get(lang, lang)}] Parler failed and MMS is disabled "
+                      f"for this lang — writing silence")
+            self._write_silence(2.0, output_path)
+            return output_path
         # Fallback: MMS standalone VITS
         mms_text = self._normalize_text_for_tts(text, lang, for_mms=True)
         if self._synthesize_standalone_vits(mms_text, lang, output_path):
@@ -1119,9 +1530,12 @@ class TTSEngine:
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         engine_used = "unknown"
         
+        # XTTS-v2 first for routed langs (natural Hindi) — if available.
+        if self._try_xtts(text, lang, output_path):
+            engine_used = "xtts"
         # Primary: Parler-TTS Indic Large
         parler_text = self._normalize_text_for_tts(text, lang, for_mms=False)
-        if lang not in _PARLER_SKIP_LANGS:
+        if engine_used == "unknown" and lang not in _PARLER_SKIP_LANGS:
             for attempt in range(2):
                 if self._synthesize_parler(parler_text, lang, output_path):
                     engine_used = "parler"
@@ -1130,8 +1544,9 @@ class TTSEngine:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
         
-        # Fallback: MMS standalone VITS
-        if engine_used == "unknown":
+        # Fallback: MMS standalone VITS — skipped for Parler-only langs (Hindi),
+        # which must never switch to the MMS voice.
+        if engine_used == "unknown" and lang not in self._PARLER_ONLY_LANGS:
             mms_text = self._normalize_text_for_tts(text, lang, for_mms=True)
             if self._synthesize_standalone_vits(mms_text, lang, output_path):
                 engine_used = "mms_vits"
@@ -1200,6 +1615,36 @@ class TTSEngine:
         if not text_idxs:
             return results
 
+        # ── XTTS-v2 pre-pass (natural Hindi) ─────────────────────────────────
+        # If XTTS-v2 is available and routed for this lang, synthesize each text
+        # segment with it first. Any segment XTTS cannot produce stays in
+        # text_idxs and falls through to the Parler path below (fallback).
+        try:
+            from . import xtts_engine as _xe
+            _xtts_on = (lang in _xe.XTTS_LANGS) and _xe.xtts_available()
+        except Exception:
+            _xtts_on = False
+        if _xtts_on:
+            if self._xtts_engine is None:
+                self._xtts_engine = _xe.XTTSEngine(device=DEVICE)
+            _xtts_done = []
+            for i in text_idxs:
+                seg_text = segments[i]["text"].strip()
+                if self._xtts_engine.synthesize(seg_text, lang, results[i]["audio_path"]):
+                    _xtts_done.append(i)
+                    log.info(f"  seg {i+1} [{lang}] ✓ (XTTS-v2)")
+                # Heartbeat per attempt (success or not) — same contract as the
+                # Parler/VITS paths, so the shard watchdog doesn't mistake a
+                # long XTTS pre-pass (esp. on CPU) for a wedged worker.
+                _beat()
+            if _xtts_done:
+                text_idxs = [i for i in text_idxs if i not in set(_xtts_done)]
+                log.info(f"XTTS-v2 [{lang}] rendered {len(_xtts_done)} segs; "
+                         f"{len(text_idxs)} remain for Parler fallback")
+            if not text_idxs:
+                self._vits_rng_pinned = False
+                return results
+
         # ── Primary: Parler-TTS Indic Large ─────────────────────────────────
         parler_skip = lang in _PARLER_SKIP_LANGS
         if not parler_skip and self._load_parler():
@@ -1244,6 +1689,21 @@ class TTSEngine:
                     self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=False)
                 )
             )
+            # ── Long-segment pre-pass ────────────────────────────────────────
+            # Parler stops early on very long dense segments (>~45 words), cutting
+            # off the end of the sentence → missing information. Render such
+            # segments sentence-by-sentence (split on । / . / ? / !) and concatenate
+            # so the FULL segment is dubbed. Uses the same fixed voice (enc_out).
+            long_idxs = [i for i in sorted_idxs
+                         if len(segments[i]["text"].split()) > self._PARLER_LONG_SPLIT_WORDS]
+            for i in long_idxs:
+                ok = self._synthesize_long_segment(
+                    segments[i]["text"].strip(), lang,
+                    results[i]["audio_path"], desc_ids, enc_out)
+                if ok:
+                    sorted_idxs.remove(i)
+                    log.info(f"  seg {i+1} [{lang}] rendered via sentence-split (long segment)")
+
             failed_idxs: list[int] = []
             # Use smaller batch size for long segments to avoid OOM
             def _batch_size_for(idxs):
@@ -1336,21 +1796,66 @@ class TTSEngine:
                     torch.cuda.manual_seed_all(42)
             self._vits_rng_pinned = True  # keep pinned for MMS batch calls below
             for i in failed_idxs:
-                text_f = self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=True)
                 path_f = results[i]["audio_path"]
+
+                # ── Parler-only langs (e.g. Hindi): retry PARLER, never MMS ──
+                if lang in self._PARLER_ONLY_LANGS:
+                    seg_text = segments[i]["text"].strip()
+                    ptext    = self._normalize_text_for_tts(seg_text, lang, for_mms=False)
+                    ok_f = False
+                    # Retry 1: sentence/word-split render (each part is short →
+                    # decodes fast, no timeout) — this is the strongest Parler path.
+                    try:
+                        ok_f = self._synthesize_long_segment(
+                            ptext, lang, path_f, desc_ids, encoder_outputs=enc_out)
+                        if ok_f:
+                            log.info(f"  seg {i+1} [{lang}] ✓ (Parler split-retry)")
+                    except Exception as _e1:
+                        log.warning(f"[{lang}] seg {i} Parler split-retry error: {_e1}")
+                    # Retry 2: plain single Parler attempt (fresh executor/timeout).
+                    if not ok_f:
+                        try:
+                            ok_f = self._parler_generate_single(
+                                ptext, lang, path_f, desc_ids, encoder_outputs=enc_out)
+                            if ok_f:
+                                log.info(f"  seg {i+1} [{lang}] ✓ (Parler single-retry)")
+                        except Exception as _e2:
+                            log.warning(f"[{lang}] seg {i} Parler single-retry error: {_e2}")
+                    if not ok_f:
+                        # Parler exhausted. Per policy, do NOT use MMS for this
+                        # language — write silence for this one segment so the
+                        # voice never switches engines. This should be very rare
+                        # now that long segments are pre-split.
+                        slot = max(0.5, segments[i].get("end", 0) - segments[i].get("start", 0))
+                        self._write_silence(slot, path_f)
+                        log.error(f"[{lang}] seg {i} — Parler failed all retries; "
+                                  f"silence {slot:.1f}s written (MMS disabled for this lang)")
+                        results[i]["tts_silent_failure"] = True
+                    continue
+
+                # ── Other langs: MMS fallback chain (unchanged) ──────────────
+                text_f = self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=True)
                 ok_f   = self._synthesize_standalone_vits(text_f, lang, path_f)
                 if not ok_f:
                     ok_list = self._synthesize_mms_batch([text_f], lang, [path_f])
                     ok_f = ok_list[0] if ok_list else False
                 if not ok_f:
+                    # Last resort before silence: retry VITS forced onto CPU. A
+                    # Parler timeout can leave the GPU context corrupted so every
+                    # GPU synthesis above fails; CPU synthesis is immune to that
+                    # and reliably produces audio, eliminating full-slot silence.
+                    log.warning(f"[{lang}] seg {i} — GPU fallbacks failed, forcing CPU VITS retry")
+                    ok_f = self._synthesize_standalone_vits(text_f, lang, path_f, force_cpu=True)
+                if not ok_f:
                     slot = max(0.5, segments[i].get("end", 0) - segments[i].get("start", 0))
                     self._write_silence(slot, path_f)
-                    log.warning(f"All TTS failed [{lang}] seg {i} — silence {slot:.1f}s written")
+                    log.error(f"All TTS failed [{lang}] seg {i} — silence {slot:.1f}s written")
+                    results[i]["tts_silent_failure"] = True
                 else:
-                    log.info(f"  seg {i+1} [{lang}] ✓ (MMS fallback)")
+                    log.info(f"  seg {i+1} [{lang}] ✓ (fallback)")
             text_idxs = []  # all handled
 
-        # Parler skipped langs — try standalone VITS, then MMS, then silence
+        # Parler skipped langs — try standalone VITS, then MMS, then CPU VITS, then silence
         for i in text_idxs:
             text = self._normalize_text_for_tts(segments[i]["text"].strip(), lang, for_mms=True)
             path = results[i]["audio_path"]
@@ -1360,6 +1865,11 @@ class TTSEngine:
                 if not ok:
                     ok_list = self._synthesize_mms_batch([text], lang, [path])
                     ok = ok_list[0] if ok_list else False
+                if not ok:
+                    # Last resort before silence: force VITS onto CPU (immune to a
+                    # corrupted GPU context) so a segment never becomes dead air.
+                    log.warning(f"[{lang}] seg {i} — GPU fallbacks failed, forcing CPU VITS retry")
+                    ok = self._synthesize_standalone_vits(text, lang, path, force_cpu=True)
             if not ok:
                 slot = max(0.1, segments[i].get("end", 0) - segments[i].get("start", 0))
                 self._write_silence(slot, path)
@@ -1397,6 +1907,7 @@ class TTSEngine:
                     torch_dtype=torch.float32,
                     low_cpu_mem_usage=True,
                 ).to(DEVICE).float()
+                _gpu_monitor.log_load("tts:mms_base", "MMS-TTS (shared VITS base)")
             if self._mms_current_lang != lang:
                 adapter_file = MMS_DIR / f"adapter.{adapter_code}.safetensors"
                 if not adapter_file.exists():
@@ -1450,6 +1961,7 @@ class TTSEngine:
                         f"Download facebook/mms-tts-{lang} to models/mms_standalone/{lang} for native voice."
                     )
                 log.info(f"MMS-TTS adapter loaded: {lang} ({adapter_code})")
+                _gpu_monitor.log_swap("tts:mms_base", f"MMS-TTS adapter → {lang}", detail=adapter_code)
             return True
         except Exception as e:
             log.error(f"MMS load failed [{lang}]: {e}")
@@ -1530,6 +2042,7 @@ class TTSEngine:
                 Path(path).parent.mkdir(parents=True, exist_ok=True)
                 sf.write(path, w, SR, subtype="PCM_16")
                 results[i] = True
+                _beat()
             except Exception as e:
                 log.error(f"MMS [{lang}] seg {i} failed: {e}")
         return results

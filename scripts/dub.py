@@ -23,6 +23,11 @@ if sys.stdout.encoding != 'utf-8':
 from pipeline.lang_config import ALL_22, LANG_NAMES
 from pipeline.dubbing_pipeline import DubbingPipeline
 
+# Module-level handle to the active pipeline so the __main__ entrypoint can
+# tear it down (release GPU/ASR/translator/TTS) on exit — see the bottom of
+# this file. main() declares `global pipeline` so its assignments land here.
+pipeline = None
+
 
 def parse_targets(tgt_arg: str) -> list[str]:
     if tgt_arg.lower() == "all":
@@ -31,6 +36,7 @@ def parse_targets(tgt_arg: str) -> list[str]:
 
 
 def main():
+    global pipeline
     parser = argparse.ArgumentParser(
         description="KB Course Dubbing Pipeline - 22 Indian Languages",
         formatter_class=argparse.RawTextHelpFormatter,
@@ -427,4 +433,43 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import os as _os
+    _exit_code = 0
+    try:
+        main()
+    except SystemExit as _se:
+        _exit_code = _se.code if isinstance(_se.code, int) else 0
+    except KeyboardInterrupt:
+        print("\nInterrupted — cleaning up GPU and exiting.")
+        _exit_code = 130
+    except Exception as _e:
+        import traceback
+        traceback.print_exc()
+        _exit_code = 1
+    finally:
+        # Release GPU/ASR/translator/TTS so the CUDA context is torn down and
+        # the process can actually exit. torch.compile/Triton worker threads and
+        # a resident faster-whisper model otherwise keep the process alive,
+        # hanging the terminal/port and freezing the machine.
+        try:
+            if pipeline is not None:
+                pipeline.full_teardown()
+        except Exception:
+            pass
+        try:
+            import torch as _torch
+            if _torch.cuda.is_available():
+                _torch.cuda.synchronize()
+                _torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # Hard-exit: skips interpreter atexit/thread-join that would otherwise
+        # block on non-joinable torch.compile/Triton/driver threads. All work is
+        # already flushed to disk at this point, so a hard exit is safe here.
+        _sys_out_flush = getattr(__import__("sys"), "stdout", None)
+        if _sys_out_flush:
+            try:
+                _sys_out_flush.flush()
+            except Exception:
+                pass
+        _os._exit(_exit_code)

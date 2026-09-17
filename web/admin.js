@@ -247,8 +247,16 @@ async function pollBatchJob() {
   if (!adminState.batchJobId) return;
   try {
     const resp = await fetch(`/api/batch/status/${adminState.batchJobId}`);
+    if (!resp.ok) {
+      // Job id no longer known to the server (e.g. it restarted) — stop
+      // polling instead of retrying a dead id forever.
+      appendBatchLog(`⚠️ Job ${adminState.batchJobId} not found on server — stopping status polling.`);
+      adminState.batchJobId = null;
+      document.getElementById('batch-start-btn').disabled = false;
+      return;
+    }
     const data = await resp.json();
-    
+
     document.getElementById('batch-job-progress').style.width = `${data.progress}%`;
     document.getElementById('batch-job-label').textContent = data.status_message || `${data.progress}%`;
     

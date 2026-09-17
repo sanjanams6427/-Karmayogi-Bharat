@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>KB Dubbing Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎙️</text></svg>">
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -32,6 +33,7 @@
     <button class="tab-btn" data-tab="corrections">🔧 Corrections</button>
     <button class="tab-btn" data-tab="monthly">📅 Monthly</button>
     <button class="tab-btn" data-tab="glossary">📖 Glossary</button>
+    <button class="tab-btn" data-tab="gpu-monitor">📈 GPU Monitor</button>
     <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
   </nav>
 
@@ -71,6 +73,16 @@
             <button id="translate-all-btn" class="btn btn-ghost" disabled>🌐 Translate All</button>
             <button id="tts-all-btn" class="btn btn-ghost" disabled>🔊 Generate All TTS</button>
             <button id="auto-approve-btn" class="btn btn-ghost" disabled>✅ Auto-Approve</button>
+            <span class="fit-all-wrap">
+              <select id="fit-all-select" title="Fit strategy to apply to every translated segment">
+                <option value="auto">Fit: Auto (speed up, extend if &gt;2x)</option>
+                <option value="extend">Fit: Extend video for all</option>
+                <option value="speedup">Fit: Speed up for all</option>
+                <option value="trim">Fit: Trim audio for all</option>
+              </select>
+              <button id="fit-all-btn" class="btn btn-ghost" disabled>📐 Apply Fit to All</button>
+            </span>
+            <button id="qa-verify-btn" class="btn btn-ghost" disabled title="Transcribe every TTS clip with ASR and compare against the target text — flags garbled or truncated audio">🧪 QA Verify All</button>
             <div class="progress-wrap batch-progress">
               <div class="progress"><div class="progress-bar" id="batch-progress"></div></div>
               <span class="progress-label" id="batch-progress-label">Idle</span>
@@ -82,18 +94,34 @@
         <div class="card table-card">
           <div class="table-head-row">
             <h2 class="card-title">3 · Segments</h2>
+            <button id="play-all-btn" class="btn btn-ghost sm" disabled>▶️ Play All</button>
             <span id="segment-count" class="muted">0 segments</span>
           </div>
           <div class="table-scroll">
             <table class="seg-table">
               <thead>
-                <tr><th>ID</th><th>Time</th><th>Dur</th><th class="col-text">Original</th><th>Action</th><th class="col-text">Translation</th><th>TTS Dur</th><th>Fit</th><th>Status</th></tr>
+                <tr><th>ID</th><th>Time</th><th>Dur</th><th class="col-text">Original</th><th>Action</th><th class="col-text">Translation</th><th>TTS Dur</th><th>Fit</th><th>QA</th><th>Status</th></tr>
               </thead>
               <tbody id="seg-tbody">
-                <tr class="empty-row"><td colspan="9">No segments yet — create a session to begin.</td></tr>
+                <tr class="empty-row"><td colspan="10">No segments yet — create a session to begin.</td></tr>
               </tbody>
             </table>
           </div>
+        </div>
+
+        <!-- GLOSSARY -->
+        <div class="card" id="glossary-card">
+          <div class="table-head-row">
+            <h2 class="card-title">📖 Glossary — fix once, apply everywhere</h2>
+            <span id="gl-count" class="muted"></span>
+          </div>
+          <div class="glossary-controls">
+            <input id="gl-find" class="gl-input" placeholder="Find in translations (wrong/leaked term)">
+            <input id="gl-replace" class="gl-input" placeholder="Replace with (approved term)">
+            <input id="gl-src" class="gl-input" placeholder="English source term (optional → saved to glossary)">
+            <button id="gl-apply-btn" class="btn btn-ghost" disabled>Apply to all segments</button>
+          </div>
+          <div id="gl-list" class="glossary-list"></div>
         </div>
 
         <!-- FINAL OUTPUT SECTION -->
@@ -140,6 +168,10 @@
             <button id="d-tts-btn" class="btn btn-ghost sm">🔊 Generate TTS</button>
             <button id="d-skip-btn" class="btn btn-ghost sm">⏭️ Skip</button>
             <button id="d-keep-btn" class="btn btn-ghost sm">📌 Keep Original</button>
+          </div>
+          <div class="action-row">
+            <button id="d-shorten-btn" class="btn btn-ghost sm" title="LLM rewrites the translation shorter so the audio fits the slot (needs API key in .env)">✂️ Shorten to Fit</button>
+            <button id="d-enhance-btn" class="btn btn-ghost sm" title="LLM fluency polish (needs API key in .env)">✨ LLM Polish</button>
           </div>
           <div class="action-row decision">
             <button id="d-approve-btn" class="btn btn-success">✅ Approve</button>
@@ -457,6 +489,35 @@
     </main>
   </div>
 
+  <!-- ===== PAGE: GPU MONITOR ===== -->
+  <div class="tab-page" id="page-gpu-monitor">
+    <main class="gpu-page-grid">
+      <div class="card span-2">
+        <h2 class="card-title">🖥️ GPU Status</h2>
+        <p class="card-desc">Live from <code>nvidia-smi</code>, polled every 1.5s. Shows what's actually resident on each GPU right now.</p>
+        <div id="gpu-status-list"><div class="muted">Loading…</div></div>
+      </div>
+
+      <div class="card span-2">
+        <h2 class="card-title">📈 VRAM Over Time</h2>
+        <div class="gpu-chart-wrap"><canvas id="gpu-vram-canvas"></canvas></div>
+        <div class="gpu-chart-legend" id="gpu-chart-legend"></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">🧩 Currently Loaded Models</h2>
+        <p class="card-desc">Everything this server process has cached on a GPU right now — cleared by <code>unload_models()</code>, not by garbage collection alone.</p>
+        <div class="gpu-chip-row" id="gpu-loaded-chips"><span class="gpu-chip-empty">Nothing loaded yet</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">📜 Load / Evict Timeline</h2>
+        <p class="card-desc"><span style="color:var(--success)">●</span> load &nbsp; <span style="color:var(--accent)">●</span> swap &nbsp; <span style="color:var(--accent-2)">●</span> evict</p>
+        <div class="gpu-event-log" id="gpu-event-log"></div>
+      </div>
+    </main>
+  </div>
+
   <!-- ===== PAGE 9: SETTINGS ===== -->
   <div class="tab-page" id="page-settings">
     <main class="page-grid">
@@ -497,5 +558,6 @@
 
   <script src="app.js"></script>
   <script src="admin.js"></script>
+  <script src="gpu-monitor.js"></script>
 </body>
 </html>

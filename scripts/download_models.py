@@ -52,11 +52,23 @@ MODELS = [
     ),
     
     # TTS - Parler
+    # Repo id matches the model actually loaded by the pipeline (confirmed from
+    # models/indic_parler_tts_large/config.json _name_or_path). The earlier
+    # "-pretrained" id fetched a different (mini/pretrained) variant.
     (
-        "ai4bharat/indic-parler-tts-pretrained",
+        "ai4bharat/indic-parler-tts",
         "indic_parler_tts_large",
         "Indic Parler-TTS Large",
         ["config.json", "model.safetensors"],
+    ),
+
+    # TTS - XTTS-v2 (Coqui) — natural, neutral-tone primary engine for Hindi.
+    # Requires `pip install coqui-tts`. Falls back to Parler if absent.
+    (
+        "coqui/XTTS-v2",
+        "xtts_v2",
+        "XTTS-v2 (natural Hindi)",
+        ["config.json", "model.pth", "vocab.json"],
     ),
     
     # TTS - MMS standalone VITS (main languages)

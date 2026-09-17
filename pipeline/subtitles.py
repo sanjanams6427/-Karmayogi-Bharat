@@ -304,11 +304,61 @@ def _adjust_timings(segs: list[dict], video_duration: float) -> list[tuple[float
             ceiling = video_duration if video_duration > orig_end else orig_end + 2.0
         end = min(max(orig_end, needed), ceiling)
         end = max(end, start + 0.5)  # guard: end must always be > start
-        # Last segment: always extend to video_duration
-        if i == n - 1 and video_duration > end:
-            end = video_duration
+        # Do NOT stretch the last subtitle to fill trailing video silence — that
+        # produced a single 50s+ cue at the end. Leave it at its natural reading
+        # end; trailing silence simply has no subtitle, which is correct.
         timings.append((start, end))
     return timings
+
+
+# Maximum on-screen duration for a single subtitle cue. Blocks longer than this
+# (e.g. a 62s ASR segment that merged many sentences) are split into multiple
+# readable cues at sentence boundaries. This only affects the DISPLAYED subtitle
+# — the dubbed audio segment is unchanged.
+_MAX_CUE_S = 7.0
+
+
+def _split_long_cue(start: float, end: float, text: str) -> list[tuple[float, float, str]]:
+    """Split a (start, end, text) cue into readable sub-cues so that NO emitted
+    cue exceeds _MAX_CUE_S. Splits at sentence boundaries first, then falls back
+    to word groups for any piece that is still too long. Time is distributed
+    proportionally to character length. Only affects displayed subtitles — the
+    dubbed audio segment is unchanged."""
+    dur = end - start
+    if dur <= _MAX_CUE_S or not text.strip():
+        return [(start, end, text)]
+    import re as _re
+    parts = [p.strip() for p in _re.split(r'(?<=[।॥.!?])\s+', text.strip()) if p.strip()]
+    if len(parts) <= 1:
+        parts = [text.strip()]
+
+    # Distribute the total duration across sentence parts by char length, then
+    # for any part whose allotted time still exceeds the cap, break it into
+    # smaller word groups so every final cue is <= _MAX_CUE_S.
+    total_chars = sum(len(p) for p in parts) or 1
+    cues: list[tuple[float, float, str]] = []
+    t = start
+    for p in parts:
+        p_dur = dur * (len(p) / total_chars)
+        if p_dur <= _MAX_CUE_S:
+            cues.append((t, t + p_dur, p))
+            t += p_dur
+            continue
+        # Part still too long — break into word groups sized to the cap.
+        words = p.split()
+        n_chunks = max(2, int(p_dur / _MAX_CUE_S) + 1)
+        size = max(1, (len(words) + n_chunks - 1) // n_chunks)
+        chunks = [" ".join(words[j:j + size]) for j in range(0, len(words), size)]
+        cchars = sum(len(c) for c in chunks) or 1
+        for c in chunks:
+            c_dur = p_dur * (len(c) / cchars)
+            cues.append((t, t + c_dur, c))
+            t += c_dur
+    # Snap the last cue to exactly `end` to avoid rounding drift.
+    if cues:
+        ls, _, lt = cues[-1]
+        cues[-1] = (ls, end, lt)
+    return cues
 
 
 def generate_srt(segments: list[dict], output_path: str,
@@ -316,7 +366,8 @@ def generate_srt(segments: list[dict], output_path: str,
     """
     Generate SRT subtitle file from translated segments.
     End times are extended to cover reading time of the translated text,
-    clamped to the next segment's start so subtitles never overlap.
+    clamped to the next segment's start so subtitles never overlap. Cues longer
+    than _MAX_CUE_S are split at sentence boundaries for readability.
     """
     lines = []
     idx   = 1
@@ -329,14 +380,21 @@ def generate_srt(segments: list[dict], output_path: str,
             src = s.get("src_text", "")
             txt = _clean_sub_text(src, "") if src else ""
         if txt:
-            segs.append({**s, "_display_text": txt})
+            # Prefer placed timings (from push-forward assembly) so subtitles
+            # line up with the actual dubbed audio, not the original stamps.
+            _seg = {**s, "_display_text": txt}
+            if s.get("placed_start") is not None and s.get("placed_end") is not None:
+                _seg["start"] = s["placed_start"]
+                _seg["end"]   = s["placed_end"]
+            segs.append(_seg)
     timings = _adjust_timings(segs, video_duration)
     for i, (seg, (start, end)) in enumerate(zip(segs, timings)):
-        text    = _wrap_subtitle(seg["_display_text"])
-        start_s = _seconds_to_srt_time(start)
-        end_s   = _seconds_to_srt_time(end)
-        lines.append(f"{idx}\r\n{start_s} --> {end_s}\r\n{text}\r\n")
-        idx += 1
+        for (cs, ce, ctext) in _split_long_cue(start, end, seg["_display_text"]):
+            text    = _wrap_subtitle(ctext)
+            start_s = _seconds_to_srt_time(cs)
+            end_s   = _seconds_to_srt_time(ce)
+            lines.append(f"{idx}\r\n{start_s} --> {end_s}\r\n{text}\r\n")
+            idx += 1
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_bytes(("\r\n".join(lines)).encode("utf-8-sig"))
     log.info(f"SRT generated ({idx-1} entries) → {output_path}")
@@ -354,13 +412,20 @@ def generate_vtt(segments: list[dict], output_path: str,
             src = s.get("src_text", "")
             txt = _clean_sub_text(src, "") if src else ""
         if txt:
-            segs.append({**s, "_display_text": txt})
+            # Prefer placed timings (from push-forward assembly) so subtitles
+            # line up with the actual dubbed audio, not the original stamps.
+            _seg = {**s, "_display_text": txt}
+            if s.get("placed_start") is not None and s.get("placed_end") is not None:
+                _seg["start"] = s["placed_start"]
+                _seg["end"]   = s["placed_end"]
+            segs.append(_seg)
     timings = _adjust_timings(segs, video_duration)
     for seg, (start, end) in zip(segs, timings):
-        text    = _wrap_subtitle(seg["_display_text"])
-        start_s = _seconds_to_vtt_time(start)
-        end_s   = _seconds_to_vtt_time(end)
-        lines.append(f"{start_s} --> {end_s}\n{text}\n")
+        for (cs, ce, ctext) in _split_long_cue(start, end, seg["_display_text"]):
+            text    = _wrap_subtitle(ctext)
+            start_s = _seconds_to_vtt_time(cs)
+            end_s   = _seconds_to_vtt_time(ce)
+            lines.append(f"{start_s} --> {end_s}\n{text}\n")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     Path(output_path).write_text("\n".join(lines), encoding="utf-8")
     log.info(f"VTT generated → {output_path}")

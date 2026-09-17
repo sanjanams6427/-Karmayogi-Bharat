@@ -33,8 +33,13 @@ IndicTransToolkit>=0.1.0
 
 # ── TTS ──────────────────────────────────────────────────────
 parler-tts>=1.0.0
-# Coqui XTTS-v2 (voice cloning — install separately to avoid conflicts):
-#   pip install coqui-tts --no-deps
+# Coqui XTTS-v2 — natural, neutral-tone primary engine for Hindi (optional).
+# Kept OUT of the hard requirements because its dependency tree can conflict
+# with the pinned transformers/torch above; install it explicitly when you want
+# the natural Hindi voice. The pipeline auto-detects it and falls back to Parler
+# if it is not installed. Use the maintained fork:
+#   pip install coqui-tts
+# Then download weights:  python scripts/download_models.py   (adds models/xtts_v2)
 
 # ── Audio ────────────────────────────────────────────────────
 soundfile>=0.12.1
